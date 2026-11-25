@@ -1,0 +1,9 @@
+name = "fatext-email-worker"
+main = "src/index.js"
+compatibility_date = "2026-01-01"
+
+[vars]
+FATEXT_INGEST_URL = "https://fatext.com/internal/mail/ingest"
+
+# Configure the secret in Cloudflare Workers before deploying:
+#   npx wrangler secret put FATEXT_MAIL_INTERNAL_SECRET

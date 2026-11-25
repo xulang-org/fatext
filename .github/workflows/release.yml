@@ -1,0 +1,77 @@
+name: Release Server
+
+on:
+  push:
+    tags:
+      - 'server-v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. server-v1.0.0)"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  XU_VERSION: v0.14.0
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x64
+            os: ubuntu-24.04
+            asset: xu-v0.14.0-linux-x64.tar.gz
+          - target: linux-arm64
+            os: ubuntu-24.04-arm
+            asset: xu-v0.14.0-linux-arm64.tar.gz
+          - target: macos-arm64
+            os: macos-14
+            asset: xu-v0.14.0-macos-arm64.tar.gz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Xu toolchain (${{ matrix.target }})
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/xu" dist
+          curl -fsSL "https://github.com/xulang-org/xu/releases/download/${XU_VERSION}/${{ matrix.asset }}" -o "$RUNNER_TEMP/xu.tar.gz"
+          tar -xzf "$RUNNER_TEMP/xu.tar.gz" -C "$RUNNER_TEMP/xu"
+          XU_BIN="$(find "$RUNNER_TEMP/xu" -type f -name xu | head -n 1)"
+          XU_STD="$(dirname "$(find "$RUNNER_TEMP/xu" -type f -name mod.xu -path '*/net/http/mod.xu' | head -n 1 | xargs dirname | xargs dirname)")"
+          chmod +x "$XU_BIN"
+          XU_STDLIB_ROOT="$XU_STD" "$XU_BIN" build server -o dist/fatext-server
+          if [ "$(uname -s)" = "Darwin" ]; then
+            codesign -fs - dist/fatext-server
+          fi
+          tar -C dist -czf "dist/fatext-server-${{ matrix.target }}.tar.gz" fatext-server
+          rm -f dist/fatext-server
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: server-${{ matrix.target }}
+          path: dist/fatext-server-*.tar.gz
+
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS and publish Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          cd artifacts
+          sha256sum fatext-server-*.tar.gz > SHA256SUMS
+          gh release create "$TAG" --title "fatext-server $TAG" --notes "Single-binary fatext-server release artifacts." \
+            fatext-server-*.tar.gz SHA256SUMS || \
+          gh release upload "$TAG" fatext-server-*.tar.gz SHA256SUMS --clobber

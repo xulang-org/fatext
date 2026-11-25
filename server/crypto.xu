@@ -2,6 +2,8 @@
 
 #errors
 #math/big
+#crypto/aes
+#crypto/cipher
 #crypto/rand
 #crypto/rsa
 #crypto/rsa/oaep
@@ -9,6 +11,8 @@
 #encoding/asn1
 #encoding/base64
 #encoding/pem
+#encoding/json
+#strconv
 #strings
 #time
 
@@ -171,4 +175,20 @@ pub fn new_ulid() string {
         }
     }
     << out
+}
+
+pub fn encrypt_mail_envelope(to_id string, mail_id string, to_key_ver int, to_pk &rsa.PublicKey, plaintext &string) string {
+    cek := rand.read(32) or >>
+    iv := rand.read(12) or >>
+    empty_lbl := ""
+    ek := oaep.encrypt_oaep(to_pk, rsa.SHA256, &cek, &empty_lbl) or >>
+    ciph := aes.new_cipher(&cek) or >>
+    aad := "fatext-mail\n" + to_id + "\n" + mail_id + "\n" + strconv.itoa(to_key_ver)
+    ct := cipher.seal_gcm(&ciph, &iv, plaintext, &aad) or >>
+    ek_b64 := base64.encode_to_string(ek)
+    iv_b64 := base64.encode_to_string(iv)
+    ct_b64 := base64.encode_to_string(ct)
+    << "{\"v\":1,\"alg\":\"RSA-OAEP-256+A256GCM\",\"ek\":" + json.quote(&ek_b64) +
+        ",\"iv\":" + json.quote(&iv_b64) +
+        ",\"ct\":" + json.quote(&ct_b64) + "}"
 }

@@ -1,0 +1,13 @@
+# Optional Cloudflare Tunnel configuration if you prefer keeping port 443 private
+# and terminating edge TLS at Cloudflare (run fatext-server without FATEXT_TLS_CERT
+# bound to 127.0.0.1:8080).
+
+tunnel: fatext-tunnel
+credentials-file: /etc/cloudflared/fatext-tunnel.json
+
+ingress:
+  - hostname: fatext.com
+    service: http://127.0.0.1:8080
+    originRequest:
+      noHappyEyeballs: true
+  - service: http_status:404

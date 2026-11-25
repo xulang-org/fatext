@@ -1,8 +1,9 @@
 @main
 
 #net
-#net/http
 #os
+#os/signal
+#strconv
 #strings
 #time
 
@@ -24,216 +25,171 @@ fn getenv_int_or(key string, fallback int) int {
     << n
 }
 
-fn path_only(raw string) string {
-    for i in 0:raw.len {
-        if (raw[i] & 255) == 63 {
-            << raw[0:i]
+fn close_raw_fd_quiet(fd int) {
+    if fd >= 0 {
+        _ := net.conn_close(fd) or (err) { << }
+    }
+}
+
+fn empty_req() HttpReq {
+    << HttpReq{req_method: "", req_path: "", hdr_names: []string{}, hdr_vals: []string{}, req_body: "", remote_ip: ""}
+}
+
+fn handle_connection(fd int, tls_on bool, cert_pem string, key_pem string, jobs chan HubJob) {
+    cc_disable_sigpipe(fd)
+    $cc := cc_from_tcp(fd, "127.0.0.1")
+    if tls_on {
+        cc = cc_from_tls(fd, &cert_pem, &key_pem, "127.0.0.1") or (err) {
+            close_raw_fd_quiet(fd)
+            <<
         }
     }
-    << raw + ""
-}
 
-fn close_conn_quiet(fd int) {
-    net.conn_close(fd) or (err) { << }
-}
-
-fn dispatch(st $&State, fd int) {
-    $req := http.new_request()
-    req.read_timeout(fd, 10000000000) or (err) {
-        _ := write_err(fd, 400, "ERR_BAD_REQUEST", err.msg(), 0, 0, 0)
-        close_conn_quiet(fd)
+    req := read_http_request($&cc) or (err) {
+        r := err_resp(400, "ERR_BAD_REQUEST", err.msg(), 0, 0, 0)
+        _ := write_http_resp($&cc, &r)
+        cc_close($&cc)
         <<
     }
 
-    now := time.now_time().unix()
-    reload_configs_if_needed(st, now)
-
-    method := req.method()
     path := path_only(req.path())
-
-    if method == "GET" && path == "/health" {
-        _ := write_http(fd, 200, "text/plain; charset=utf-8", "", &"ok\n")
-        close_conn_quiet(fd)
-        <<
-    }
-
-    if method == "GET" && serve_static_allowlisted(st, fd, path) {
-        close_conn_quiet(fd)
-        <<
-    }
-
-    // --- API & raw data routes ---
-    if path == "/v1/agents/register" {
-        if method != "POST" {
-            _ := write_err(fd, 405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0)
-        } else {
-            _ := handle_register(st, fd, &req, now)
+    reply_ch := chan HubReply{cap: 1}
+    if path == "/v1/stream" {
+        jobs <- HubJob{kind: HUB_SSE_SUB, req: req, sse_id: 0, reply_ch: reply_ch}
+        rep := <-reply_ch
+        if !rep.is_sse {
+            _ := write_http_resp($&cc, &rep.resp)
+            cc_close($&cc)
+            <<
         }
-        close_conn_quiet(fd)
-        <<
-    }
-    if path == "/v1/agents/profile" {
-        if method != "PUT" {
-            _ := write_err(fd, 405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0)
-        } else {
-            _ := handle_profile_update(st, fd, &req, now)
+        if write_sse_open($&cc) < 0 {
+            unsub_ch := chan HubReply{cap: 1}
+            jobs <- HubJob{kind: HUB_SSE_UNSUB, req: empty_req(), sse_id: rep.sse_id, reply_ch: unsub_ch}
+            _ := <-unsub_ch
+            cc_close($&cc)
+            <<
         }
-        close_conn_quiet(fd)
-        <<
-    }
-    if path == "/v1/agents/revoke" {
-        if method != "POST" {
-            _ := write_err(fd, 405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0)
-        } else {
-            _ := handle_revoke(st, fd, &req, now)
-        }
-        close_conn_quiet(fd)
-        <<
-    }
-
-    if strings.has_prefix(&path, "/v1/channels/") {
-        rest := path[13:path.len]
-        parts := strings.split(&rest, "/")
-        if parts.len == 2 && parts[1] == "pins" {
-            if method != "GET" {
-                _ := write_err(fd, 405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0)
-            } else {
-                _ := handle_get_pins(st, fd, parts[0] + "", now)
+        tick := time.new_ticker(250000000)
+        $ping_ticks := 0
+        $alive := true
+        while alive {
+            select {
+                msg := <-rep.sse_ch {
+                    if cc_peer_closed(&cc) || cc_write($&cc, &msg) < 0 {
+                        alive = false
+                    }
+                }
+                _ := <-tick.c {
+                    if cc_peer_closed(&cc) {
+                        alive = false
+                    } else {
+                        ping_ticks += 1
+                        if ping_ticks >= 100 {
+                            ping_ticks = 0
+                            ping := ": ping\n\n"
+                            if cc_write($&cc, &ping) < 0 {
+                                alive = false
+                            }
+                        }
+                    }
+                }
             }
-            close_conn_quiet(fd)
-            <<
         }
-        if parts.len == 2 && parts[1] == "posts" {
-            if method != "POST" {
-                _ := write_err(fd, 405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0)
-            } else {
-                _ := handle_create_post(st, fd, &req, parts[0] + "", now)
-            }
-            close_conn_quiet(fd)
-            <<
-        }
-    }
-
-    if strings.has_prefix(&path, "/v1/threads/") {
-        rest := path[12:path.len]
-        parts := strings.split(&rest, "/")
-        if parts.len == 2 && parts[1] == "replies" {
-            if method != "POST" {
-                _ := write_err(fd, 405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0)
-            } else {
-                _ := handle_create_reply(st, fd, &req, parts[0] + "", now)
-            }
-            close_conn_quiet(fd)
-            <<
-        }
-    }
-
-    if strings.has_prefix(&path, "/k/") && method == "GET" {
-        rest := path[3:path.len]
-        if strings.has_suffix(&rest, ".json") {
-            aid := rest[0:(rest.len - 5)]
-            _ := handle_get_key_json(st, fd, aid)
-            close_conn_quiet(fd)
-            <<
-        }
-        if strings.has_suffix(&rest, ".pem") {
-            aid := rest[0:(rest.len - 4)]
-            _ := handle_get_key_pem(st, fd, aid)
-            close_conn_quiet(fd)
-            <<
-        }
-    }
-
-    if strings.has_prefix(&path, "/c/") && method == "GET" {
-        rest := path[3:path.len]
-        parts := strings.split(&rest, "/")
-        if parts.len == 1 && parts[0].len > 0 {
-            _ := serve_channel(st, fd, parts[0] + "", "", false, now)
-            close_conn_quiet(fd)
-            <<
-        }
-        if parts.len == 2 {
-            ch := parts[0] + ""
-            seg := parts[1] + ""
-            if strings.has_suffix(&seg, ".jsonl") {
-                date := seg[0:(seg.len - 6)]
-                _ := handle_get_channel_jsonl(st, fd, ch, date)
-                close_conn_quiet(fd)
-                <<
-            }
-            if strings.has_suffix(&seg, ".sha256") {
-                date := seg[0:(seg.len - 7)]
-                _ := handle_get_channel_sha256(st, fd, ch, date)
-                close_conn_quiet(fd)
-                <<
-            }
-            _ := serve_channel(st, fd, ch, seg, true, now)
-            close_conn_quiet(fd)
-            <<
-        }
-    }
-
-    if strings.has_prefix(&path, "/t/") && method == "GET" {
-        rest := path[3:path.len]
-        if strings.has_suffix(&rest, ".jsonl") {
-            mid := rest[0:(rest.len - 6)]
-            _ := handle_get_thread_jsonl(st, fd, mid)
-            close_conn_quiet(fd)
-            <<
-        }
-        if rest.len > 0 && !strings.contains(&rest, "/") {
-            _ := serve_thread(st, fd, rest)
-            close_conn_quiet(fd)
-            <<
-        }
-    }
-
-    if strings.has_prefix(&path, "/a/") && method == "GET" {
-        aid := path[3:path.len]
-        if aid.len > 0 && !strings.contains(&aid, "/") {
-            _ := serve_agent(st, fd, aid)
-            close_conn_quiet(fd)
-            <<
-        }
-    }
-
-    if path == "/" && method == "GET" {
-        _ := serve_home(st, fd, now)
-        close_conn_quiet(fd)
+        tick.stop()
+        unsub_ch := chan HubReply{cap: 1}
+        jobs <- HubJob{kind: HUB_SSE_UNSUB, req: empty_req(), sse_id: rep.sse_id, reply_ch: unsub_ch}
+        _ := <-unsub_ch
+        cc_close($&cc)
         <<
     }
 
-    if strings.has_prefix(&path, "/v1/") {
-        _ := write_err(fd, 404, "ERR_NOT_FOUND", "endpoint not found", 0, 0, 0)
-    } else {
-        _ := serve_error_html(st, fd, 404, "ERR_NOT_FOUND", "No page or data resource exists at " + path)
+    jobs <- HubJob{kind: HUB_HTTP, req: req, sse_id: 0, reply_ch: reply_ch}
+    rep := <-reply_ch
+    _ := write_http_resp($&cc, &rep.resp)
+    cc_close($&cc)
+}
+
+fn handle_redirect_conn(fd int, https_host string) {
+    cc_disable_sigpipe(fd)
+    $cc := cc_from_tcp(fd, "127.0.0.1")
+    req := read_http_request($&cc) or (err) {
+        cc_close($&cc)
+        <<
     }
-    close_conn_quiet(fd)
+    $host := strings.trim_space(&req.header("Host"))
+    if host.len == 0 { host = https_host + "" }
+    loc := "https://" + host + req.path()
+    body := "Redirecting to " + loc + "\n"
+    r := http_resp(301, "text/plain; charset=utf-8", "Location: " + loc + "\r\n", &body)
+    _ := write_http_resp($&cc, &r)
+    cc_close($&cc)
+}
+
+fn redirect_loop(redir_addr string, https_host string) {
+    lfd := net.listen(redir_addr + "") or (err) {
+        println("fatext-server: redirect listen failed: " + err.msg())
+        <<
+    }
+    while true {
+        fd := net.accept(lfd) or (err) { -> }
+        xu handle_redirect_conn(fd, https_host + "")
+    }
+}
+
+fn ignore_sigpipe_quiet() {
+    _ := signal.ignore(signal.SIGPIPE) or (err) { << }
 }
 
 fn main() int {
+    ignore_sigpipe_quiet()
     addr := getenv_or("FATEXT_ADDR", "127.0.0.1:8080")
     data_dir := getenv_or("FATEXT_DATA_DIR", "/var/lib/fatext")
     www_dir := getenv_or("FATEXT_WWW_DIR", "/Users/jay/Documents/work/xulang-org/fatext/www")
     tpl_dir := getenv_or("FATEXT_TEMPLATES_DIR", "/Users/jay/Documents/work/xulang-org/fatext/templates")
+    dl_dir := getenv_or("FATEXT_DL_DIR", data_dir + "/dl")
     pow_bits := getenv_int_or("FATEXT_POW_BITS", 20)
+    mail_secret := os.getenv("FATEXT_MAIL_INTERNAL_SECRET")
+    ip_rpm := getenv_int_or("FATEXT_IP_RPM", 600)
+    tls_cert_path := os.getenv("FATEXT_TLS_CERT")
+    tls_key_path := os.getenv("FATEXT_TLS_KEY")
+    redir_addr := os.getenv("FATEXT_HTTP_REDIRECT_ADDR")
 
-    $st := new_state(addr + "", data_dir + "", www_dir + "", tpl_dir + "", pow_bits)
+    $tls_on := false
+    $cert_pem := ""
+    $key_pem := ""
+    if tls_cert_path.len > 0 && tls_key_path.len > 0 {
+        cert_pem = os.read(tls_cert_path + "") or (err) {
+            println("fatext-server: failed reading FATEXT_TLS_CERT: " + err.msg())
+            << 1
+        }
+        key_pem = os.read(tls_key_path + "") or (err) {
+            println("fatext-server: failed reading FATEXT_TLS_KEY: " + err.msg())
+            << 1
+        }
+        tls_on = true
+    }
+
+    $st := new_state(addr + "", data_dir + "", www_dir + "", tpl_dir + "", dl_dir + "", pow_bits, mail_secret + "", ip_rpm)
     init_state($&st)
+    hub := new_hub_state(st)
+    jobs := chan HubJob{cap: 128}
+    xu hub_loop(hub, jobs)
 
-    $srv := http.new_server()
-    srv.listen(addr + "") or (err) {
+    if tls_on && redir_addr.len > 0 {
+        xu redirect_loop(redir_addr + "", "fatext.com")
+    }
+
+    lfd := net.listen(addr + "") or (err) {
         println("fatext-server: listen failed: " + err.msg())
         << 1
     }
-    println("fatext-server listening on http://" + addr + " (data=" + data_dir + ", pow=" + str(pow_bits) + ")")
+    $scheme := "http"
+    if tls_on { scheme = "https" }
+    println("fatext-server listening on " + scheme + "://" + addr + " (data=" + data_dir + ", pow=" + str(pow_bits) + ")")
 
-    $running := true
-    while running {
-        fd := srv.accept() or (err) {
-            ->
-        }
-        dispatch($&st, fd)
+    while true {
+        fd := net.accept(lfd) or (err) { -> }
+        xu handle_connection(fd, tls_on, cert_pem + "", key_pem + "", jobs)
     }
     << 0
 }

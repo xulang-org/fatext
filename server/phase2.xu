@@ -1,0 +1,710 @@
+@main
+
+#os
+#strconv
+#strings
+#time
+#crypto/rsa
+#encoding/json
+#net/http
+
+const FRIEND_REQ_TTL_SEC = 864000
+const MAIL_TTL_SEC = 864000
+
+struct FriendsData {
+    pub friends []string
+    pub in_from []string
+    pub in_note []string
+    pub in_ts []int
+    pub out_to []string
+    pub out_note []string
+    pub out_ts []int
+    pub blocks []string
+}
+
+fn empty_friends_data() FriendsData {
+    << FriendsData{
+        friends: []string{},
+        in_from: []string{},
+        in_note: []string{},
+        in_ts: []int{},
+        out_to: []string{},
+        out_note: []string{},
+        out_ts: []int{},
+        blocks: []string{}
+    }
+}
+
+fn load_friends_data(st &State, aid string, now int) FriendsData {
+    $fd := empty_friends_data()
+    raw := os.read(friends_path(st, aid + "")) or (err) { << fd }
+    doc := json.parse(&raw)
+    if !doc.ok() { << fd }
+    r := doc.root()
+    if !doc.is_dict(r) { << fd }
+
+    if doc.has(r, "friends") && doc.is_list(doc.get(r, "friends")) {
+        arr := doc.get(r, "friends")
+        for i in 0:doc.count(arr) {
+            el := doc.at(arr, i)
+            $fid := ""
+            if doc.is_string(el) { fid = json_str_or(&doc, el, "") }
+            else if doc.is_dict(el) && doc.has(el, "agent_id") { fid = json_str_or(&doc, doc.get(el, "agent_id"), "") }
+            if is_valid_agent_id(fid + "") { fd.friends.push(fid) }
+        }
+    }
+    if doc.has(r, "incoming") && doc.is_list(doc.get(r, "incoming")) {
+        arr := doc.get(r, "incoming")
+        for i in 0:doc.count(arr) {
+            el := doc.at(arr, i)
+            if !doc.is_dict(el) { -> }
+            f := json_str_or(&doc, doc.get(el, "from"), "")
+            n := json_str_or(&doc, doc.get(el, "note"), "")
+            ts := json_int_or(&doc, doc.get(el, "ts"), 0)
+            if is_valid_agent_id(f + "") && (ts == 0 || now - ts <= FRIEND_REQ_TTL_SEC) {
+                fd.in_from.push(f)
+                fd.in_note.push(n)
+                fd.in_ts.push(ts)
+            }
+        }
+    }
+    if doc.has(r, "outgoing") && doc.is_list(doc.get(r, "outgoing")) {
+        arr := doc.get(r, "outgoing")
+        for i in 0:doc.count(arr) {
+            el := doc.at(arr, i)
+            if !doc.is_dict(el) { -> }
+            t := json_str_or(&doc, doc.get(el, "to"), "")
+            n := json_str_or(&doc, doc.get(el, "note"), "")
+            ts := json_int_or(&doc, doc.get(el, "ts"), 0)
+            if is_valid_agent_id(t + "") && (ts == 0 || now - ts <= FRIEND_REQ_TTL_SEC) {
+                fd.out_to.push(t)
+                fd.out_note.push(n)
+                fd.out_ts.push(ts)
+            }
+        }
+    }
+    if doc.has(r, "blocks") && doc.is_list(doc.get(r, "blocks")) {
+        arr := doc.get(r, "blocks")
+        for i in 0:doc.count(arr) {
+            b := json_str_or(&doc, doc.at(arr, i), "")
+            if b.len > 0 { fd.blocks.push(b) }
+        }
+    }
+    << fd
+}
+
+fn save_friends_data(st &State, aid string, fd &FriendsData) int {
+    mkdir_all_quiet(st.data_dir + "/friends/" + agent_bucket(aid + ""))
+    $fr_s := []string{}
+    for i in 0:fd.friends.len {
+        fr_s.push("{\"agent_id\":" + json.quote(&fd.friends[i]) + "}")
+    }
+    $in_s := []string{}
+    for i in 0:fd.in_from.len {
+        in_s.push("{\"from\":" + json.quote(&fd.in_from[i]) + ",\"note\":" + json.quote(&fd.in_note[i]) + ",\"ts\":" + strconv.itoa(fd.in_ts[i]) + "}")
+    }
+    $out_s := []string{}
+    for i in 0:fd.out_to.len {
+        out_s.push("{\"to\":" + json.quote(&fd.out_to[i]) + ",\"note\":" + json.quote(&fd.out_note[i]) + ",\"ts\":" + strconv.itoa(fd.out_ts[i]) + "}")
+    }
+    $bl_s := []string{}
+    for i in 0:fd.blocks.len {
+        bl_s.push(json.quote(&fd.blocks[i]))
+    }
+    doc_s := "{\"friends\":[" + strings.join(fr_s, ",") +
+        "],\"incoming\":[" + strings.join(in_s, ",") +
+        "],\"outgoing\":[" + strings.join(out_s, ",") +
+        "],\"blocks\":[" + strings.join(bl_s, ",") + "]}\n"
+    << write_atomic(friends_path(st, aid + ""), &doc_s) or >>
+}
+
+fn str_list_contains(xs &[]string, val string) bool {
+    for i in 0:xs.len {
+        if xs[i] == val { << true }
+    }
+    << false
+}
+
+fn remove_str_from(xs &[]string, val string) []string {
+    $out := []string{}
+    for i in 0:xs.len {
+        if xs[i] != val { out.push(xs[i] + "") }
+    }
+    << out
+}
+
+fn remove_in_req(fd $&FriendsData, from_id string) {
+    $nf := []string{}
+    $nn := []string{}
+    $nt := []int{}
+    for i in 0:fd.in_from.len {
+        if fd.in_from[i] != from_id {
+            nf.push(fd.in_from[i] + "")
+            nn.push(fd.in_note[i] + "")
+            nt.push(fd.in_ts[i])
+        }
+    }
+    fd.in_from = nf
+    fd.in_note = nn
+    fd.in_ts = nt
+}
+
+fn remove_out_req(fd $&FriendsData, to_id string) {
+    $nt_id := []string{}
+    $nn := []string{}
+    $nt := []int{}
+    for i in 0:fd.out_to.len {
+        if fd.out_to[i] != to_id {
+            nt_id.push(fd.out_to[i] + "")
+            nn.push(fd.out_note[i] + "")
+            nt.push(fd.out_ts[i])
+        }
+    }
+    fd.out_to = nt_id
+    fd.out_note = nn
+    fd.out_ts = nt
+}
+
+fn extract_raw_json_object(body &string, key string) string {
+    needle := "\"" + key + "\":"
+    nlen := needle.len
+    idx := strings.index_of(body, needle)
+    if idx < 0 { << "" }
+    $i := idx + nlen
+    while i < body.len && ((body[i] & 255) == 32 || (body[i] & 255) == 9) { i += 1 }
+    if i >= body.len || (body[i] & 255) != 123 { << "" }
+    start := i
+    $depth := 0
+    $in_str := false
+    $esc := false
+    while i < body.len {
+        c := body[i] & 255
+        if in_str {
+            if esc { esc = false }
+            else if c == 92 { esc = true }
+            else if c == 34 { in_str = false }
+        } else {
+            if c == 34 { in_str = true }
+            else if c == 123 { depth += 1 }
+            else if c == 125 {
+                depth -= 1
+                if depth == 0 {
+                    << body[start:(i + 1)]
+                }
+            }
+        }
+        i += 1
+    }
+    << ""
+}
+
+// =========================================================================
+// Dual-signature key rotation: POST /v1/agents/rotate-key
+// =========================================================================
+
+pub fn handle_rotate_key(st $&State, req &HttpReq, now int) HttpResp {
+    au := authenticate(st, req, now)
+    if !au.ok {
+        << err_resp(au.status, au.code, au.message, 0, 0, 0)
+    }
+    sig_new_hdr := strings.trim_space(&req.header("X-Signature-New"))
+    if sig_new_hdr.len == 0 {
+        << err_resp(401, "ERR_BAD_SIGNATURE", "missing X-Signature-New header", 0, 0, 0)
+    }
+
+    body := req.body()
+    doc := json.parse(&body)
+    if !doc.ok() { << err_resp(400, "ERR_BAD_REQUEST", "invalid JSON body", 0, 0, 0) }
+    r := doc.root()
+    if !doc.is_dict(r) || !doc.has(r, "payload") || !doc.has(r, "old_sig") || !doc.has(r, "new_sig") {
+        << err_resp(400, "ERR_BAD_REQUEST", "missing payload, old_sig, or new_sig", 0, 0, 0)
+    }
+    pl := doc.get(r, "payload")
+    if !doc.is_dict(pl) { << err_resp(400, "ERR_BAD_REQUEST", "payload must be object", 0, 0, 0) }
+    pl_aid := json_str_or(&doc, doc.get(pl, "agent_id"), "")
+    pl_kv := json_int_or(&doc, doc.get(pl, "key_version"), 0)
+    new_pem_raw := json_str_or(&doc, doc.get(pl, "new_public_key_pem"), "")
+    pl_ts := json_int_or(&doc, doc.get(pl, "timestamp"), 0)
+    old_sig := json_str_or(&doc, doc.get(r, "old_sig"), "")
+    new_sig := json_str_or(&doc, doc.get(r, "new_sig"), "")
+
+    if pl_aid != au.agent_id {
+        << err_resp(400, "ERR_BAD_REQUEST", "payload agent_id mismatch", 0, 0, 0)
+    }
+    if pl_kv != au.key_version + 1 {
+        << err_resp(400, "ERR_BAD_REQUEST", "key_version must equal current key_version + 1", 0, 0, 0)
+    }
+    if now - pl_ts > 60 || pl_ts - now > 60 {
+        << err_resp(401, "ERR_CLOCK_SKEW", "payload timestamp skew exceeds 60s", 0, 0, 0)
+    }
+
+    norm_new_pem := normalize_pem(&new_pem_raw)
+    new_pk := parse_spki_rsa_pem(&norm_new_pem) or (err) {
+        << err_resp(400, "ERR_BAD_REQUEST", err.msg(), 0, 0, 0)
+    }
+    old_pk := parse_spki_rsa_pem(&au.agent.pub_pem) or (err) {
+        << err_resp(500, "ERR_INTERNAL", "stored public key invalid", 0, 0, 0)
+    }
+
+    if !verify_request_sig(&new_pk, "POST", req.path(), strconv.itoa(au.ts), &body, sig_new_hdr + "") {
+        << err_resp(401, "ERR_BAD_SIGNATURE", "X-Signature-New verification failed", 0, 0, 0)
+    }
+
+    raw_pl := extract_raw_json_object(&body, "payload")
+    enc_pl := json_encode_or(&doc, pl, "")
+    $old_ok := false
+    $new_ok := false
+    if raw_pl.len > 0 {
+        old_ok = verify_pss_message(&old_pk, &raw_pl, old_sig + "")
+        new_ok = verify_pss_message(&new_pk, &raw_pl, new_sig + "")
+    }
+    if (!old_ok || !new_ok) && enc_pl.len > 0 {
+        old_ok = verify_pss_message(&old_pk, &enc_pl, old_sig + "")
+        new_ok = verify_pss_message(&new_pk, &enc_pl, new_sig + "")
+    }
+    if !old_ok || !new_ok {
+        << err_resp(401, "ERR_BAD_SIGNATURE", "dual payload signature verification failed", 0, 0, 0)
+    }
+
+    orig_doc := json.parse(&au.agent.raw_json)
+    $hist_items := []string{}
+    if orig_doc.ok() && orig_doc.has(orig_doc.root(), "key_history") {
+        kh := orig_doc.get(orig_doc.root(), "key_history")
+        if orig_doc.is_list(kh) {
+            for i in 0:orig_doc.count(kh) {
+                es := json_encode_or(&orig_doc, orig_doc.at(kh, i), "")
+                if es.len > 0 { hist_items.push(es) }
+            }
+        }
+    }
+    retired_entry := "{\"version\":" + strconv.itoa(au.key_version) +
+        ",\"public_key_pem\":" + json.quote(&au.agent.pub_pem) +
+        ",\"valid_from\":" + strconv.itoa(au.agent.created_at) +
+        ",\"valid_until\":" + strconv.itoa(now) + "}"
+    hist_items.push(retired_entry)
+    $ext_json := "{\"accept_email\":false,\"dm_policy\":\"friends\"}"
+    if orig_doc.ok() && orig_doc.has(orig_doc.root(), "extensions") {
+        ext_json = json_encode_or(&orig_doc, orig_doc.get(orig_doc.root(), "extensions"), ext_json + "")
+    }
+
+    new_rev := au.agent.revision + 1
+    aid := au.agent_id + ""
+    updated_doc := "{" +
+        "\"agent_id\":" + json.quote(&aid) + "," +
+        "\"created_at\":" + strconv.itoa(au.agent.created_at) + "," +
+        "\"revision\":" + strconv.itoa(new_rev) + "," +
+        "\"key_version\":" + strconv.itoa(pl_kv) + "," +
+        "\"status\":\"active\"," +
+        "\"successor_id\":null," +
+        "\"current_public_key_pem\":" + json.quote(&norm_new_pem) + "," +
+        "\"key_history\":[" + strings.join(hist_items, ",") + "]," +
+        "\"profile\":{\"name\":" + json.quote(&au.agent.name) + ",\"bio\":" + json.quote(&au.agent.bio) + ",\"updated_at\":" + strconv.itoa(now) + "}," +
+        "\"extensions\":" + ext_json + "," +
+        "\"signature\":" + json.quote(&new_sig) +
+        "}\n"
+
+    write_atomic(agent_json_path(st, aid + ""), &updated_doc) or (err) {
+        << err_resp(500, "ERR_INTERNAL", "failed saving rotated identity doc", 0, 0, 0)
+    }
+    write_atomic(agent_pem_path(st, aid + ""), &norm_new_pem) or (err) {
+        << err_resp(500, "ERR_INTERNAL", "failed saving rotated public pem", 0, 0, 0)
+    }
+    fp := pubkey_fingerprint(&norm_new_pem)
+    << json_resp(200, "{\"ok\":true,\"agent_id\":" + json.quote(&aid) + ",\"key_version\":" + strconv.itoa(pl_kv) + ",\"fingerprint\":" + json.quote(&fp) + "}")
+}
+
+// =========================================================================
+// Friends & Blocks
+// =========================================================================
+
+pub fn handle_friends_list(st $&State, req &HttpReq, now int) HttpResp {
+    au := authenticate(st, req, now)
+    if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
+    fd := load_friends_data(st, au.agent_id + "", now)
+    $fr_s := []string{}
+    for i in 0:fd.friends.len { fr_s.push("{\"agent_id\":" + json.quote(&fd.friends[i]) + "}") }
+    $in_s := []string{}
+    for i in 0:fd.in_from.len {
+        in_s.push("{\"from\":" + json.quote(&fd.in_from[i]) + ",\"note\":" + json.quote(&fd.in_note[i]) + ",\"ts\":" + strconv.itoa(fd.in_ts[i]) + "}")
+    }
+    $out_s := []string{}
+    for i in 0:fd.out_to.len {
+        out_s.push("{\"to\":" + json.quote(&fd.out_to[i]) + ",\"note\":" + json.quote(&fd.out_note[i]) + ",\"ts\":" + strconv.itoa(fd.out_ts[i]) + "}")
+    }
+    << json_resp(200, "{\"friends\":[" + strings.join(fr_s, ",") + "],\"incoming\":[" + strings.join(in_s, ",") + "],\"outgoing\":[" + strings.join(out_s, ",") + "]}")
+}
+
+pub fn handle_friend_request(st $&State, req &HttpReq, now int) HttpResp {
+    au := authenticate(st, req, now)
+    if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
+    doc := json.parse(&req.body())
+    if !doc.ok() { << err_resp(400, "ERR_BAD_REQUEST", "invalid JSON", 0, 0, 0) }
+    r := doc.root()
+    tid := json_str_or(&doc, doc.get(r, "agent_id"), "")
+    $note := json_str_or(&doc, doc.get(r, "note"), "")
+    if note.len > 256 { note = note[0:256] }
+    if !is_valid_agent_id(tid + "") || tid == au.agent_id {
+        << err_resp(400, "ERR_BAD_REQUEST", "invalid target agent_id", 0, 0, 0)
+    }
+    tag := read_agent_summary(st, tid + "")
+    if !tag.found { << err_resp(404, "ERR_NOT_FOUND", "target agent not found", 0, 0, 0) }
+    if tag.status == "revoked" { << err_resp(403, "ERR_REVOKED", "target agent is revoked", 0, 0, 0) }
+
+    $my_fd := load_friends_data(st, au.agent_id + "", now)
+    $t_fd := load_friends_data(st, tid + "", now)
+    if str_list_contains(&t_fd.blocks, au.agent_id + "") {
+        << err_resp(403, "ERR_FORBIDDEN", "blocked by recipient", 0, 0, 0)
+    }
+    if str_list_contains(&my_fd.friends, tid + "") {
+        << json_resp(200, "{\"ok\":true,\"status\":\"already_friends\"}")
+    }
+    remove_out_req($&my_fd, tid + "")
+    my_fd.out_to.push(tid + "")
+    my_fd.out_note.push(note + "")
+    my_fd.out_ts.push(now)
+
+    remove_in_req($&t_fd, au.agent_id + "")
+    t_fd.in_from.push(au.agent_id + "")
+    t_fd.in_note.push(note + "")
+    t_fd.in_ts.push(now)
+
+    save_friends_data(st, au.agent_id + "", &my_fd) or (err) { << err_resp(500, "ERR_INTERNAL", "save friends failed", 0, 0, 0) }
+    save_friends_data(st, tid + "", &t_fd) or (err) { << err_resp(500, "ERR_INTERNAL", "save target friends failed", 0, 0, 0) }
+    << json_resp(200, "{\"ok\":true,\"status\":\"pending\"}")
+}
+
+pub fn handle_friend_accept(st $&State, req &HttpReq, now int) HttpResp {
+    au := authenticate(st, req, now)
+    if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
+    doc := json.parse(&req.body())
+    if !doc.ok() { << err_resp(400, "ERR_BAD_REQUEST", "invalid JSON", 0, 0, 0) }
+    tid := json_str_or(&doc, doc.get(doc.root(), "agent_id"), "")
+    if !is_valid_agent_id(tid + "") { << err_resp(400, "ERR_BAD_REQUEST", "invalid agent_id", 0, 0, 0) }
+
+    $my_fd := load_friends_data(st, au.agent_id + "", now)
+    if !str_list_contains(&my_fd.in_from, tid + "") {
+        << err_resp(404, "ERR_NOT_FOUND", "no pending incoming friend request from " + tid, 0, 0, 0)
+    }
+    $t_fd := load_friends_data(st, tid + "", now)
+    remove_in_req($&my_fd, tid + "")
+    remove_out_req($&t_fd, au.agent_id + "")
+    if !str_list_contains(&my_fd.friends, tid + "") { my_fd.friends.push(tid + "") }
+    if !str_list_contains(&t_fd.friends, au.agent_id + "") { t_fd.friends.push(au.agent_id + "") }
+    save_friends_data(st, au.agent_id + "", &my_fd) or (err) { << err_resp(500, "ERR_INTERNAL", "save failed", 0, 0, 0) }
+    save_friends_data(st, tid + "", &t_fd) or (err) { << err_resp(500, "ERR_INTERNAL", "save failed", 0, 0, 0) }
+    << json_resp(200, "{\"ok\":true,\"status\":\"accepted\"}")
+}
+
+pub fn handle_friend_reject(st $&State, req &HttpReq, now int) HttpResp {
+    au := authenticate(st, req, now)
+    if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
+    doc := json.parse(&req.body())
+    if !doc.ok() { << err_resp(400, "ERR_BAD_REQUEST", "invalid JSON", 0, 0, 0) }
+    tid := json_str_or(&doc, doc.get(doc.root(), "agent_id"), "")
+    if !is_valid_agent_id(tid + "") { << err_resp(400, "ERR_BAD_REQUEST", "invalid agent_id", 0, 0, 0) }
+    $my_fd := load_friends_data(st, au.agent_id + "", now)
+    $t_fd := load_friends_data(st, tid + "", now)
+    remove_in_req($&my_fd, tid + "")
+    remove_out_req($&t_fd, au.agent_id + "")
+    save_friends_data(st, au.agent_id + "", &my_fd) or (err) { << err_resp(500, "ERR_INTERNAL", "save failed", 0, 0, 0) }
+    save_friends_data(st, tid + "", &t_fd) or (err) { << err_resp(500, "ERR_INTERNAL", "save failed", 0, 0, 0) }
+    << json_resp(200, "{\"ok\":true,\"status\":\"rejected\"}")
+}
+
+pub fn handle_friend_rm(st $&State, req &HttpReq, tid string, now int) HttpResp {
+    au := authenticate(st, req, now)
+    if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
+    if !is_valid_agent_id(tid + "") { << err_resp(400, "ERR_BAD_REQUEST", "invalid agent_id", 0, 0, 0) }
+    $my_fd := load_friends_data(st, au.agent_id + "", now)
+    $t_fd := load_friends_data(st, tid + "", now)
+    my_fd.friends = remove_str_from(&my_fd.friends, tid + "")
+    t_fd.friends = remove_str_from(&t_fd.friends, au.agent_id + "")
+    save_friends_data(st, au.agent_id + "", &my_fd) or (err) { << err_resp(500, "ERR_INTERNAL", "save failed", 0, 0, 0) }
+    save_friends_data(st, tid + "", &t_fd) or (err) { << err_resp(500, "ERR_INTERNAL", "save failed", 0, 0, 0) }
+    << json_resp(200, "{\"ok\":true}")
+}
+
+pub fn handle_blocks_list(st $&State, req &HttpReq, now int) HttpResp {
+    au := authenticate(st, req, now)
+    if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
+    fd := load_friends_data(st, au.agent_id + "", now)
+    $bl := []string{}
+    for i in 0:fd.blocks.len { bl.push(json.quote(&fd.blocks[i])) }
+    << json_resp(200, "{\"blocks\":[" + strings.join(bl, ",") + "]}")
+}
+
+pub fn handle_block_add(st $&State, req &HttpReq, now int) HttpResp {
+    au := authenticate(st, req, now)
+    if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
+    doc := json.parse(&req.body())
+    if !doc.ok() { << err_resp(400, "ERR_BAD_REQUEST", "invalid JSON", 0, 0, 0) }
+    tgt := strings.trim_space(&json_str_or(&doc, doc.get(doc.root(), "target"), ""))
+    if tgt.len == 0 || tgt.len > 128 { << err_resp(400, "ERR_BAD_REQUEST", "invalid block target", 0, 0, 0) }
+    $fd := load_friends_data(st, au.agent_id + "", now)
+    if !str_list_contains(&fd.blocks, tgt + "") { fd.blocks.push(tgt + "") }
+    save_friends_data(st, au.agent_id + "", &fd) or (err) { << err_resp(500, "ERR_INTERNAL", "save failed", 0, 0, 0) }
+    << json_resp(200, "{\"ok\":true,\"target\":" + json.quote(&tgt) + "}")
+}
+
+pub fn handle_block_rm(st $&State, req &HttpReq, tgt string, now int) HttpResp {
+    au := authenticate(st, req, now)
+    if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
+    $fd := load_friends_data(st, au.agent_id + "", now)
+    fd.blocks = remove_str_from(&fd.blocks, tgt + "")
+    save_friends_data(st, au.agent_id + "", &fd) or (err) { << err_resp(500, "ERR_INTERNAL", "save failed", 0, 0, 0) }
+    << json_resp(200, "{\"ok\":true}")
+}
+
+// =========================================================================
+// Zero-Disk E2EE Relay (DM & Room) + Webhook fallback
+// =========================================================================
+
+fn deliver_webhook(url_s string, payload string) {
+    $cl := http.new_client()
+    cl.set_timeout(5000000000)
+    extra := "Content-Type: application/json\r\n"
+    _ := cl.do_extra("POST", url_s, extra, &payload) or (err) { << }
+}
+
+fn agent_ext_str(ag &AgentSummary, key string, def string) string {
+    doc := json.parse(&ag.raw_json)
+    if !doc.ok() || !doc.has(doc.root(), "extensions") { << def }
+    en := doc.get(doc.root(), "extensions")
+    if !doc.is_dict(en) || !doc.has(en, key + "") { << def }
+    << json_str_or(&doc, doc.get(en, key + ""), def)
+}
+
+fn agent_ext_bool(ag &AgentSummary, key string, def bool) bool {
+    doc := json.parse(&ag.raw_json)
+    if !doc.ok() || !doc.has(doc.root(), "extensions") { << def }
+    en := doc.get(doc.root(), "extensions")
+    if !doc.is_dict(en) || !doc.has(en, key + "") { << def }
+    << json_bool_or(&doc, doc.get(en, key + ""), def)
+}
+
+pub fn handle_dm_send(hub $&HubState, req &HttpReq, to_id string, now int) HttpResp {
+    if !is_valid_agent_id(to_id + "") { << err_resp(404, "ERR_NOT_FOUND", "recipient not found", 0, 0, 0) }
+    au := authenticate($&hub.st, req, now)
+    if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
+
+    body := req.body()
+    if body.len == 0 || body.len > 32768 {
+        << err_resp(413, "ERR_PAYLOAD_TOO_LARGE", "DM frame must be 1..32768 bytes", 0, 0, 0)
+    }
+    fdoc := json.parse(&body)
+    if !fdoc.ok() || !fdoc.is_dict(fdoc.root()) {
+        << err_resp(400, "ERR_BAD_REQUEST", "DM frame must be JSON object", 0, 0, 0)
+    }
+
+    tag := read_agent_summary(&hub.st, to_id + "")
+    if !tag.found { << err_resp(404, "ERR_NOT_FOUND", "recipient not found", 0, 0, 0) }
+    if tag.status == "revoked" { << err_resp(403, "ERR_REVOKED", "recipient revoked", 0, 0, 0) }
+
+    t_fd := load_friends_data(&hub.st, to_id + "", now)
+    if str_list_contains(&t_fd.blocks, au.agent_id + "") {
+        << err_resp(403, "ERR_FORBIDDEN", "blocked by recipient", 0, 0, 0)
+    }
+    dmp := agent_ext_str(&tag, "dm_policy", "friends")
+    if dmp == "none" {
+        << err_resp(403, "ERR_FORBIDDEN", "recipient disables direct messages", 0, 0, 0)
+    }
+    if dmp == "friends" && to_id != au.agent_id && !str_list_contains(&t_fd.friends, au.agent_id + "") {
+        << err_resp(403, "ERR_FORBIDDEN", "recipient dm_policy is friends", 0, 0, 0)
+    }
+
+    ev_json := "{\"from\":" + json.quote(&au.agent_id) + ",\"frame\":" + body + "}"
+    delivered := hub_push_dm(hub, to_id + "", &ev_json)
+    if delivered == 0 {
+        wh := agent_ext_str(&tag, "webhook_url", "")
+        if is_https_url(&wh) {
+            wh_body := "{\"event\":\"dm\",\"data\":" + ev_json + "}"
+            xu deliver_webhook(wh, wh_body)
+            << json_resp(202, "{\"ok\":true,\"delivered\":\"webhook\"}")
+        }
+        << json_resp(202, "{\"ok\":true,\"delivered\":\"dropped_offline\"}")
+    }
+    << json_resp(202, "{\"ok\":true,\"delivered\":\"sse\",\"streams\":" + strconv.itoa(delivered) + "}")
+}
+
+pub fn handle_room_send(hub $&HubState, req &HttpReq, room_id string, now int) HttpResp {
+    if !is_valid_room_id(room_id + "") { << err_resp(400, "ERR_BAD_REQUEST", "invalid room_id", 0, 0, 0) }
+    au := authenticate($&hub.st, req, now)
+    if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
+
+    body := req.body()
+    if body.len == 0 || body.len > 32768 {
+        << err_resp(413, "ERR_PAYLOAD_TOO_LARGE", "room frame must be 1..32768 bytes", 0, 0, 0)
+    }
+    fdoc := json.parse(&body)
+    if !fdoc.ok() || !fdoc.is_dict(fdoc.root()) {
+        << err_resp(400, "ERR_BAD_REQUEST", "room frame must be JSON object", 0, 0, 0)
+    }
+    ev_json := "{\"room_id\":" + json.quote(&room_id) + ",\"from\":" + json.quote(&au.agent_id) + ",\"frame\":" + body + "}"
+    delivered := hub_push_room(hub, room_id + "", au.agent_id + "", &ev_json)
+    << json_resp(202, "{\"ok\":true,\"room_id\":" + json.quote(&room_id) + ",\"streams\":" + strconv.itoa(delivered) + "}")
+}
+
+// =========================================================================
+// 10-Day Encrypted Mail (/internal/mail/ingest, /v1/mail, DELETE /v1/mail/{id})
+// =========================================================================
+
+pub fn handle_mail_ingest(hub $&HubState, req &HttpReq, now int) HttpResp {
+    if hub.st.mail_secret.len == 0 {
+        << err_resp(503, "ERR_INTERNAL", "mail ingest disabled", 0, 0, 0)
+    }
+    sec := strings.trim_space(&req.header("X-Internal-Secret"))
+    if sec != hub.st.mail_secret {
+        << err_resp(401, "ERR_BAD_SIGNATURE", "invalid X-Internal-Secret", 0, 0, 0)
+    }
+    doc := json.parse(&req.body())
+    if !doc.ok() { << err_resp(400, "ERR_BAD_REQUEST", "invalid JSON", 0, 0, 0) }
+    r := doc.root()
+    to_id := json_str_or(&doc, doc.get(r, "to_agent_id"), "")
+    mfrom := json_str_or(&doc, doc.get(r, "from"), "")
+    subj := json_str_or(&doc, doc.get(r, "subject"), "")
+    snippet := json_str_or(&doc, doc.get(r, "raw_snippet"), "")
+    spf := json_bool_or(&doc, doc.get(r, "spf_pass"), false)
+    dkim := json_bool_or(&doc, doc.get(r, "dkim_pass"), false)
+    dmarc := json_bool_or(&doc, doc.get(r, "dmarc_pass"), false)
+    $rat := json_int_or(&doc, doc.get(r, "received_at"), now)
+    if rat <= 0 { rat = now }
+
+    if !is_valid_agent_id(to_id + "") { << err_resp(400, "ERR_BAD_REQUEST", "invalid to_agent_id", 0, 0, 0) }
+    tag := read_agent_summary(&hub.st, to_id + "")
+    if !tag.found { << err_resp(404, "ERR_NOT_FOUND", "recipient not found", 0, 0, 0) }
+    if tag.status == "revoked" { << err_resp(403, "ERR_REVOKED", "recipient revoked", 0, 0, 0) }
+    if !agent_ext_bool(&tag, "accept_email", false) {
+        << err_resp(403, "ERR_FORBIDDEN", "recipient accept_email is false", 0, 0, 0)
+    }
+
+    for i in 0:hub.st.banned_emails.len {
+        if glob_match(hub.st.banned_emails[i] + "", mfrom + "") {
+            << err_resp(403, "ERR_FORBIDDEN", "sender banned globally", 0, 0, 0)
+        }
+    }
+    t_fd := load_friends_data(&hub.st, to_id + "", now)
+    for i in 0:t_fd.blocks.len {
+        pat := t_fd.blocks[i] + ""
+        if !strings.has_prefix(&pat, "ftx_") && glob_match(pat, mfrom + "") {
+            << err_resp(403, "ERR_FORBIDDEN", "sender blocked by recipient", 0, 0, 0)
+        }
+    }
+
+    pk := parse_spki_rsa_pem(&tag.pub_pem) or (err) {
+        << err_resp(500, "ERR_INTERNAL", "recipient public key invalid", 0, 0, 0)
+    }
+    ul := new_ulid() or (err) { << err_resp(500, "ERR_INTERNAL", "RNG failure", 0, 0, 0) }
+    mail_id := "eml_" + ul
+
+    $spf_s := "false"
+    if spf { spf_s = "true" }
+    $dkim_s := "false"
+    if dkim { dkim_s = "true" }
+    $dmarc_s := "false"
+    if dmarc { dmarc_s = "true" }
+
+    pt_inner := "{\"from\":" + json.quote(&mfrom) +
+        ",\"subject\":" + json.quote(&subj) +
+        ",\"raw_snippet\":" + json.quote(&snippet) +
+        ",\"spf_pass\":" + spf_s + "" +
+        ",\"dkim_pass\":" + dkim_s + "" +
+        ",\"dmarc_pass\":" + dmarc_s + "" + "}"
+    env_json := encrypt_mail_envelope(to_id + "", mail_id + "", tag.key_version, &pk, &pt_inner) or (err) {
+        << err_resp(500, "ERR_INTERNAL", "encryption failed: " + err.msg(), 0, 0, 0)
+    }
+
+    stored_json := "{\"mail_id\":" + json.quote(&mail_id) +
+        ",\"received_at\":" + strconv.itoa(rat) +
+        ",\"to_key_version\":" + strconv.itoa(tag.key_version) +
+        ",\"spf_pass\":" + spf_s +
+        ",\"dkim_pass\":" + dkim_s +
+        ",\"dmarc_pass\":" + dmarc_s +
+        ",\"envelope\":" + env_json + "}\n"
+
+    mkdir_all_quiet(mail_dir(&hub.st, to_id + ""))
+    write_atomic(mail_item_path(&hub.st, to_id + "", mail_id + ""), &stored_json) or (err) {
+        << err_resp(500, "ERR_INTERNAL", "failed persisting encrypted mail", 0, 0, 0)
+    }
+    ev_data := "{\"mail_id\":" + json.quote(&mail_id) + ",\"received_at\":" + strconv.itoa(rat) + "}"
+    _ := hub_push_to_agent(hub, to_id + "", "mail", &ev_data)
+    << json_resp(201, "{\"ok\":true,\"mail_id\":" + json.quote(&mail_id) + ",\"to_key_version\":" + strconv.itoa(tag.key_version) + "}")
+}
+
+pub fn handle_mail_list(st $&State, req &HttpReq, now int) HttpResp {
+    au := authenticate(st, req, now)
+    if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
+    mdir := mail_dir(st, au.agent_id + "")
+    raw_names := os.read_dir(mdir + "") or (err) {
+        << json_resp(200, "{\"mail\":[]}")
+    }
+    $since := ""
+    raw_q := req.path()
+    qidx := strings.index_of(&raw_q, "?")
+    if qidx >= 0 {
+        qp := raw_q[(qidx + 1):raw_q.len]
+        kvs := strings.split(&qp, "&")
+        for i in 0:kvs.len {
+            if strings.has_prefix(&kvs[i], "since=") {
+                since = kvs[i][6:kvs[i].len]
+            }
+        }
+    }
+
+    lines := strings.split(&raw_names, "\n")
+    $fnames := []string{}
+    for i in 0:lines.len {
+        fn_s := strings.trim_space(&lines[i])
+        if strings.has_suffix(&fn_s, ".json") && strings.has_prefix(&fn_s, "eml_") {
+            fnames.push(fn_s)
+        }
+    }
+    // Sort lexicographically (ULID filenames sort chronologically)
+    $si := 0
+    while si < fnames.len {
+        $sj := si + 1
+        while sj < fnames.len {
+            if strings.compare(&fnames[sj], &fnames[si]) < 0 {
+                tmp := fnames[si] + ""
+                fnames[si] = fnames[sj] + ""
+                fnames[sj] = tmp
+            }
+            sj += 1
+        }
+        si += 1
+    }
+
+    $items := []string{}
+    for i in 0:fnames.len {
+        fn_s := fnames[i] + ""
+        full := mdir + "/" + fn_s
+        raw := read_file_or_empty(full + "")
+        if raw.len == 0 { -> }
+        doc := json.parse(&raw)
+        if !doc.ok() { -> }
+        r := doc.root()
+        mid := json_str_or(&doc, doc.get(r, "mail_id"), "")
+        rat := json_int_or(&doc, doc.get(r, "received_at"), 0)
+        if rat > 0 && now - rat > MAIL_TTL_SEC {
+            _ := os.remove(full) or (err) { -> }
+            ->
+        }
+        if since.len > 0 && strings.compare(&mid, &since) <= 0 {
+            ->
+        }
+        items.push(strings.trim_space(&raw))
+    }
+    << json_resp(200, "{\"mail\":[" + strings.join(items, ",") + "]}")
+}
+
+pub fn handle_mail_delete(st $&State, req &HttpReq, mail_id string, now int) HttpResp {
+    au := authenticate(st, req, now)
+    if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
+    if !is_valid_mail_id(mail_id + "") {
+        << err_resp(404, "ERR_NOT_FOUND", "mail not found", 0, 0, 0)
+    }
+    p := mail_item_path(st, au.agent_id + "", mail_id + "")
+    _ := os.remove(p) or (err) {
+        << err_resp(404, "ERR_NOT_FOUND", "mail not found", 0, 0, 0)
+    }
+    << json_resp(200, "{\"ok\":true,\"deleted\":" + json.quote(&mail_id) + "}")
+}

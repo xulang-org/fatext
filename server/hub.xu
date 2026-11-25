@@ -1,0 +1,502 @@
+@main
+
+#os
+#maps
+#strconv
+#strings
+#time
+#crypto/sha256
+#encoding/json
+
+pub const HUB_HTTP = 1
+pub const HUB_SSE_SUB = 2
+pub const HUB_SSE_UNSUB = 3
+
+pub struct SseClient {
+    pub id int
+    pub agent_id string
+    pub channels []string
+    pub rooms []string
+    pub ch chan string
+}
+
+pub struct HubReply {
+    pub resp HttpResp
+    pub is_sse bool
+    pub sse_id int
+    pub sse_ch chan string
+}
+
+pub struct HubJob {
+    pub kind int
+    pub req HttpReq
+    pub sse_id int
+    pub reply_ch chan HubReply
+}
+
+pub struct HubState {
+    pub st State
+    pub clients []SseClient
+    pub next_sse_id int
+    pub ip_hits maps.StrInt
+    pub ip_window int
+}
+
+pub fn new_hub_state(st State) HubState {
+    << HubState{
+        st: st,
+        clients: []SseClient{},
+        next_sse_id: 1,
+        ip_hits: maps.new_str_int(),
+        ip_window: 0
+    }
+}
+
+fn empty_sse_ch() chan string {
+    << chan string{cap: 1}
+}
+
+fn reply_http(resp HttpResp) HubReply {
+    << HubReply{resp: resp, is_sse: false, sse_id: 0, sse_ch: empty_sse_ch()}
+}
+
+fn send_sse_msg(cli &SseClient, msg string) {
+    select {
+        cli.ch <- msg {}
+        else {}
+    }
+}
+
+pub fn hub_push_to_agent(hub &HubState, agent_id string, event_type string, data_json &string) int {
+    msg := "event: " + event_type + "\ndata: " + data_json + "\n\n"
+    $sent := 0
+    for i in 0:hub.clients.len {
+        if hub.clients[i].agent_id == agent_id {
+            send_sse_msg(&hub.clients[i], msg + "")
+            sent += 1
+        }
+    }
+    << sent
+}
+
+pub fn hub_push_dm(hub &HubState, to_id string, data_json &string) int {
+    << hub_push_to_agent(hub, to_id, "dm", data_json)
+}
+
+pub fn hub_push_room(hub &HubState, room_id string, sender_id string, data_json &string) int {
+    msg := "event: room\ndata: " + data_json + "\n\n"
+    $sent := 0
+    for i in 0:hub.clients.len {
+        c := &hub.clients[i]
+        if c.agent_id == sender_id { -> }
+        if str_list_contains(&c.rooms, room_id + "") || c.rooms.len == 0 {
+            send_sse_msg(c, msg + "")
+            sent += 1
+        }
+    }
+    << sent
+}
+
+pub fn hub_push_channel(hub &HubState, ch string, event_type string, data_json &string) int {
+    msg := "event: " + event_type + "\ndata: " + data_json + "\n\n"
+    $sent := 0
+    for i in 0:hub.clients.len {
+        c := &hub.clients[i]
+        if c.channels.len == 0 || str_list_contains(&c.channels, ch + "") {
+            send_sse_msg(c, msg + "")
+            sent += 1
+        }
+    }
+    << sent
+}
+
+pub fn path_only(raw string) string {
+    for i in 0:raw.len {
+        if (raw[i] & 255) == 63 {
+            << raw[0:i]
+        }
+    }
+    << raw + ""
+}
+
+fn clear_map(m $&maps.StrInt) {
+    m.clear()
+}
+
+fn check_ip_rate_limit(hub $&HubState, remote_ip string, now int) bool {
+    if hub.st.ip_rpm <= 0 { << true }
+    win := now / 60
+    if win != hub.ip_window {
+        hub.ip_window = win
+        clear_map($&hub.ip_hits)
+    }
+    $k := remote_ip + ""
+    if k.len == 0 { k = "unknown" }
+    cur := map_get_or(&hub.ip_hits, k + "", 0)
+    if cur >= hub.st.ip_rpm { << false }
+    map_set($&hub.ip_hits, k + "", cur + 1)
+    << true
+}
+
+fn parse_csv_query_param(raw_path string, key string) []string {
+    $out := []string{}
+    qidx := strings.index_of(&raw_path, "?")
+    if qidx < 0 { << out }
+    qp := raw_path[(qidx + 1):raw_path.len]
+    parts := strings.split(&qp, "&")
+    prefix := key + "="
+    for i in 0:parts.len {
+        p := parts[i] + ""
+        if strings.has_prefix(&p, prefix) {
+            v := p[prefix.len:p.len]
+            items := strings.split(&v, ",")
+            for j in 0:items.len {
+                t := strings.trim_space(&items[j])
+                if t.len > 0 { out.push(t) }
+            }
+        }
+    }
+    << out
+}
+
+fn url_decode_simple(s &string) string {
+    $out := ""
+    $i := 0
+    while i < s.len {
+        c := s[i] & 255
+        if c == 37 && i + 2 < s.len {
+            h1 := s[i + 1] & 255
+            h2 := s[i + 2] & 255
+            v1 := hex_val(h1)
+            v2 := hex_val(h2)
+            if v1 >= 0 && v2 >= 0 {
+                out.push_byte((v1 << 4) | v2)
+                i += 3
+                ->
+            }
+        }
+        out.push_byte(c)
+        i += 1
+    }
+    << out
+}
+
+fn hex_val(c int) int {
+    if c >= 48 && c <= 57 { << c - 48 }
+    if c >= 65 && c <= 70 { << c - 55 }
+    if c >= 97 && c <= 102 { << c - 87 }
+    << -1
+}
+
+fn maybe_run_maintenance(st $&State, now int) {
+    // Daily anchor .sha256 generation for yesterday's UTC channel archives
+    today := utc_date_from_unix(now)
+    if st.last_anchor_date != today {
+        st.last_anchor_date = today + ""
+        yday := shift_utc_date(today + "", -1)
+        for i in 0:st.channels.len {
+            ch := st.channels[i].name + ""
+            p := channel_day_path(st, ch + "", yday + "")
+            raw := read_file_or_empty(p + "")
+            if raw.len > 0 {
+                sha_p := p + ".sha256"
+                if read_file_or_empty(sha_p + "").len == 0 {
+                    anchor := sha256.sum256(raw + "") + "  " + yday + ".jsonl\n"
+                    write_atomic_quiet(sha_p, &anchor)
+                }
+            }
+        }
+    }
+
+    // Periodic 10-day mail GC every 3600s
+    if now - st.last_gc >= 3600 {
+        st.last_gc = now
+        mail_root := st.data_dir + "/mail"
+        buckets := os.read_dir(mail_root + "") or (err) { << }
+        blines := strings.split(&buckets, "\n")
+        for bi in 0:blines.len {
+            b := strings.trim_space(&blines[bi])
+            if b.len != 2 { -> }
+            bdir := mail_root + "/" + b
+            agents := os.read_dir(bdir + "") or (err) { -> }
+            alines := strings.split(&agents, "\n")
+            for ai in 0:alines.len {
+                aid := strings.trim_space(&alines[ai])
+                if !is_valid_agent_id(aid + "") { -> }
+                adir := bdir + "/" + aid
+                files := os.read_dir(adir + "") or (err) { -> }
+                flines := strings.split(&files, "\n")
+                for fi in 0:flines.len {
+                    fn_s := strings.trim_space(&flines[fi])
+                    if !strings.has_suffix(&fn_s, ".json") { -> }
+                    fpath := adir + "/" + fn_s
+                    raw := read_file_or_empty(fpath + "")
+                    doc := json.parse(&raw)
+                    if doc.ok() && doc.has(doc.root(), "received_at") {
+                        rat := json_int_or(&doc, doc.get(doc.root(), "received_at"), 0)
+                        if rat > 0 && now - rat > MAIL_TTL_SEC {
+                            _ := os.remove(fpath + "") or (err) { -> }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn dispatch_http(hub $&HubState, req &HttpReq, now int) HttpResp {
+    method := req.method()
+    path := path_only(req.path())
+
+    if method == "GET" && path == "/health" {
+        << http_resp(200, "text/plain; charset=utf-8", "", &"ok\n")
+    }
+    if method == "GET" {
+        st_resp := serve_static_allowlisted(&hub.st, path + "")
+        if st_resp.status != 0 { << st_resp }
+        if strings.has_prefix(&path, "/dl/") {
+            << serve_dl_file(&hub.st, path[4:path.len])
+        }
+    }
+
+    if path == "/internal/mail/ingest" {
+        if method != "POST" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+        << handle_mail_ingest(hub, req, now)
+    }
+
+    if path == "/v1/agents/register" {
+        if method != "POST" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+        << handle_register($&hub.st, req, now)
+    }
+    if path == "/v1/agents/profile" {
+        if method != "PUT" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+        << handle_profile_update($&hub.st, req, now)
+    }
+    if path == "/v1/agents/rotate-key" {
+        if method != "POST" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+        << handle_rotate_key($&hub.st, req, now)
+    }
+    if path == "/v1/agents/revoke" {
+        if method != "POST" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+        << handle_revoke($&hub.st, req, now)
+    }
+
+    if path == "/v1/friends" {
+        if method != "GET" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+        << handle_friends_list($&hub.st, req, now)
+    }
+    if path == "/v1/friends/request" {
+        if method != "POST" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+        << handle_friend_request($&hub.st, req, now)
+    }
+    if path == "/v1/friends/accept" {
+        if method != "POST" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+        << handle_friend_accept($&hub.st, req, now)
+    }
+    if path == "/v1/friends/reject" {
+        if method != "POST" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+        << handle_friend_reject($&hub.st, req, now)
+    }
+    if strings.has_prefix(&path, "/v1/friends/") {
+        if method != "DELETE" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+        << handle_friend_rm($&hub.st, req, path[12:path.len], now)
+    }
+
+    if path == "/v1/blocks" {
+        if method == "GET" { << handle_blocks_list($&hub.st, req, now) }
+        if method == "POST" { << handle_block_add($&hub.st, req, now) }
+        << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0)
+    }
+    if strings.has_prefix(&path, "/v1/blocks/") {
+        if method != "DELETE" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+        raw_t := path[11:path.len]
+        << handle_block_rm($&hub.st, req, url_decode_simple(&raw_t), now)
+    }
+
+    if strings.has_prefix(&path, "/v1/dm/") {
+        if method != "POST" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+        << handle_dm_send(hub, req, path[7:path.len], now)
+    }
+    if strings.has_prefix(&path, "/v1/rooms/") && strings.has_suffix(&path, "/send") && path.len > 15 {
+        if method != "POST" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+        rid := path[10:(path.len - 5)]
+        << handle_room_send(hub, req, rid, now)
+    }
+
+    if path == "/v1/mail" {
+        if method != "GET" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+        << handle_mail_list($&hub.st, req, now)
+    }
+    if strings.has_prefix(&path, "/v1/mail/") {
+        if method != "DELETE" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+        << handle_mail_delete($&hub.st, req, path[9:path.len], now)
+    }
+
+    if strings.has_prefix(&path, "/v1/channels/") {
+        rest := path[13:path.len]
+        parts := strings.split(&rest, "/")
+        if parts.len == 2 && parts[1] == "pins" {
+            if method != "GET" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+            << handle_get_pins(&hub.st, parts[0] + "", now)
+        }
+        if parts.len == 2 && parts[1] == "posts" {
+            if method != "POST" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+            ch := parts[0] + ""
+            resp := handle_create_post($&hub.st, req, ch + "", now)
+            if resp.status == 201 {
+                rdoc := json.parse(&resp.body)
+                if rdoc.ok() && rdoc.has(rdoc.root(), "msg_id") {
+                    mid := json_str_or(&rdoc, rdoc.get(rdoc.root(), "msg_id"), "")
+                    recs := read_jsonl_records(thread_path(&hub.st, mid + ""))
+                    if recs.len > 0 {
+                        _ := hub_push_channel(hub, ch + "", "post", &recs[0].raw_line)
+                    }
+                }
+            }
+            << resp
+        }
+    }
+
+    if strings.has_prefix(&path, "/v1/threads/") {
+        rest := path[12:path.len]
+        parts := strings.split(&rest, "/")
+        if parts.len == 2 && parts[1] == "replies" {
+            if method != "POST" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+            tid := parts[0] + ""
+            resp := handle_create_reply($&hub.st, req, tid + "", now)
+            if resp.status == 201 {
+                recs := read_jsonl_records(thread_path(&hub.st, tid + ""))
+                if recs.len > 0 {
+                    ch := recs[0].channel + ""
+                    last := recs[recs.len - 1].raw_line + ""
+                    _ := hub_push_channel(hub, ch, "reply", &last)
+                }
+            }
+            << resp
+        }
+    }
+
+    if strings.has_prefix(&path, "/k/") && method == "GET" {
+        rest := path[3:path.len]
+        if strings.has_suffix(&rest, ".json") {
+            << handle_get_key_json(&hub.st, rest[0:(rest.len - 5)])
+        }
+        if strings.has_suffix(&rest, ".pem") {
+            << handle_get_key_pem(&hub.st, rest[0:(rest.len - 4)])
+        }
+    }
+
+    if strings.has_prefix(&path, "/c/") && method == "GET" {
+        rest := path[3:path.len]
+        parts := strings.split(&rest, "/")
+        if parts.len == 1 && parts[0].len > 0 {
+            << serve_channel(&hub.st, parts[0] + "", "", false, now)
+        }
+        if parts.len == 2 {
+            ch := parts[0] + ""
+            seg := parts[1] + ""
+            if strings.has_suffix(&seg, ".jsonl") {
+                << handle_get_channel_jsonl(&hub.st, ch, seg[0:(seg.len - 6)])
+            }
+            if strings.has_suffix(&seg, ".sha256") {
+                << handle_get_channel_sha256(&hub.st, ch, seg[0:(seg.len - 7)])
+            }
+            << serve_channel(&hub.st, ch, seg, true, now)
+        }
+    }
+
+    if strings.has_prefix(&path, "/t/") && method == "GET" {
+        rest := path[3:path.len]
+        if strings.has_suffix(&rest, ".jsonl") {
+            << handle_get_thread_jsonl(&hub.st, rest[0:(rest.len - 6)])
+        }
+        if rest.len > 0 && !strings.contains(&rest, "/") {
+            << serve_thread(&hub.st, rest)
+        }
+    }
+
+    if strings.has_prefix(&path, "/a/") && method == "GET" {
+        aid := path[3:path.len]
+        if aid.len > 0 && !strings.contains(&aid, "/") {
+            << serve_agent(&hub.st, aid)
+        }
+    }
+
+    if path == "/" && method == "GET" {
+        << serve_home(&hub.st, now)
+    }
+
+    if strings.has_prefix(&path, "/v1/") {
+        << err_resp(404, "ERR_NOT_FOUND", "endpoint not found", 0, 0, 0)
+    }
+    << serve_error_html(&hub.st, 404, "ERR_NOT_FOUND", "No page or data resource exists at " + path)
+}
+
+pub fn hub_loop(hub_init HubState, jobs chan HubJob) {
+    $hub := hub_init
+    while true {
+        job := <-jobs
+        now := time.now_time().unix()
+        reload_configs_if_needed($&hub.st, now)
+        maybe_run_maintenance($&hub.st, now)
+
+        if job.kind == HUB_SSE_UNSUB {
+            $next_clients := []SseClient{}
+            for i in 0:hub.clients.len {
+                c := &hub.clients[i]
+                if c.id != job.sse_id {
+                    next_clients.push(SseClient{
+                        id: c.id,
+                        agent_id: c.agent_id + "",
+                        channels: clone_str_slice(&c.channels),
+                        rooms: clone_str_slice(&c.rooms),
+                        ch: c.ch
+                    })
+                }
+            }
+            hub.clients = next_clients
+            job.reply_ch <- reply_http(json_resp(200, "{\"ok\":true}"))
+            ->
+        }
+
+        if !check_ip_rate_limit($&hub, job.req.remote_ip + "", now) {
+            job.reply_ch <- reply_http(err_resp(429, "ERR_RATE_LIMITED", "IP rate limit exceeded", 60, now + 60, 0))
+            ->
+        }
+
+        if job.kind == HUB_SSE_SUB {
+            if job.req.method() != "GET" {
+                job.reply_ch <- reply_http(err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0))
+                ->
+            }
+            au := authenticate($&hub.st, &job.req, now)
+            if !au.ok {
+                job.reply_ch <- reply_http(err_resp(au.status, au.code, au.message, 0, 0, 0))
+                ->
+            }
+            sid := hub.next_sse_id
+            hub.next_sse_id += 1
+            ch := chan string{cap: 64}
+            chs := parse_csv_query_param(job.req.path(), "channels")
+            rms := parse_csv_query_param(job.req.path(), "rooms")
+            cli := SseClient{
+                id: sid,
+                agent_id: au.agent_id + "",
+                channels: chs,
+                rooms: rms,
+                ch: ch
+            }
+            hub.clients.push(cli)
+            job.reply_ch <- HubReply{
+                resp: HttpResp{status: 200, ctype: "text/event-stream", extra: "", body: ""},
+                is_sse: true,
+                sse_id: sid,
+                sse_ch: ch
+            }
+            ->
+        }
+
+        resp := dispatch_http($&hub, &job.req, now)
+        job.reply_ch <- reply_http(resp)
+    }
+}

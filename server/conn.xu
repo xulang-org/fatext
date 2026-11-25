@@ -1,0 +1,294 @@
+@main
+
+#errors
+#crypto/tls
+#net
+#os
+#strconv
+#strings
+#time
+
+pub struct ClientConn {
+    pub is_tls bool
+    pub fd int
+    pub tc tls.Conn
+    pub remote_ip string
+    pub buf string
+}
+
+fn tls_read_q(tc $&tls.Conn, n int) string {
+    << tc.read(n) or >>
+}
+
+fn tls_write_q(tc $&tls.Conn, data &string) int {
+    << tc.write(data) or >>
+}
+
+fn tls_close_q(tc $&tls.Conn) {
+    tc.close() or (err) { << }
+}
+
+fn tls_set_deadline_q(tc $&tls.Conn, dl int) {
+    _ := tc.set_deadline(dl) or (err) { << }
+}
+
+pub fn cc_from_tcp(fd int, remote_ip string) ClientConn {
+    << ClientConn{
+        is_tls: false,
+        fd: fd,
+        tc: tls.closed_conn(),
+        remote_ip: remote_ip,
+        buf: ""
+    }
+}
+
+pub fn cc_from_tls(fd int, cert_pem &string, key_pem &string, remote_ip string) ClientConn {
+    $cfg := tls.new_config("")
+    cfg.cert_pem = cert_pem + ""
+    cfg.key_pem = key_pem + ""
+    nc := net.file_conn(fd) or >>
+    tc := tls.server(nc, &cfg) or >>
+    << ClientConn{
+        is_tls: true,
+        fd: fd,
+        tc: tc,
+        remote_ip: remote_ip,
+        buf: ""
+    }
+}
+
+pub fn cc_set_sock_timeout(cc $&ClientConn, dur_ns int) {
+    if cc.is_tls {
+        if dur_ns <= 0 {
+            tls_set_deadline_q($&cc.tc, 0)
+        } else {
+            tls_set_deadline_q($&cc.tc, time.now() + dur_ns)
+        }
+        <<
+    }
+    if cc.fd >= 0 {
+        _ := os.set_sock_timeout(cc.fd, dur_ns) or (err) { << }
+    }
+}
+
+pub fn cc_read(cc $&ClientConn, max int) string {
+    if cc.is_tls {
+        << tls_read_q($&cc.tc, max) or >>
+    }
+    << net.conn_read(cc.fd, max) or >>
+}
+
+pub fn cc_write(cc $&ClientConn, data &string) int {
+    if cc.is_tls {
+        << tls_write_q($&cc.tc, data) or (err) { << -1 }
+    }
+    << net.conn_write(cc.fd, data) or (err) { << -1 }
+}
+
+pub fn cc_disable_sigpipe(fd int) {
+    if fd < 0 { << }
+    _ := os.setsockopt_int(fd, 65535, 4130, 1) or (err) { << }
+}
+
+pub fn cc_peer_closed(cc &ClientConn) bool {
+    if cc.fd < 0 { << true }
+    mask := os.socket_wait(cc.fd, 1, -1) or (err) { << true }
+    if cc.is_tls {
+        << (mask & 12) != 0
+    }
+    << (mask & 13) != 0
+}
+
+pub fn cc_close(cc $&ClientConn) {
+    if cc.is_tls {
+        tls_close_q($&cc.tc)
+        cc.fd = -1
+        <<
+    }
+    if cc.fd >= 0 {
+        _ := net.conn_close(cc.fd) or (err) { << }
+        cc.fd = -1
+    }
+}
+
+pub struct HttpReq {
+    pub req_method string
+    pub req_path string
+    pub hdr_names []string
+    pub hdr_vals []string
+    pub req_body string
+    pub remote_ip string
+}
+
+pub fn (r &HttpReq) method() string {
+    << r.req_method + ""
+}
+
+pub fn (r &HttpReq) path() string {
+    << r.req_path + ""
+}
+
+pub fn (r &HttpReq) body() string {
+    << r.req_body + ""
+}
+
+pub fn (r &HttpReq) header(name string) string {
+    want := strings.to_lower(&name)
+    for i in 0:r.hdr_names.len {
+        if r.hdr_names[i] == want {
+            << r.hdr_vals[i] + ""
+        }
+    }
+    << ""
+}
+
+pub struct HttpResp {
+    pub status int
+    pub ctype string
+    pub extra string
+    pub body string
+}
+
+pub fn http_resp(status int, ctype string, extra string, body &string) HttpResp {
+    << HttpResp{status: status, ctype: ctype, extra: extra, body: body + ""}
+}
+
+pub fn json_resp(status int, body string) HttpResp {
+    << HttpResp{status: status, ctype: "application/json; charset=utf-8", extra: "", body: body}
+}
+
+fn http_reason(status int) string {
+    if status == 200 { << "OK" }
+    if status == 201 { << "Created" }
+    if status == 202 { << "Accepted" }
+    if status == 301 { << "Moved Permanently" }
+    if status == 400 { << "Bad Request" }
+    if status == 401 { << "Unauthorized" }
+    if status == 403 { << "Forbidden" }
+    if status == 404 { << "Not Found" }
+    if status == 405 { << "Method Not Allowed" }
+    if status == 409 { << "Conflict" }
+    if status == 413 { << "Payload Too Large" }
+    if status == 429 { << "Too Many Requests" }
+    << "Internal Server Error"
+}
+
+pub fn format_http_resp(r &HttpResp) string {
+    $out := "HTTP/1.1 " + strconv.itoa(r.status) + " " + http_reason(r.status) + "\r\n"
+    out = out + "Content-Type: " + r.ctype + "\r\n"
+    out = out + "Content-Length: " + strconv.itoa(r.body.len) + "\r\n"
+    out = out + "X-Content-Type-Options: nosniff\r\n"
+    if r.extra.len > 0 {
+        out = out + r.extra
+    }
+    out = out + "Connection: close\r\n\r\n"
+    out = out + r.body
+    << out
+}
+
+pub fn write_http_resp(cc $&ClientConn, r &HttpResp) int {
+    wire := format_http_resp(r)
+    << cc_write(cc, &wire) or (err) { << -1 }
+}
+
+pub fn write_sse_open(cc $&ClientConn) int {
+    hdr := "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nX-Accel-Buffering: no\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n: connected\n\n"
+    << cc_write(cc, &hdr) or (err) { << -1 }
+}
+
+fn parse_content_length_hdr(names &[]string, vals &[]string) int {
+    for i in 0:names.len {
+        if names[i] == "content-length" {
+            v := strings.trim_space(&vals[i])
+            n := strconv.atoi(&v) or (err) { << -1 }
+            << n
+        }
+    }
+    << 0
+}
+
+pub fn read_http_request(cc $&ClientConn) HttpReq {
+    cc_set_sock_timeout(cc, 10000000000)
+    $hdr_end := -1
+    while hdr_end < 0 {
+        idx := strings.index_of(&cc.buf, "\r\n\r\n")
+        if idx >= 0 {
+            hdr_end = idx
+            <-
+        }
+        if cc.buf.len > 16384 {
+            >> errors.new("header too large")
+        }
+        chunk := cc_read(cc, 4096) or >>
+        if chunk.len == 0 {
+            >> errors.new("eof reading request")
+        }
+        cc.buf = cc.buf + chunk
+    }
+    if hdr_end > 16384 {
+        >> errors.new("header too large")
+    }
+    head_s := cc.buf[0:hdr_end]
+    $rest := ""
+    if hdr_end + 4 < cc.buf.len {
+        rest = cc.buf[(hdr_end + 4):cc.buf.len]
+    }
+    cc.buf = ""
+
+    lines := strings.split(&head_s, "\r\n")
+    if lines.len == 0 {
+        >> errors.new("empty request")
+    }
+    req_parts := strings.split(&lines[0], " ")
+    if req_parts.len < 2 {
+        >> errors.new("malformed request line")
+    }
+    meth := strings.to_upper(&strings.trim_space(&req_parts[0]))
+    rpath := req_parts[1] + ""
+
+    $hnames := []string{}
+    $hvals := []string{}
+    for i in 1:lines.len {
+        ln := lines[i] + ""
+        col := strings.index_of(&ln, ":")
+        if col > 0 {
+            k := strings.to_lower(&strings.trim_space(&ln[0:col]))
+            $v := ""
+            if col + 1 < ln.len {
+                v = strings.trim_space(&ln[(col + 1):ln.len])
+            }
+            hnames.push(k)
+            hvals.push(v)
+        }
+    }
+
+    clen := parse_content_length_hdr(&hnames, &hvals)
+    if clen < 0 || clen > 262144 {
+        >> errors.new("invalid or oversized content-length")
+    }
+    while rest.len < clen {
+        need := clen - rest.len
+        $rmax := 8192
+        if need < rmax { rmax = need }
+        chunk := cc_read(cc, rmax) or >>
+        if chunk.len == 0 {
+            >> errors.new("unexpected eof reading body")
+        }
+        rest = rest + chunk
+    }
+    $body := ""
+    if rest.len > clen {
+        body = rest[0:clen]
+    } else {
+        body = rest
+    }
+    cc_set_sock_timeout(cc, 0)
+    << HttpReq{
+        req_method: meth,
+        req_path: rpath,
+        hdr_names: hnames,
+        hdr_vals: hvals,
+        req_body: body,
+        remote_ip: cc.remote_ip + ""
+    }
+}

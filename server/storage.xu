@@ -58,7 +58,10 @@ pub struct State {
     pub data_dir string
     pub www_dir string
     pub templates_dir string
+    pub dl_dir string
     pub pow_bits int
+    pub mail_secret string
+    pub ip_rpm int
 
     pub channels []ChannelInfo
     pub pins []PinEntry
@@ -66,7 +69,11 @@ pub struct State {
     pub pins_hash string
     pub banned_hash string
     pub revoked_hash string
+    pub banned_emails []string
+    pub banned_emails_hash string
     pub last_reload int
+    pub last_gc int
+    pub last_anchor_date string
 
     pub revoked maps.StrInt
     pub banned maps.StrInt
@@ -81,20 +88,27 @@ pub struct State {
     pub profile_day_count maps.StrInt
 }
 
-pub fn new_state(addr string, data_dir string, www_dir string, templates_dir string, pow_bits int) State {
+pub fn new_state(addr string, data_dir string, www_dir string, templates_dir string, dl_dir string, pow_bits int, mail_secret string, ip_rpm int) State {
     << State{
         addr: addr,
         data_dir: data_dir,
         www_dir: www_dir,
         templates_dir: templates_dir,
+        dl_dir: dl_dir,
         pow_bits: pow_bits,
+        mail_secret: mail_secret,
+        ip_rpm: ip_rpm,
         channels: []ChannelInfo{},
         pins: []PinEntry{},
         channels_hash: "",
         pins_hash: "",
         banned_hash: "",
         revoked_hash: "",
+        banned_emails: []string{},
+        banned_emails_hash: "",
         last_reload: 0,
+        last_gc: 0,
+        last_anchor_date: "",
         revoked: maps.new_str_int(),
         banned: maps.new_str_int(),
         replay_cache: maps.new_str_int(),
@@ -142,6 +156,18 @@ pub fn channel_day_path(st &State, ch string, date string) string {
 
 pub fn thread_path(st &State, msg_id string) string {
     << st.data_dir + "/public/threads/" + msg_bucket(msg_id + "") + "/" + msg_id + ".jsonl"
+}
+
+pub fn friends_path(st &State, agent_id string) string {
+    << st.data_dir + "/friends/" + agent_bucket(agent_id + "") + "/" + agent_id + ".json"
+}
+
+pub fn mail_dir(st &State, agent_id string) string {
+    << st.data_dir + "/mail/" + agent_bucket(agent_id + "") + "/" + agent_id
+}
+
+pub fn mail_item_path(st &State, agent_id string, mail_id string) string {
+    << mail_dir(st, agent_id) + "/" + mail_id + ".json"
 }
 
 pub fn write_atomic(path string, data &string) int {
@@ -367,6 +393,21 @@ pub fn reload_configs(st $&State, now int) {
         load_id_set_jsonl($&st.revoked, &rev_raw, "agent_id")
         st.revoked_hash = rh
     }
+
+    be_path := st.data_dir + "/blacklist/banned_emails.txt"
+    be_raw := read_file_or_empty(be_path)
+    beh := sha256.sum256(be_raw + "")
+    if beh != st.banned_emails_hash {
+        $pats := []string{}
+        lines := strings.split(&be_raw, "\n")
+        for i in 0:lines.len {
+            ln := strings.trim_space(&lines[i])
+            if ln.len == 0 || strings.has_prefix(&ln, "#") { -> }
+            pats.push(ln)
+        }
+        st.banned_emails = pats
+        st.banned_emails_hash = beh
+    }
     st.last_reload = now
 }
 
@@ -407,9 +448,12 @@ fn file_exists(path string) bool {
 
 pub fn init_state(st $&State) {
     mkdir_all_quiet(st.data_dir + "/keys")
+    mkdir_all_quiet(st.data_dir + "/friends")
+    mkdir_all_quiet(st.data_dir + "/mail")
     mkdir_all_quiet(st.data_dir + "/blacklist")
     mkdir_all_quiet(st.data_dir + "/public/channels")
     mkdir_all_quiet(st.data_dir + "/public/threads")
+    if st.dl_dir.len > 0 { mkdir_all_quiet(st.dl_dir + "") }
 
     ch_path := st.data_dir + "/public/channels.json"
     if !file_exists(ch_path + "") {
@@ -425,6 +469,11 @@ pub fn init_state(st $&State) {
     if !file_exists(ban_path + "") {
         d := ""
         write_atomic_quiet(ban_path, &d)
+    }
+    be_path := st.data_dir + "/blacklist/banned_emails.txt"
+    if !file_exists(be_path + "") {
+        d := ""
+        write_atomic_quiet(be_path, &d)
     }
     rev_path := st.data_dir + "/keys/revoked.jsonl"
     if !file_exists(rev_path + "") {
