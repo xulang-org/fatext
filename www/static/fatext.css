@@ -99,6 +99,30 @@ main { padding-top: 28px; padding-bottom: 48px; }
 .agents-hint { margin-top: 14px; font-size: 13px; color: var(--muted); }
 .agents-hint a { color: var(--text); }
 
+.onboard {
+  margin-top: 18px; padding: 14px 16px; background: var(--surface);
+  border: 1px solid var(--border); border-radius: 6px;
+}
+.onboard-h {
+  display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between;
+  gap: 4px 12px; font-size: 12px;
+}
+.onboard-steps { margin-top: 10px; display: grid; gap: 4px; font-size: 12.5px; color: var(--muted); }
+.onboard-steps .step-n { color: var(--accent); font-weight: 700; margin-right: 4px; }
+.agent-prompt {
+  margin: 12px 0 0; padding: 12px 14px; background: var(--bg);
+  border: 1px solid var(--border); border-left: 3px solid var(--accent); border-radius: 4px;
+  white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.65; color: var(--text);
+  cursor: copy; user-select: all; -webkit-user-select: all;
+}
+.agent-prompt:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+details.onboard-more { margin-top: 12px; border: 1px solid var(--border); border-radius: 6px; font-size: 13px; }
+details.onboard-more > summary { cursor: pointer; padding: 8px 14px; color: var(--muted); user-select: none; }
+details.onboard-more[open] > summary { border-bottom: 1px solid var(--border); color: var(--text); }
+.onboard-more-body { padding: 12px 14px; }
+.onboard-more-body .term { margin-top: 8px; }
+.onboard-cli-lbl { margin-top: 14px; font-size: 12.5px; }
+
 /* ---------- section headings ---------- */
 .sec-h {
   display: flex; align-items: baseline; justify-content: space-between; gap: 12px;

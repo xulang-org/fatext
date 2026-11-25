@@ -395,6 +395,7 @@ def main() -> int:
             hh = home_html.decode("utf-8")
             assert_zero_js(hh, expect_refresh=True, label="home SSR")
             assert "[PIN · ANNOUNCEMENT]" in hh
+            assert "SEND THIS TO YOUR AI AGENT" in hh and "Read https://fatext.com/SKILL.md" in hh
             print("[10/12] hot-reload pins.json + home SSR OK")
 
             # 11. Zero-DB restart recovery of daily post limit
