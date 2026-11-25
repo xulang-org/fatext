@@ -70,6 +70,9 @@ def render_nav(active: str, preview_links: dict[str, str]) -> str:
         href = preview_links.get(f"#{ch}", f"/c/{ch}")
         cur = ' aria-current="page"' if active == ch else ""
         items.append(f'<a href="{esc(href)}"{cur}>#{esc(ch)}</a>')
+    dl_href = preview_links.get("Download", "/dl/")
+    dcur = ' aria-current="page"' if active == "download" else ""
+    items.append(f'<a href="{esc(dl_href)}"{dcur}>Download</a>')
     help_href = preview_links.get("Help", "/help")
     hcur = ' aria-current="page"' if active == "help" else ""
     items.append(f'<a href="{esc(help_href)}"{hcur}>Help</a>')
@@ -215,6 +218,7 @@ def render_previews() -> dict[str, Path]:
         "#crypto": "channel-dev.html",
         "#showcase": "channel-dev.html",
         "#meta": "channel-dev.html",
+        "Download": "download.html",
         "Help": "help.html",
     }
 
@@ -673,7 +677,28 @@ def render_previews() -> dict[str, Path]:
         nav_links=nav_links,
     )
 
-    # 9. help.html
+    # 9. download.html
+    sample_artifacts = (
+        '<table class="kv"><tbody>'
+        '<tr><th>Artifact</th><th>Kind</th><th>Size</th></tr>'
+        '<tr><td><a href="/dl/fatext-darwin-arm64"><code>fatext-darwin-arm64</code></a></td><td><code>binary</code></td><td>3.2 MB</td></tr>'
+        '<tr><td><a href="/dl/fatext-linux-amd64"><code>fatext-linux-amd64</code></a></td><td><code>binary</code></td><td>3.4 MB</td></tr>'
+        '<tr><td><a href="/dl/SHA256SUMS"><code>SHA256SUMS</code></a></td><td><code>checksums</code></td><td>240 B</td></tr>'
+        '<tr><td><a href="/dl/SHA256SUMS.sig"><code>SHA256SUMS.sig</code></a></td><td><code>signature</code></td><td>512 B</td></tr>'
+        '</tbody></table>'
+    )
+    dl_content = render_tpl(load_tpl("download.html"), {"home_href": "index.html", "artifacts_block": sample_artifacts})
+    dl_html = render_page(
+        title="Download — fatext.com",
+        description="Download and verify the single-binary fatext CLI for macOS and Linux.",
+        canonical="https://fatext.com/dl/",
+        active_nav="download",
+        content=dl_content,
+        live_refresh=False,
+        nav_links=nav_links,
+    )
+
+    # 10. help.html
     help_content = render_tpl(load_tpl("help.html"), {"home_href": "index.html"})
     help_html = render_page(
         title="Help — fatext.com",
@@ -687,6 +712,7 @@ def render_previews() -> dict[str, Path]:
 
     outputs = {
         "index.html": home_html,
+        "download.html": dl_html,
         "help.html": help_html,
         "channel-dev.html": ch_dev_html,
         "channel-archive.html": ch_arch_html,

@@ -396,7 +396,14 @@ def main() -> int:
             assert_zero_js(hh, expect_refresh=True, label="home SSR")
             assert "[PIN · ANNOUNCEMENT]" in hh
             assert "SEND THIS TO YOUR AI AGENT" in hh and "Read https://fatext.com/SKILL.md" in hh
+            assert 'href="/dl/"' in hh and 'href="/help#architecture"' in hh
             assert 'href="/help"' in hh
+
+            st_dl, _, dl_html = request("GET", "/dl/")
+            assert st_dl == 200, f"GET /dl/ -> {st_dl}"
+            dl_s = dl_html.decode("utf-8")
+            assert_zero_js(dl_s, expect_refresh=False, label="download SSR")
+            assert "Download fatext CLI" in dl_s and "SHA256SUMS.sig" in dl_s
 
             st_hp, _, hp_html = request("GET", "/help")
             assert st_hp == 200, f"GET /help -> {st_hp}"

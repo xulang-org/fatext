@@ -56,9 +56,11 @@ fn render_nav(st &State, active string) string {
         if nm == active { cur = " aria-current=\"page\"" }
         out = out + "<a href=\"/c/" + esc(&nm) + "\"" + cur + ">#" + esc(&nm) + "</a>"
     }
+    $dcur := ""
+    if active == "download" { dcur = " aria-current=\"page\"" }
     $hcur := ""
     if active == "help" { hcur = " aria-current=\"page\"" }
-    out = out + "<a href=\"/help\"" + hcur + ">Help</a><a href=\"/SKILL.md\">SKILL.md</a><a href=\"/llms.txt\">llms.txt</a>"
+    out = out + "<a href=\"/dl/\"" + dcur + ">Download</a><a href=\"/help\"" + hcur + ">Help</a><a href=\"/SKILL.md\">SKILL.md</a><a href=\"/llms.txt\">llms.txt</a>"
     << out
 }
 
@@ -166,6 +168,85 @@ pub fn serve_error_html(st &State, status int, code string, detail string) HttpR
     html_out := render_base_html(st, strconv.itoa(status) + " " + code + " — fatext.com", detail,
         "https://fatext.com/", "", content, false, "", "", "")
     << http_resp(status, "text/html; charset=utf-8", "", &html_out)
+}
+
+fn format_bytes_human(n int) string {
+    if n < 1024 { << strconv.itoa(n) + " B" }
+    if n < 1048576 { << strconv.itoa(n / 1024) + " KB" }
+    mb_tenths := (n * 10) / 1048576
+    << strconv.itoa(mb_tenths / 10) + "." + strconv.itoa(mb_tenths % 10) + " MB"
+}
+
+fn dl_kind_label(name string) string {
+    if name == "SHA256SUMS" { << "checksums" }
+    if strings.has_suffix(&name, ".sig") { << "signature" }
+    if strings.has_suffix(&name, ".sh") { << "script" }
+    if strings.has_suffix(&name, ".txt") || strings.has_suffix(&name, ".md") { << "text" }
+    << "binary"
+}
+
+fn read_dir_or_empty(p string) string {
+    << os.read_dir(p) or (err) { << "" }
+}
+
+pub fn serve_download(st &State) HttpResp {
+    $files := []string{}
+    if st.dl_dir.len > 0 {
+        raw_dir := read_dir_or_empty(st.dl_dir + "")
+        if raw_dir.len > 0 {
+            lines := strings.split(&raw_dir, "\n")
+            for i in 0:lines.len {
+                fn_s := strings.trim_space(&lines[i])
+                if !is_safe_dl_filename(fn_s + "") { -> }
+                info := os.stat(st.dl_dir + "/" + fn_s) or (err) { -> }
+                if !info.is_dir {
+                    files.push(fn_s)
+                }
+            }
+        }
+    }
+    $i := 0
+    while i < files.len {
+        $j := i + 1
+        while j < files.len {
+            if strings.compare(&files[j], &files[i]) < 0 {
+                tmp := files[i]
+                files[i] = files[j]
+                files[j] = tmp
+            }
+            j += 1
+        }
+        i += 1
+    }
+
+    $artifacts_block := ""
+    if files.len > 0 {
+        $rows := ""
+        for k in 0:files.len {
+            fn_s := files[k] + ""
+            info := os.stat(st.dl_dir + "/" + fn_s) or (err) { -> }
+            kind_s := dl_kind_label(fn_s + "")
+            sz_s := format_bytes_human(info.size)
+            rows = rows + "<tr><td><a href=\"/dl/" + esc(&fn_s) + "\"><code>" + esc(&fn_s) + "</code></a></td><td><code>" + esc(&kind_s) + "</code></td><td>" + esc(&sz_s) + "</td></tr>"
+        }
+        artifacts_block = "<table class=\"kv\"><tbody><tr><th>Artifact</th><th>Kind</th><th>Size</th></tr>" + rows + "</tbody></table>"
+    } else {
+        artifacts_block = "<p class=\"help-p\">No prebuilt release binaries are published in <code>FATEXT_DL_DIR</code> on this instance yet. Expected release filenames and source build fallback:</p>" +
+            "<table class=\"kv\"><tbody><tr><th>Artifact</th><th>Target / Purpose</th></tr>" +
+            "<tr><td><code>fatext-darwin-arm64</code></td><td>macOS Apple Silicon CLI binary</td></tr>" +
+            "<tr><td><code>fatext-linux-amd64</code></td><td>Linux x86_64 CLI binary</td></tr>" +
+            "<tr><td><code>fatext-linux-arm64</code></td><td>Linux aarch64 CLI binary</td></tr>" +
+            "<tr><td><code>SHA256SUMS</code> / <code>SHA256SUMS.sig</code></td><td>SHA-256 manifest + RSA-PSS signature by <code>ftx_fatextoffice</code></td></tr>" +
+            "</tbody></table>" +
+            "<pre class=\"term\"><span class=\"c\"># or build from source with Xu</span>\n<span class=\"p\">\$</span> make -C fatext-cli build</pre>"
+    }
+
+    tpl := load_tpl(st, "download.html")
+    content := render_tpl(tpl, ["home_href", "artifacts_block"], ["/", artifacts_block])
+    html_out := render_base_html(st, "Download — fatext.com",
+        "Download and verify the single-binary fatext CLI for macOS and Linux.",
+        "https://fatext.com/dl/", "download", content, false, "", "", "")
+    << http_resp(200, "text/html; charset=utf-8", "", &html_out)
 }
 
 pub fn serve_help(st &State) HttpResp {

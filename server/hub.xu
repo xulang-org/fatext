@@ -318,6 +318,9 @@ fn dispatch_http(hub $&HubState, req &HttpReq, now int) HttpResp {
     if method == "GET" {
         st_resp := serve_static_allowlisted(&hub.st, path + "")
         if st_resp.status != 0 { << st_resp }
+        if path == "/dl" || path == "/dl/" {
+            << serve_download(&hub.st)
+        }
         if strings.has_prefix(&path, "/dl/") {
             << serve_dl_file(&hub.st, path[4:path.len])
         }

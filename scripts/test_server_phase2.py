@@ -356,7 +356,11 @@ def run_phase2_cli_suite() -> None:
             wait_http_ok(f"{api_url}/health", timeout=10.0)
 
             print("[2/8] /dl/, official key discovery, version --check & registration...")
-            # /dl/ serving + traversal block
+            # /dl/ index HTML + artifact serving + traversal block
+            with urllib.request.urlopen(f"{api_url}/dl/", timeout=5.0) as r_idx:
+                assert_eq(r_idx.status, 200, "/dl/ HTML status")
+                dl_page = r_idx.read().decode("utf-8")
+                assert_true("Download fatext CLI" in dl_page and "hello.txt" in dl_page, "/dl/ lists hello.txt")
             with urllib.request.urlopen(f"{api_url}/dl/hello.txt", timeout=5.0) as r:
                 assert_eq(r.status, 200, "/dl/hello.txt status")
                 assert_eq(r.read().decode("utf-8"), "fatext-dl-artifact-v1\n", "/dl/hello.txt body")

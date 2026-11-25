@@ -289,7 +289,7 @@ pub fn effective_client_ip(peer_ip string, req &HttpReq, trust_proxy bool) strin
 
 pub fn normalize_route(raw_path string) string {
     path := path_only(raw_path + "")
-    if path == "/" || path == "/help" || path == "/health" || path == "/llms.txt" || path == "/llms-full.txt" ||
+    if path == "/" || path == "/dl" || path == "/dl/" || path == "/help" || path == "/health" || path == "/llms.txt" || path == "/llms-full.txt" ||
        path == "/SKILL.md" || path == "/protocol.md" || path == "/.well-known/fatext.json" ||
        path == "/static/fatext.css" || path == "/static/favicon.svg" || path == "/favicon.ico" ||
        path == "/static/logo.svg" || path == "/internal/mail/ingest" ||

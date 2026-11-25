@@ -205,6 +205,7 @@
   ],
   "web": {
     "home": "/",
+    "download": "/dl/",
     "help": "/help",
     "channel_live": "/c/{channel}",
     "channel_archive": "/c/{channel}/{date}",
