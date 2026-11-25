@@ -232,18 +232,22 @@ pub fn append_jsonl_quiet(path string, line string) {
 }
 
 pub fn json_str_or(doc &json.Doc, node int, def string) string {
+    if node < 0 { << def }
     << doc.as_string(node) or (err) { << def }
 }
 
 pub fn json_int_or(doc &json.Doc, node int, def int) int {
+    if node < 0 { << def }
     << doc.as_int(node) or (err) { << def }
 }
 
 pub fn json_bool_or(doc &json.Doc, node int, def bool) bool {
+    if node < 0 { << def }
     << doc.as_bool(node) or (err) { << def }
 }
 
 pub fn json_encode_or(doc &json.Doc, node int, def string) string {
+    if node < 0 { << def }
     << doc.encode(node) or (err) { << def }
 }
 

@@ -350,7 +350,7 @@ pub fn handle_friend_request(st $&State, req &HttpReq, now int) HttpResp {
     au := authenticate_scoped(st, req, now, "social")
     if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
     doc := json.parse(&req.body())
-    if !doc.ok() { << err_resp(400, "ERR_BAD_REQUEST", "invalid JSON", 0, 0, 0) }
+    if !doc.ok() || !doc.is_dict(doc.root()) { << err_resp(400, "ERR_BAD_REQUEST", "invalid JSON", 0, 0, 0) }
     r := doc.root()
     tid := json_str_or(&doc, doc.get(r, "agent_id"), "")
     $note := json_str_or(&doc, doc.get(r, "note"), "")
@@ -398,7 +398,7 @@ pub fn handle_friend_accept(st $&State, req &HttpReq, now int) HttpResp {
     au := authenticate_scoped(st, req, now, "social")
     if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
     doc := json.parse(&req.body())
-    if !doc.ok() { << err_resp(400, "ERR_BAD_REQUEST", "invalid JSON", 0, 0, 0) }
+    if !doc.ok() || !doc.is_dict(doc.root()) { << err_resp(400, "ERR_BAD_REQUEST", "invalid JSON", 0, 0, 0) }
     tid := json_str_or(&doc, doc.get(doc.root(), "agent_id"), "")
     if !is_valid_agent_id(tid + "") { << err_resp(400, "ERR_BAD_REQUEST", "invalid agent_id", 0, 0, 0) }
 
@@ -420,7 +420,7 @@ pub fn handle_friend_reject(st $&State, req &HttpReq, now int) HttpResp {
     au := authenticate_scoped(st, req, now, "social")
     if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
     doc := json.parse(&req.body())
-    if !doc.ok() { << err_resp(400, "ERR_BAD_REQUEST", "invalid JSON", 0, 0, 0) }
+    if !doc.ok() || !doc.is_dict(doc.root()) { << err_resp(400, "ERR_BAD_REQUEST", "invalid JSON", 0, 0, 0) }
     tid := json_str_or(&doc, doc.get(doc.root(), "agent_id"), "")
     if !is_valid_agent_id(tid + "") { << err_resp(400, "ERR_BAD_REQUEST", "invalid agent_id", 0, 0, 0) }
     $my_fd := load_friends_data(st, au.agent_id + "", now)
@@ -458,7 +458,7 @@ pub fn handle_block_add(st $&State, req &HttpReq, now int) HttpResp {
     au := authenticate_scoped(st, req, now, "social")
     if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
     doc := json.parse(&req.body())
-    if !doc.ok() { << err_resp(400, "ERR_BAD_REQUEST", "invalid JSON", 0, 0, 0) }
+    if !doc.ok() || !doc.is_dict(doc.root()) { << err_resp(400, "ERR_BAD_REQUEST", "invalid JSON", 0, 0, 0) }
     tgt := strings.trim_space(&json_str_or(&doc, doc.get(doc.root(), "target"), ""))
     if tgt.len == 0 || tgt.len > 128 { << err_resp(400, "ERR_BAD_REQUEST", "invalid block target", 0, 0, 0) }
     $fd := load_friends_data(st, au.agent_id + "", now)
@@ -603,7 +603,7 @@ pub fn handle_mail_ingest(hub $&HubState, req &HttpReq, now int) HttpResp {
         << err_resp(401, "ERR_BAD_SIGNATURE", "invalid X-Internal-Secret", 0, 0, 0)
     }
     doc := json.parse(&req.body())
-    if !doc.ok() { << err_resp(400, "ERR_BAD_REQUEST", "invalid JSON", 0, 0, 0) }
+    if !doc.ok() || !doc.is_dict(doc.root()) { << err_resp(400, "ERR_BAD_REQUEST", "invalid JSON", 0, 0, 0) }
     r := doc.root()
     to_id := json_str_or(&doc, doc.get(r, "to_agent_id"), "")
     mfrom := json_str_or(&doc, doc.get(r, "from"), "")
