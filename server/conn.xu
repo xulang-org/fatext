@@ -173,7 +173,7 @@ fn http_reason(status int) string {
     << "Internal Server Error"
 }
 
-pub fn format_http_resp(r &HttpResp) string {
+pub fn format_http_resp_ka(r &HttpResp, keep_alive bool) string {
     $out := "HTTP/1.1 " + strconv.itoa(r.status) + " " + http_reason(r.status) + "\r\n"
     out = out + "Content-Type: " + r.ctype + "\r\n"
     out = out + "Content-Length: " + strconv.itoa(r.body.len) + "\r\n"
@@ -181,14 +181,32 @@ pub fn format_http_resp(r &HttpResp) string {
     if r.extra.len > 0 {
         out = out + r.extra
     }
-    out = out + "Connection: close\r\n\r\n"
+    if keep_alive {
+        out = out + "Connection: keep-alive\r\nKeep-Alive: timeout=15, max=200\r\n\r\n"
+    } else {
+        out = out + "Connection: close\r\n\r\n"
+    }
     out = out + r.body
     << out
 }
 
-pub fn write_http_resp(cc $&ClientConn, r &HttpResp) int {
-    wire := format_http_resp(r)
+pub fn format_http_resp(r &HttpResp) string {
+    << format_http_resp_ka(r, false)
+}
+
+pub fn write_http_resp_ka(cc $&ClientConn, r &HttpResp, keep_alive bool) int {
+    wire := format_http_resp_ka(r, keep_alive)
     << cc_write(cc, &wire) or (err) { << -1 }
+}
+
+pub fn write_http_resp(cc $&ClientConn, r &HttpResp) int {
+    << write_http_resp_ka(cc, r, false)
+}
+
+pub fn wants_keep_alive(req &HttpReq) bool {
+    conn_h := strings.to_lower(&req.header("Connection"))
+    if strings.contains(&conn_h, "close") { << false }
+    << true
 }
 
 pub fn write_sse_open(cc $&ClientConn) int {
@@ -207,8 +225,8 @@ fn parse_content_length_hdr(names &[]string, vals &[]string) int {
     << 0
 }
 
-pub fn read_http_request(cc $&ClientConn) HttpReq {
-    cc_set_sock_timeout(cc, 10000000000)
+pub fn read_http_request_timeout(cc $&ClientConn, timeout_ns int) HttpReq {
+    cc_set_sock_timeout(cc, timeout_ns)
     $hdr_end := -1
     while hdr_end < 0 {
         idx := strings.index_of(&cc.buf, "\r\n\r\n")
@@ -279,8 +297,10 @@ pub fn read_http_request(cc $&ClientConn) HttpReq {
     $body := ""
     if rest.len > clen {
         body = rest[0:clen]
+        cc.buf = rest[clen:rest.len]
     } else {
         body = rest
+        cc.buf = ""
     }
     cc_set_sock_timeout(cc, 0)
     << HttpReq{
@@ -290,5 +310,16 @@ pub fn read_http_request(cc $&ClientConn) HttpReq {
         hdr_vals: hvals,
         req_body: body,
         remote_ip: cc.remote_ip + ""
+    }
+}
+
+pub fn read_http_request(cc $&ClientConn) HttpReq {
+    << read_http_request_timeout(cc, 10000000000) or >>
+}
+
+pub fn read_req_into(cc $&ClientConn, timeout_ns int, out_errs $&[]string) HttpReq {
+    << read_http_request_timeout(cc, timeout_ns) or (err) {
+        out_errs.push(err.msg())
+        << HttpReq{req_method: "", req_path: "", hdr_names: []string{}, hdr_vals: []string{}, req_body: "", remote_ip: ""}
     }
 }

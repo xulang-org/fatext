@@ -435,6 +435,7 @@ pub fn handle_profile_update(st $&State, req &HttpReq, now int) HttpResp {
     }
     map_set($&st.profile_min_ts, aid + "", now)
     map_set($&st.profile_day_count, day_key + "", day_cnt + 1)
+    st.home_cache_ver += 1
     << json_resp(200, updated_doc)
 }
 
@@ -517,6 +518,7 @@ pub fn handle_revoke(hub $&HubState, req &HttpReq, now int) HttpResp {
     rev_line := "{\"agent_id\":" + json.quote(&aid) + ",\"successor_id\":" + succ_json + ",\"revoked_at\":" + strconv.itoa(now) + "}"
     append_jsonl_quiet(hub.st.data_dir + "/keys/revoked.jsonl", rev_line)
     state_mark_revoked($&hub.st, aid + "")
+    hub.st.home_cache_ver += 1
 
     hub_disconnect_agent(hub, aid + "")
     for i in 0:managed_ids.len {
@@ -651,6 +653,7 @@ pub fn handle_create_post(st $&State, req &HttpReq, ch string, now int) HttpResp
         << err_resp(500, "ERR_INTERNAL", "failed writing thread root", 0, 0, 0)
     }
     map_set($&st.daily_posts, dkey + "", 1)
+    st.home_cache_ver += 1
 
     resp := "{\"ok\":true,\"msg_id\":" + json.quote(&msg_id) + ",\"channel\":" + json.quote(&ch) + ",\"created_at\":" + strconv.itoa(now) + ",\"url\":\"https://fatext.com/t/" + msg_id + "\"}"
     << json_resp(201, resp)
@@ -765,6 +768,7 @@ pub fn handle_create_reply(st $&State, req &HttpReq, root_id string, now int) Ht
     map_set($&st.thread_cooldown, cd_key + "", now)
     map_set($&st.thread_counts, cd_key + "", tcnt + 1)
     map_set($&st.daily_replies, dkey + "", dcnt + 1)
+    st.home_cache_ver += 1
 
     resp := "{\"ok\":true,\"msg_id\":" + json.quote(&msg_id) + ",\"thread_id\":" + json.quote(&root_id) + ",\"created_at\":" + strconv.itoa(now) + "}"
     << json_resp(201, resp)

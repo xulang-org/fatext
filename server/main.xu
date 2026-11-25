@@ -40,7 +40,7 @@ fn handle_connection(fd int, req_seq int, tls_on bool, cert_pem string, key_pem 
     cc_disable_sigpipe(fd)
     t0_ns := time.now()
     peer_ip := resolve_peer_ip(fd)
-    req_id := "r_" + strconv.itoa(req_seq)
+    req_prefix := "r_" + strconv.itoa(req_seq)
 
     $cc := cc_from_tcp(fd, peer_ip + "")
     $tls_ms := 0
@@ -53,7 +53,7 @@ fn handle_connection(fd int, req_seq int, tls_on bool, cert_pem string, key_pem 
             now_err := time.now_time().unix()
             emsg := err.msg()
             log_event_json(log_ch, now_err, "tls_handshake_fail",
-                "\"req_id\":" + json.quote(&req_id) + ",\"ip\":" + json.quote(&peer_ip) +
+                "\"req_id\":" + json.quote(&req_prefix) + ",\"ip\":" + json.quote(&peer_ip) +
                 ",\"tls_ms\":" + strconv.itoa(tls_ms) + ",\"error\":" + json.quote(&emsg))
             close_raw_fd_quiet(fd)
             <<
@@ -63,147 +63,168 @@ fn handle_connection(fd int, req_seq int, tls_on bool, cert_pem string, key_pem 
         jobs <- HubJob{kind: HUB_METRIC_TLS, req: empty_req(), sse_id: 0, enqueued_ns: 0, flag: 1, reply_ch: chan HubReply{cap: 1}}
     }
 
-    t_read0 := time.now()
-    $req := read_http_request($&cc) or (err) {
-        $rm := (time.now() - t_read0) / 1000000
-        if rm < 0 { rm = 0 }
-        emsg := err.msg()
-        r := err_resp(400, "ERR_BAD_REQUEST", emsg + "", 0, 0, 0)
-        t_w0 := time.now()
-        _ := write_http_resp($&cc, &r)
-        $w_ms := (time.now() - t_w0) / 1000000
-        if w_ms < 0 { w_ms = 0 }
-        $tot_us := (time.now() - t0_ns) / 1000
-        if tot_us < 0 { tot_us = 0 }
-        tot_ms := tot_us / 1000
-        now_r := time.now_time().unix()
-        log_event_json(log_ch, now_r, "http_read_fail",
-            "\"req_id\":" + json.quote(&req_id) + ",\"ip\":" + json.quote(&peer_ip) +
-            ",\"tls_ms\":" + strconv.itoa(tls_ms) + ",\"read_ms\":" + strconv.itoa(rm) +
-            ",\"error\":" + json.quote(&emsg))
-        log_access_json(log_ch, slow_ms, now_r, req_id + "", "?", "/invalid", 400, "ERR_BAD_REQUEST",
-            tls_on, peer_ip + "", "anon", "", 0, r.body.len, tls_ms, rm, 0, 0, w_ms, tot_ms, tot_us)
-        cc_close($&cc)
-        <<
-    }
-    $read_ms := (time.now() - t_read0) / 1000000
-    if read_ms < 0 { read_ms = 0 }
+    $req_n := 0
+    while req_n < 200 {
+        $req_t0 := t0_ns
+        $req_tls_ms := tls_ms
+        $read_to_ns := 10000000000
+        $req_id := req_prefix + ""
+        if req_n > 0 {
+            req_t0 = time.now()
+            req_tls_ms = 0
+            read_to_ns = 5000000000
+            req_id = req_prefix + "_" + strconv.itoa(req_n)
+        }
 
-    client_ip := effective_client_ip(peer_ip + "", &req, trust_proxy)
-    req.remote_ip = client_ip + ""
-    meth := req.method()
-    raw_p := req.path()
-    route := normalize_route(raw_p + "")
-    req_bytes := req.req_body.len
-
-    reply_ch := chan HubReply{cap: 1}
-    if path_only(raw_p + "") == "/v1/stream" {
-        jobs <- HubJob{kind: HUB_SSE_SUB, req: req, sse_id: 0, enqueued_ns: time.now(), flag: 0, reply_ch: reply_ch}
-        rep := <-reply_ch
-        if !rep.is_sse {
+        t_read0 := time.now()
+        $read_errs := []string{}
+        $req := read_req_into($&cc, read_to_ns, $&read_errs)
+        if read_errs.len > 0 {
+            read_err := read_errs[0] + ""
+            if req_n > 0 && cc.buf.len == 0 {
+                // Clean Keep-Alive idle close or timeout between requests
+                <-
+            }
+            $rm := (time.now() - t_read0) / 1000000
+            if rm < 0 { rm = 0 }
+            r := err_resp(400, "ERR_BAD_REQUEST", read_err + "", 0, 0, 0)
             t_w0 := time.now()
-            _ := write_http_resp($&cc, &rep.resp)
+            _ := write_http_resp_ka($&cc, &r, false)
             $w_ms := (time.now() - t_w0) / 1000000
             if w_ms < 0 { w_ms = 0 }
-            $tot_us := (time.now() - t0_ns) / 1000
+            $tot_us := (time.now() - req_t0) / 1000
             if tot_us < 0 { tot_us = 0 }
+            tot_ms := tot_us / 1000
+            now_r := time.now_time().unix()
+            log_event_json(log_ch, now_r, "http_read_fail",
+                "\"req_id\":" + json.quote(&req_id) + ",\"ip\":" + json.quote(&peer_ip) +
+                ",\"tls_ms\":" + strconv.itoa(req_tls_ms) + ",\"read_ms\":" + strconv.itoa(rm) +
+                ",\"error\":" + json.quote(&read_err))
+            log_access_json(log_ch, slow_ms, now_r, req_id + "", "?", "/invalid", 400, "ERR_BAD_REQUEST",
+                tls_on, peer_ip + "", "anon", "", 0, r.body.len, req_tls_ms, rm, 0, 0, w_ms, tot_ms, tot_us)
+            <-
+        }
+        $read_ms := (time.now() - t_read0) / 1000000
+        if read_ms < 0 { read_ms = 0 }
+
+        client_ip := effective_client_ip(peer_ip + "", &req, trust_proxy)
+        req.remote_ip = client_ip + ""
+        meth := req.method()
+        raw_p := req.path()
+        route := normalize_route(raw_p + "")
+        req_bytes := req.req_body.len
+
+        reply_ch := chan HubReply{cap: 1}
+        if path_only(raw_p + "") == "/v1/stream" {
+            jobs <- HubJob{kind: HUB_SSE_SUB, req: req, sse_id: 0, enqueued_ns: time.now(), flag: 0, reply_ch: reply_ch}
+            rep := <-reply_ch
+            if !rep.is_sse {
+                t_w0 := time.now()
+                _ := write_http_resp_ka($&cc, &rep.resp, false)
+                $w_ms := (time.now() - t_w0) / 1000000
+                if w_ms < 0 { w_ms = 0 }
+                $tot_us := (time.now() - req_t0) / 1000
+                if tot_us < 0 { tot_us = 0 }
+                log_access_json(log_ch, slow_ms, time.now_time().unix(), req_id + "", meth + "", route + "",
+                    rep.resp.status, rep.err_code + "", tls_on, client_ip + "", rep.actor_type + "", rep.actor_id + "",
+                    req_bytes, rep.resp.body.len, req_tls_ms, read_ms, rep.queue_ms, rep.handle_ms, w_ms, tot_us / 1000, tot_us)
+                <-
+            }
+            t_w0 := time.now()
+            open_rc := write_sse_open($&cc)
+            $w_ms := (time.now() - t_w0) / 1000000
+            if w_ms < 0 { w_ms = 0 }
+            $tot_us := (time.now() - req_t0) / 1000
+            if tot_us < 0 { tot_us = 0 }
+            $open_status := 200
+            if open_rc < 0 { open_status = 499 }
             log_access_json(log_ch, slow_ms, time.now_time().unix(), req_id + "", meth + "", route + "",
-                rep.resp.status, rep.err_code + "", tls_on, client_ip + "", rep.actor_type + "", rep.actor_id + "",
-                req_bytes, rep.resp.body.len, tls_ms, read_ms, rep.queue_ms, rep.handle_ms, w_ms, tot_us / 1000, tot_us)
-            cc_close($&cc)
-            <<
-        }
-        t_w0 := time.now()
-        open_rc := write_sse_open($&cc)
-        $w_ms := (time.now() - t_w0) / 1000000
-        if w_ms < 0 { w_ms = 0 }
-        $tot_us := (time.now() - t0_ns) / 1000
-        if tot_us < 0 { tot_us = 0 }
-        $open_status := 200
-        if open_rc < 0 { open_status = 499 }
-        log_access_json(log_ch, slow_ms, time.now_time().unix(), req_id + "", meth + "", route + "",
-            open_status, "", tls_on, client_ip + "", rep.actor_type + "", rep.actor_id + "",
-            req_bytes, 0, tls_ms, read_ms, rep.queue_ms, rep.handle_ms, w_ms, tot_us / 1000, tot_us)
-        if open_rc < 0 {
-            unsub_ch := chan HubReply{cap: 1}
-            jobs <- HubJob{kind: HUB_SSE_UNSUB, req: empty_req(), sse_id: rep.sse_id, enqueued_ns: time.now(), flag: 0, reply_ch: unsub_ch}
-            _ := <-unsub_ch
-            log_event_json(log_ch, time.now_time().unix(), "sse_close",
-                "\"sse_id\":" + strconv.itoa(rep.sse_id) + ",\"agent_id\":" + json.quote(&rep.actor_id) +
-                ",\"reason\":\"open_write_fail\",\"duration_ms\":0,\"events_sent\":0,\"pings_sent\":0")
-            cc_close($&cc)
-            <<
-        }
-        sse_t0 := time.now()
-        tick := time.new_ticker(250000000)
-        $ping_ticks := 0
-        $ev_sent := 0
-        $pg_sent := 0
-        $close_reason := "peer_closed"
-        $alive := true
-        while alive {
-            select {
-                msg := <-rep.sse_ch {
-                    if msg == SSE_CTRL_CLOSE {
-                        disc := "event: system\ndata: {\"kind\":\"disconnected\"}\n\n"
-                        _ := cc_write($&cc, &disc)
-                        close_reason = "ctrl_close"
-                        alive = false
-                    } else if cc_peer_closed(&cc) {
-                        close_reason = "peer_closed"
-                        alive = false
-                    } else if cc_write($&cc, &msg) < 0 {
-                        close_reason = "write_error"
-                        alive = false
-                    } else {
-                        ev_sent += 1
+                open_status, "", tls_on, client_ip + "", rep.actor_type + "", rep.actor_id + "",
+                req_bytes, 0, req_tls_ms, read_ms, rep.queue_ms, rep.handle_ms, w_ms, tot_us / 1000, tot_us)
+            if open_rc < 0 {
+                unsub_ch := chan HubReply{cap: 1}
+                jobs <- HubJob{kind: HUB_SSE_UNSUB, req: empty_req(), sse_id: rep.sse_id, enqueued_ns: time.now(), flag: 0, reply_ch: unsub_ch}
+                _ := <-unsub_ch
+                log_event_json(log_ch, time.now_time().unix(), "sse_close",
+                    "\"sse_id\":" + strconv.itoa(rep.sse_id) + ",\"agent_id\":" + json.quote(&rep.actor_id) +
+                    ",\"reason\":\"open_write_fail\",\"duration_ms\":0,\"events_sent\":0,\"pings_sent\":0")
+                <-
+            }
+            sse_t0 := time.now()
+            tick := time.new_ticker(250000000)
+            $ping_ticks := 0
+            $ev_sent := 0
+            $pg_sent := 0
+            $close_reason := "peer_closed"
+            $alive := true
+            while alive {
+                select {
+                    msg := <-rep.sse_ch {
+                        if msg == SSE_CTRL_CLOSE {
+                            disc := "event: system\ndata: {\"kind\":\"disconnected\"}\n\n"
+                            _ := cc_write($&cc, &disc)
+                            close_reason = "ctrl_close"
+                            alive = false
+                        } else if cc_peer_closed(&cc) {
+                            close_reason = "peer_closed"
+                            alive = false
+                        } else if cc_write($&cc, &msg) < 0 {
+                            close_reason = "write_error"
+                            alive = false
+                        } else {
+                            ev_sent += 1
+                        }
                     }
-                }
-                _ := <-tick.c {
-                    if cc_peer_closed(&cc) {
-                        close_reason = "peer_closed"
-                        alive = false
-                    } else {
-                        ping_ticks += 1
-                        if ping_ticks >= 100 {
-                            ping_ticks = 0
-                            ping := ": ping\n\n"
-                            if cc_write($&cc, &ping) < 0 {
-                                close_reason = "write_error"
-                                alive = false
-                            } else {
-                                pg_sent += 1
+                    _ := <-tick.c {
+                        if cc_peer_closed(&cc) {
+                            close_reason = "peer_closed"
+                            alive = false
+                        } else {
+                            ping_ticks += 1
+                            if ping_ticks >= 100 {
+                                ping_ticks = 0
+                                ping := ": ping\n\n"
+                                if cc_write($&cc, &ping) < 0 {
+                                    close_reason = "write_error"
+                                    alive = false
+                                } else {
+                                    pg_sent += 1
+                                }
                             }
                         }
                     }
                 }
             }
+            tick.stop()
+            $sse_dur := (time.now() - sse_t0) / 1000000
+            if sse_dur < 0 { sse_dur = 0 }
+            unsub_ch := chan HubReply{cap: 1}
+            jobs <- HubJob{kind: HUB_SSE_UNSUB, req: empty_req(), sse_id: rep.sse_id, enqueued_ns: time.now(), flag: 0, reply_ch: unsub_ch}
+            _ := <-unsub_ch
+            log_event_json(log_ch, time.now_time().unix(), "sse_close",
+                "\"sse_id\":" + strconv.itoa(rep.sse_id) + ",\"agent_id\":" + json.quote(&rep.actor_id) +
+                ",\"reason\":" + json.quote(&close_reason) + ",\"duration_ms\":" + strconv.itoa(sse_dur) +
+                ",\"events_sent\":" + strconv.itoa(ev_sent) + ",\"pings_sent\":" + strconv.itoa(pg_sent))
+            <-
         }
-        tick.stop()
-        $sse_dur := (time.now() - sse_t0) / 1000000
-        if sse_dur < 0 { sse_dur = 0 }
-        unsub_ch := chan HubReply{cap: 1}
-        jobs <- HubJob{kind: HUB_SSE_UNSUB, req: empty_req(), sse_id: rep.sse_id, enqueued_ns: time.now(), flag: 0, reply_ch: unsub_ch}
-        _ := <-unsub_ch
-        log_event_json(log_ch, time.now_time().unix(), "sse_close",
-            "\"sse_id\":" + strconv.itoa(rep.sse_id) + ",\"agent_id\":" + json.quote(&rep.actor_id) +
-            ",\"reason\":" + json.quote(&close_reason) + ",\"duration_ms\":" + strconv.itoa(sse_dur) +
-            ",\"events_sent\":" + strconv.itoa(ev_sent) + ",\"pings_sent\":" + strconv.itoa(pg_sent))
-        cc_close($&cc)
-        <<
-    }
 
-    jobs <- HubJob{kind: HUB_HTTP, req: req, sse_id: 0, enqueued_ns: time.now(), flag: 0, reply_ch: reply_ch}
-    rep := <-reply_ch
-    t_w0 := time.now()
-    _ := write_http_resp($&cc, &rep.resp)
-    $w_ms := (time.now() - t_w0) / 1000000
-    if w_ms < 0 { w_ms = 0 }
-    $tot_us := (time.now() - t0_ns) / 1000
-    if tot_us < 0 { tot_us = 0 }
-    log_access_json(log_ch, slow_ms, time.now_time().unix(), req_id + "", meth + "", route + "",
-        rep.resp.status, rep.err_code + "", tls_on, client_ip + "", rep.actor_type + "", rep.actor_id + "",
-        req_bytes, rep.resp.body.len, tls_ms, read_ms, rep.queue_ms, rep.handle_ms, w_ms, tot_us / 1000, tot_us)
+        ka := wants_keep_alive(&req) && req_n + 1 < 200
+        jobs <- HubJob{kind: HUB_HTTP, req: req, sse_id: 0, enqueued_ns: time.now(), flag: 0, reply_ch: reply_ch}
+        rep := <-reply_ch
+        req_n += 1
+        t_w0 := time.now()
+        w_rc := write_http_resp_ka($&cc, &rep.resp, ka)
+        $w_ms := (time.now() - t_w0) / 1000000
+        if w_ms < 0 { w_ms = 0 }
+        $tot_us := (time.now() - req_t0) / 1000
+        if tot_us < 0 { tot_us = 0 }
+        log_access_json(log_ch, slow_ms, time.now_time().unix(), req_id + "", meth + "", route + "",
+            rep.resp.status, rep.err_code + "", tls_on, client_ip + "", rep.actor_type + "", rep.actor_id + "",
+            req_bytes, rep.resp.body.len, req_tls_ms, read_ms, rep.queue_ms, rep.handle_ms, w_ms, tot_us / 1000, tot_us)
+        if !ka || w_rc < 0 {
+            <-
+        }
+    }
     cc_close($&cc)
 }
 

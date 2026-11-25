@@ -564,7 +564,7 @@ fn dispatch_http(hub $&HubState, req &HttpReq, now int) HttpResp {
     }
 
     if path == "/" && method == "GET" {
-        << serve_home(&hub.st, now)
+        << serve_home($&hub.st, now)
     }
 
     if strings.has_prefix(&path, "/v1/") {

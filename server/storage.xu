@@ -101,6 +101,11 @@ pub struct State {
     pub thread_counts maps.StrInt
     pub profile_min_ts maps.StrInt
     pub profile_day_count maps.StrInt
+
+    pub home_cache_key string
+    pub home_cache_html string
+    pub home_cache_ts int
+    pub home_cache_ver int
 }
 
 pub fn new_state(addr string, data_dir string, www_dir string, templates_dir string, dl_dir string, pow_bits int, mail_secret string, ip_rpm int) State {
@@ -134,7 +139,11 @@ pub fn new_state(addr string, data_dir string, www_dir string, templates_dir str
         thread_cooldown: maps.new_str_int(),
         thread_counts: maps.new_str_int(),
         profile_min_ts: maps.new_str_int(),
-        profile_day_count: maps.new_str_int()
+        profile_day_count: maps.new_str_int(),
+        home_cache_key: "",
+        home_cache_html: "",
+        home_cache_ts: 0,
+        home_cache_ver: 0
     }
 }
 
@@ -403,6 +412,7 @@ pub fn reload_configs(st $&State, now int) {
         if h != st.pins_hash {
             parse_pins_data(st, &pin_raw)
             st.pins_hash = h
+            st.home_cache_ver += 1
         }
     }
 

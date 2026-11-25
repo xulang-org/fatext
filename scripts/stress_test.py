@@ -694,6 +694,46 @@ def main() -> int:
                         err_tls.append(err)
             tls_wall = time.perf_counter() - t_t0
             report["scenarios"]["5_native_tls"] = summarize_latencies(lat_tls, tls_wall, st_tls, err_tls)
+
+            # Scenario 5b: Persistent HTTPS Keep-Alive reuse (c_tls connections x n_tls total requests)
+            def run_ka_worker(cnt: int, start_idx: int) -> tuple[list[float], Counter[int], list[str]]:
+                w_lat: list[float] = []
+                w_st: Counter[int] = Counter()
+                w_err: list[str] = []
+                conn = http.client.HTTPSConnection(HOST, tls_port, timeout=15.0, context=ctx)
+                try:
+                    for j in range(cnt):
+                        p = "/health" if (start_idx + j) % 2 == 0 else "/"
+                        t1 = time.perf_counter()
+                        try:
+                            conn.request("GET", p, headers={"Connection": "keep-alive"})
+                            resp = conn.getresponse()
+                            _ = resp.read()
+                            w_lat.append((time.perf_counter() - t1) * 1000.0)
+                            w_st[resp.status] += 1
+                        except Exception as e:
+                            w_lat.append((time.perf_counter() - t1) * 1000.0)
+                            w_st[0] += 1
+                            if len(w_err) < 5:
+                                w_err.append(repr(e))
+                finally:
+                    conn.close()
+                return w_lat, w_st, w_err
+
+            ka_per = max(1, n_tls // c_tls)
+            lat_ka: list[float] = []
+            st_ka: Counter[int] = Counter()
+            err_ka: list[str] = []
+            t_ka0 = time.perf_counter()
+            with ThreadPoolExecutor(max_workers=c_tls) as pool:
+                futs_ka = [pool.submit(run_ka_worker, ka_per, wi * ka_per) for wi in range(c_tls)]
+                for fut in as_completed(futs_ka):
+                    wl, ws, we = fut.result()
+                    lat_ka.extend(wl)
+                    st_ka.update(ws)
+                    err_ka.extend(we)
+            ka_wall = time.perf_counter() - t_ka0
+            report["scenarios"]["5b_native_tls_keepalive"] = summarize_latencies(lat_ka, ka_wall, st_ka, err_ka)
             time.sleep(2.3)
         finally:
             if tsrv.poll() is None:

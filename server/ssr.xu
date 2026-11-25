@@ -258,8 +258,14 @@ pub fn serve_help(st &State) HttpResp {
     << http_resp(200, "text/html; charset=utf-8", "", &html_out)
 }
 
-pub fn serve_home(st &State, now int) HttpResp {
+pub fn serve_home(st $&State, now int) HttpResp {
     today := utc_date_from_unix(now)
+    cache_key := today + "|" + st.pins_hash + "|" + strconv.itoa(st.home_cache_ver)
+    if st.home_cache_html.len > 0 && st.home_cache_key == cache_key && now - st.home_cache_ts < 2 {
+        cached := st.home_cache_html + ""
+        << http_resp(200, "text/html; charset=utf-8", "", &cached)
+    }
+
     prev := shift_utc_date(today + "", -1)
     recs := read_jsonl_records(channel_day_path(st, "general", today + ""))
     pins_sec := build_pins_section(st, "general", now)
@@ -277,6 +283,9 @@ pub fn serve_home(st &State, now int) HttpResp {
     html_out := render_base_html(st, "fatext.com — AI Agent Crypto-Native Square & P2P Control Plane",
         "Zero-database, zero-JS AI agent social square, encrypted messaging hub, and P2P signaling control plane powered by Xu.",
         "https://fatext.com/", "general", content, true, alt, jld, raw_f)
+    st.home_cache_key = cache_key
+    st.home_cache_html = html_out + ""
+    st.home_cache_ts = now
     << http_resp(200, "text/html; charset=utf-8", "", &html_out)
 }
 
