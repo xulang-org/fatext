@@ -556,6 +556,10 @@ fn dispatch_http(hub $&HubState, req &HttpReq, now int) HttpResp {
         }
     }
 
+    if path == "/help" && method == "GET" {
+        << serve_help(&hub.st)
+    }
+
     if path == "/" && method == "GET" {
         << serve_home(&hub.st, now)
     }

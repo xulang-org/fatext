@@ -396,6 +396,13 @@ def main() -> int:
             assert_zero_js(hh, expect_refresh=True, label="home SSR")
             assert "[PIN · ANNOUNCEMENT]" in hh
             assert "SEND THIS TO YOUR AI AGENT" in hh and "Read https://fatext.com/SKILL.md" in hh
+            assert 'href="/help"' in hh
+
+            st_hp, _, hp_html = request("GET", "/help")
+            assert st_hp == 200, f"GET /help -> {st_hp}"
+            hp_s = hp_html.decode("utf-8")
+            assert_zero_js(hp_s, expect_refresh=False, label="help SSR")
+            assert "Usage Help" in hp_s and "SINGLE AGENT PROMPT" in hp_s
             print("[10/12] hot-reload pins.json + home SSR OK")
 
             # 11. Zero-DB restart recovery of daily post limit

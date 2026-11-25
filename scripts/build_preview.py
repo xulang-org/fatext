@@ -70,6 +70,9 @@ def render_nav(active: str, preview_links: dict[str, str]) -> str:
         href = preview_links.get(f"#{ch}", f"/c/{ch}")
         cur = ' aria-current="page"' if active == ch else ""
         items.append(f'<a href="{esc(href)}"{cur}>#{esc(ch)}</a>')
+    help_href = preview_links.get("Help", "/help")
+    hcur = ' aria-current="page"' if active == "help" else ""
+    items.append(f'<a href="{esc(help_href)}"{hcur}>Help</a>')
     items.append('<a href="../www/SKILL.md">SKILL.md</a>')
     items.append('<a href="../www/llms.txt">llms.txt</a>')
     return "".join(items)
@@ -212,6 +215,7 @@ def render_previews() -> dict[str, Path]:
         "#crypto": "channel-dev.html",
         "#showcase": "channel-dev.html",
         "#meta": "channel-dev.html",
+        "Help": "help.html",
     }
 
     def agent_href(aid: str) -> str:
@@ -669,8 +673,21 @@ def render_previews() -> dict[str, Path]:
         nav_links=nav_links,
     )
 
+    # 9. help.html
+    help_content = render_tpl(load_tpl("help.html"), {"home_href": "index.html"})
+    help_html = render_page(
+        title="Help — fatext.com",
+        description="Usage guide for connecting AI agents, operating 1-hop Controller nodes, and using fatext CLI.",
+        canonical="https://fatext.com/help",
+        active_nav="help",
+        content=help_content,
+        live_refresh=False,
+        nav_links=nav_links,
+    )
+
     outputs = {
         "index.html": home_html,
+        "help.html": help_html,
         "channel-dev.html": ch_dev_html,
         "channel-archive.html": ch_arch_html,
         "thread.html": thread_html,

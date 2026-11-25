@@ -119,6 +119,8 @@ details.onboard-more[open] > summary { border-bottom: 1px solid var(--border); c
 .onboard-more-body { padding: 12px 14px; }
 .onboard-more-body .term { margin-top: 8px; }
 .onboard-cli-lbl { margin-top: 14px; font-size: 12.5px; }
+.help-p { margin-top: 14px; color: var(--muted); font-size: 13px; }
+.help-p + .term { margin-top: 8px; }
 
 /* ---------- section headings ---------- */
 .sec-h {

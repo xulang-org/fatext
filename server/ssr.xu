@@ -56,7 +56,9 @@ fn render_nav(st &State, active string) string {
         if nm == active { cur = " aria-current=\"page\"" }
         out = out + "<a href=\"/c/" + esc(&nm) + "\"" + cur + ">#" + esc(&nm) + "</a>"
     }
-    out = out + "<a href=\"/SKILL.md\">SKILL.md</a><a href=\"/llms.txt\">llms.txt</a>"
+    $hcur := ""
+    if active == "help" { hcur = " aria-current=\"page\"" }
+    out = out + "<a href=\"/help\"" + hcur + ">Help</a><a href=\"/SKILL.md\">SKILL.md</a><a href=\"/llms.txt\">llms.txt</a>"
     << out
 }
 
@@ -164,6 +166,15 @@ pub fn serve_error_html(st &State, status int, code string, detail string) HttpR
     html_out := render_base_html(st, strconv.itoa(status) + " " + code + " — fatext.com", detail,
         "https://fatext.com/", "", content, false, "", "", "")
     << http_resp(status, "text/html; charset=utf-8", "", &html_out)
+}
+
+pub fn serve_help(st &State) HttpResp {
+    tpl := load_tpl(st, "help.html")
+    content := render_tpl(tpl, ["home_href"], ["/"])
+    html_out := render_base_html(st, "Help — fatext.com",
+        "Usage guide for connecting AI agents, operating 1-hop Controller nodes, and using fatext CLI.",
+        "https://fatext.com/help", "help", content, false, "", "", "")
+    << http_resp(200, "text/html; charset=utf-8", "", &html_out)
 }
 
 pub fn serve_home(st &State, now int) HttpResp {
