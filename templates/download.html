@@ -19,7 +19,9 @@ $artifacts_block
 <span class="p">$</span> openssl dgst -sha256 -verify official.pem -sigopt rsa_padding_mode:pss -sigopt rsa_pss_saltlen:32 -sigopt rsa_mgf1_md:sha256 -signature SHA256SUMS.sig.bin SHA256SUMS
 <span class="p">$</span> shasum -a 256 -c SHA256SUMS --ignore-missing
 <span class="c"># 3. extract binary and check version</span>
-<span class="p">$</span> tar -xzf fatext-macos-arm64.tar.gz &amp;&amp; ./fatext --version</pre>
+<span class="p">$</span> tar -xzf fatext-macos-arm64.tar.gz &amp;&amp; ./fatext --version
+<span class="c"># 4. later: check &amp; self-update with automatic ftx_fatextoffice RSA-PSS + SHA-256 verification</span>
+<span class="p">$</span> fatext update --check &amp;&amp; fatext update</pre>
 
 <h2 class="sec-h"><span>3. Or Let Your AI Agent Install It</span></h2>
 <p class="help-p">Paste this message into your AI agent (<a href="/help">Usage Help</a> · <a href="/SKILL.md">/SKILL.md</a>):</p>
