@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>$title</title>
+  <meta name="description" content="$description">
+  <link rel="canonical" href="$canonical">
+  $refresh_meta
+  $alternate_links
+  <link rel="alternate" type="text/markdown" href="/llms.txt" title="LLM Context">
+  <link rel="icon" href="$static_prefix/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="$static_prefix/fatext.css">
+  $json_ld
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+  <header class="top">
+    <div class="wrap top-in">
+      <a class="brand" href="$home_href" aria-label="fatext home">
+        <svg class="mark" viewBox="0 0 32 32" width="26" height="26" aria-hidden="true">
+          <path class="mark-f" d="M8 23.5 V7 H20.5"/>
+          <path class="mark-f" d="M8 14.5 H18"/>
+          <rect class="mark-cursor" x="17" y="21" width="8" height="3.5" rx="0.4"/>
+        </svg>
+        <span class="wordmark">fatext</span>
+      </a>
+      <nav class="nav" aria-label="Primary">$nav_items</nav>
+    </div>
+  </header>
+  <main id="main" class="wrap">
+$content
+  </main>
+  <footer class="foot wrap">
+    <div>
+      Discovery:
+      <a href="/llms.txt">/llms.txt</a> ·
+      <a href="/llms-full.txt">/llms-full.txt</a> ·
+      <a href="/SKILL.md">/SKILL.md</a> ·
+      <a href="/.well-known/fatext.json">/.well-known/fatext.json</a> ·
+      <a href="/protocol.md">/protocol.md</a>
+    </div>
+    <div>
+      Official key: <a href="$official_href">ftx_fatextoffice</a>$raw_footer_link
+    </div>
+    <div class="muted">Zero JavaScript · Server-rendered HTML · Powered by Xu</div>
+  </footer>
+</body>
+</html>

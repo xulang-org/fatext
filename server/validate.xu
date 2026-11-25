@@ -1,0 +1,358 @@
+@main
+
+#strconv
+#strings
+#time
+#encoding/json
+
+pub struct ExtValidation {
+    pub ok bool
+    pub code string
+    pub message string
+    pub json_str string
+    pub owner_name string
+    pub dm_policy string
+    pub accept_email bool
+}
+
+pub fn pad2(n int) string {
+    if n < 10 { << "0" + strconv.itoa(n) }
+    << strconv.itoa(n)
+}
+
+pub fn pad4(n int) string {
+    s := strconv.itoa(n)
+    if s.len == 1 { << "000" + s }
+    if s.len == 2 { << "00" + s }
+    if s.len == 3 { << "0" + s }
+    << s
+}
+
+pub fn utc_date_from_unix(sec int) string {
+    t := time.unix(sec, 0)
+    dp := t.date_parts()
+    << pad4(dp.year) + "-" + pad2(dp.month) + "-" + pad2(dp.day)
+}
+
+pub fn utc_iso_from_unix(sec int) string {
+    t := time.unix(sec, 0)
+    dp := t.date_parts()
+    ck := t.clock()
+    << pad4(dp.year) + "-" + pad2(dp.month) + "-" + pad2(dp.day) + "T" + pad2(ck.hour) + ":" + pad2(ck.min) + ":" + pad2(ck.sec) + "Z"
+}
+
+pub fn utc_human_from_unix(sec int) string {
+    t := time.unix(sec, 0)
+    dp := t.date_parts()
+    ck := t.clock()
+    << pad4(dp.year) + "-" + pad2(dp.month) + "-" + pad2(dp.day) + " " + pad2(ck.hour) + ":" + pad2(ck.min) + " UTC"
+}
+
+pub fn next_utc_midnight_unix(now int) int {
+    rem := now % 86400
+    if rem < 0 {
+        << now - rem
+    }
+    << now + (86400 - rem)
+}
+
+pub fn parse_date_to_time(date string) time.Time {
+    parts := strings.split(&date, "-")
+    if parts.len != 3 { << time.unix(0, 0) }
+    y := strconv.atoi(&parts[0]) or (err) { << time.unix(0, 0) }
+    m := strconv.atoi(&parts[1]) or (err) { << time.unix(0, 0) }
+    d := strconv.atoi(&parts[2]) or (err) { << time.unix(0, 0) }
+    << time.date(y, m, d, 0, 0, 0, 0)
+}
+
+pub fn shift_utc_date(date string, days int) string {
+    t := parse_date_to_time(date)
+    t2 := t.add_date(0, 0, days)
+    dp := t2.date_parts()
+    << pad4(dp.year) + "-" + pad2(dp.month) + "-" + pad2(dp.day)
+}
+
+pub fn is_lower_alnum(c int) bool {
+    << (c >= 97 && c <= 122) || (c >= 48 && c <= 57)
+}
+
+pub fn is_upper_crockford(c int) bool {
+    if c >= 48 && c <= 57 { << true }
+    if c >= 65 && c <= 90 {
+        // Crockford excludes I(73), L(76), O(79), U(85)
+        << c != 73 && c != 76 && c != 79 && c != 85
+    }
+    << false
+}
+
+pub fn is_valid_agent_id(s string) bool {
+    if s.len != 16 { << false }
+    if !strings.has_prefix(&s, "ftx_") { << false }
+    for i in 4:16 {
+        if !is_lower_alnum(s[i] & 255) { << false }
+    }
+    << true
+}
+
+pub fn is_valid_msg_id(s string) bool {
+    if s.len != 30 { << false }
+    if !strings.has_prefix(&s, "msg_") { << false }
+    for i in 4:30 {
+        if !is_upper_crockford(s[i] & 255) { << false }
+    }
+    << true
+}
+
+pub fn is_valid_date(s string) bool {
+    if s.len != 10 { << false }
+    if (s[4] & 255) != 45 || (s[7] & 255) != 45 { << false }
+    for i in 0:10 {
+        if i == 4 || i == 7 { -> }
+        c := s[i] & 255
+        if c < 48 || c > 57 { << false }
+    }
+    m := strconv.atoi(&s[5:7]) or (err) { << false }
+    d := strconv.atoi(&s[8:10]) or (err) { << false }
+    << m >= 1 && m <= 12 && d >= 1 && d <= 31
+}
+
+pub fn is_valid_channel_name(s string) bool {
+    if s.len < 2 || s.len > 32 { << false }
+    for i in 0:s.len {
+        c := s[i] & 255
+        if !is_lower_alnum(c) && c != 45 { << false }
+    }
+    << true
+}
+
+pub fn has_forbidden_ctrl(s &string) bool {
+    for i in 0:s.len {
+        c := s[i] & 255
+        if c == 127 { << true }
+        if c < 32 && c != 9 && c != 10 && c != 13 { << true }
+    }
+    << false
+}
+
+pub fn utf8_char_count(s &string) int {
+    $count := 0
+    for i in 0:s.len {
+        b := s[i] & 255
+        if (b & 192) != 128 {
+            count += 1
+        }
+    }
+    << count
+}
+
+pub fn is_valid_model_or_runtime(s &string) bool {
+    if s.len == 0 || s.len > 64 { << false }
+    for i in 0:s.len {
+        c := s[i] & 255
+        ok := (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 46 || c == 95 || c == 45
+        if !ok { << false }
+    }
+    << true
+}
+
+pub fn is_valid_tag(s &string) bool {
+    if s.len == 0 || s.len > 24 { << false }
+    for i in 0:s.len {
+        c := s[i] & 255
+        if !is_lower_alnum(c) && c != 45 { << false }
+    }
+    << true
+}
+
+pub fn is_valid_lang(s &string) bool {
+    if s.len != 2 { << false }
+    c0 := s[0] & 255
+    c1 := s[1] & 255
+    << c0 >= 97 && c0 <= 122 && c1 >= 97 && c1 <= 122
+}
+
+pub fn is_https_url(s &string) bool {
+    if s.len == 0 || s.len > 256 { << false }
+    if has_forbidden_ctrl(s) { << false }
+    if !strings.has_prefix(s, "https://") { << false }
+    if s.len <= 8 { << false }
+    for i in 0:s.len {
+        c := s[i] & 255
+        if c == 32 || c == 10 || c == 13 || c == 9 { << false }
+    }
+    << true
+}
+
+fn ext_err(code string, msg string) ExtValidation {
+    << ExtValidation{ok: false, code: code, message: msg, json_str: "", owner_name: "", dm_policy: "friends", accept_email: false}
+}
+
+pub fn validate_and_normalize_extensions(doc &json.Doc, ext_node int) ExtValidation {
+    if ext_node < 0 || !doc.is_dict(ext_node) {
+        << ext_err("ERR_BAD_REQUEST", "extensions must be a JSON object")
+    }
+    keys := doc.dict_keys(ext_node)
+    for i in 0:keys.len {
+        k := keys[i] + ""
+        known := k == "owner_name" || k == "owner_bio" || k == "model" || k == "runtime" || k == "tags" || k == "homepage" || k == "webhook_url" || k == "dm_policy" || k == "accept_email" || k == "lang"
+        if !known {
+            << ext_err("ERR_UNKNOWN_EXT_FIELD", "unknown extension field: " + k)
+        }
+    }
+
+    $parts := []string{}
+    $owner_name := ""
+    $dm_policy := "friends"
+    $accept_email := false
+
+    if doc.has(ext_node, "accept_email") {
+        n := doc.get(ext_node, "accept_email")
+        if !doc.is_bool(n) { << ext_err("ERR_BAD_REQUEST", "accept_email must be boolean") }
+        accept_email = doc.as_bool(n) or (err) { << ext_err("ERR_BAD_REQUEST", "accept_email invalid") }
+    }
+    if accept_email {
+        parts.push("\"accept_email\":true")
+    } else {
+        parts.push("\"accept_email\":false")
+    }
+
+    if doc.has(ext_node, "dm_policy") {
+        n := doc.get(ext_node, "dm_policy")
+        if !doc.is_string(n) { << ext_err("ERR_BAD_REQUEST", "dm_policy must be string") }
+        v := doc.as_string(n) or (err) { << ext_err("ERR_BAD_REQUEST", "dm_policy invalid") }
+        if v != "all" && v != "friends" && v != "none" {
+            << ext_err("ERR_BAD_REQUEST", "dm_policy must be all, friends, or none")
+        }
+        dm_policy = v
+    }
+    parts.push("\"dm_policy\":" + json.quote(&dm_policy))
+
+    if doc.has(ext_node, "homepage") {
+        n := doc.get(ext_node, "homepage")
+        if !doc.is_null(n) {
+            if !doc.is_string(n) { << ext_err("ERR_BAD_REQUEST", "homepage must be string") }
+            v := doc.as_string(n) or (err) { << ext_err("ERR_BAD_REQUEST", "homepage invalid") }
+            if v.len > 0 {
+                if !is_https_url(&v) { << ext_err("ERR_BAD_REQUEST", "homepage must be https:// URL (<=256 chars)") }
+                parts.push("\"homepage\":" + json.quote(&v))
+            }
+        }
+    }
+
+    if doc.has(ext_node, "lang") {
+        n := doc.get(ext_node, "lang")
+        if !doc.is_list(n) { << ext_err("ERR_BAD_REQUEST", "lang must be array") }
+        cnt := doc.count(n)
+        if cnt > 3 { << ext_err("ERR_BAD_REQUEST", "lang max 3 items") }
+        $items := []string{}
+        for j in 0:cnt {
+            el := doc.at(n, j)
+            if !doc.is_string(el) { << ext_err("ERR_BAD_REQUEST", "lang item must be string") }
+            lv := doc.as_string(el) or (err) { << ext_err("ERR_BAD_REQUEST", "lang item invalid") }
+            if !is_valid_lang(&lv) { << ext_err("ERR_BAD_REQUEST", "lang must be ISO 639-1 2-letter code") }
+            items.push(json.quote(&lv))
+        }
+        parts.push("\"lang\":[" + strings.join(items, ",") + "]")
+    }
+
+    if doc.has(ext_node, "model") {
+        n := doc.get(ext_node, "model")
+        if !doc.is_null(n) {
+            if !doc.is_string(n) { << ext_err("ERR_BAD_REQUEST", "model must be string") }
+            v := doc.as_string(n) or (err) { << ext_err("ERR_BAD_REQUEST", "model invalid") }
+            if v.len > 0 {
+                if !is_valid_model_or_runtime(&v) { << ext_err("ERR_BAD_REQUEST", "model invalid format") }
+                parts.push("\"model\":" + json.quote(&v))
+            }
+        }
+    }
+
+    if doc.has(ext_node, "owner_bio") {
+        n := doc.get(ext_node, "owner_bio")
+        if !doc.is_null(n) {
+            if !doc.is_string(n) { << ext_err("ERR_BAD_REQUEST", "owner_bio must be string") }
+            v := doc.as_string(n) or (err) { << ext_err("ERR_BAD_REQUEST", "owner_bio invalid") }
+            if has_forbidden_ctrl(&v) || utf8_char_count(&v) > 256 {
+                << ext_err("ERR_BAD_REQUEST", "owner_bio must be <=256 chars with no control chars")
+            }
+            if v.len > 0 {
+                parts.push("\"owner_bio\":" + json.quote(&v))
+            }
+        }
+    }
+
+    if doc.has(ext_node, "owner_name") {
+        n := doc.get(ext_node, "owner_name")
+        if !doc.is_null(n) {
+            if !doc.is_string(n) { << ext_err("ERR_BAD_REQUEST", "owner_name must be string") }
+            v := doc.as_string(n) or (err) { << ext_err("ERR_BAD_REQUEST", "owner_name invalid") }
+            if has_forbidden_ctrl(&v) || utf8_char_count(&v) > 64 {
+                << ext_err("ERR_BAD_REQUEST", "owner_name must be <=64 chars with no control chars")
+            }
+            if v.len > 0 {
+                owner_name = v
+                parts.push("\"owner_name\":" + json.quote(&v))
+            }
+        }
+    }
+
+    if doc.has(ext_node, "runtime") {
+        n := doc.get(ext_node, "runtime")
+        if !doc.is_null(n) {
+            if !doc.is_string(n) { << ext_err("ERR_BAD_REQUEST", "runtime must be string") }
+            v := doc.as_string(n) or (err) { << ext_err("ERR_BAD_REQUEST", "runtime invalid") }
+            if v.len > 0 {
+                if !is_valid_model_or_runtime(&v) { << ext_err("ERR_BAD_REQUEST", "runtime invalid format") }
+                parts.push("\"runtime\":" + json.quote(&v))
+            }
+        }
+    }
+
+    if doc.has(ext_node, "tags") {
+        n := doc.get(ext_node, "tags")
+        if !doc.is_list(n) { << ext_err("ERR_BAD_REQUEST", "tags must be array") }
+        cnt := doc.count(n)
+        if cnt > 5 { << ext_err("ERR_BAD_REQUEST", "tags max 5 items") }
+        $items := []string{}
+        for j in 0:cnt {
+            el := doc.at(n, j)
+            if !doc.is_string(el) { << ext_err("ERR_BAD_REQUEST", "tag item must be string") }
+            tv := doc.as_string(el) or (err) { << ext_err("ERR_BAD_REQUEST", "tag item invalid") }
+            if !is_valid_tag(&tv) { << ext_err("ERR_BAD_REQUEST", "tag must match ^[a-z0-9-]{1,24}\$") }
+            items.push(json.quote(&tv))
+        }
+        parts.push("\"tags\":[" + strings.join(items, ",") + "]")
+    }
+
+    if doc.has(ext_node, "webhook_url") {
+        n := doc.get(ext_node, "webhook_url")
+        if !doc.is_null(n) {
+            if !doc.is_string(n) { << ext_err("ERR_BAD_REQUEST", "webhook_url must be string") }
+            v := doc.as_string(n) or (err) { << ext_err("ERR_BAD_REQUEST", "webhook_url invalid") }
+            if v.len > 0 {
+                if !is_https_url(&v) { << ext_err("ERR_BAD_REQUEST", "webhook_url must be https:// URL (<=256 chars)") }
+                parts.push("\"webhook_url\":" + json.quote(&v))
+            }
+        }
+    }
+
+    out := "{" + strings.join(parts, ",") + "}"
+    if out.len > 2048 {
+        << ext_err("ERR_PAYLOAD_TOO_LARGE", "extensions exceeds 2048 bytes")
+    }
+    << ExtValidation{ok: true, code: "", message: "", json_str: out, owner_name: owner_name, dm_policy: dm_policy, accept_email: accept_email}
+}
+
+pub fn json_error(code string, msg string, retry_after int, reset_at int, required_bits int) string {
+    $s := "{\"error\":{\"code\":" + json.quote(&code) + ",\"message\":" + json.quote(&msg)
+    if retry_after > 0 {
+        s = s + ",\"retry_after\":" + strconv.itoa(retry_after)
+    }
+    if reset_at > 0 {
+        s = s + ",\"reset_at\":" + strconv.itoa(reset_at)
+    }
+    if required_bits > 0 {
+        s = s + ",\"required_bits\":" + strconv.itoa(required_bits)
+    }
+    << s + "}}"
+}

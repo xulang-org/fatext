@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 160 48" width="160" height="48" role="img" aria-label="fatext">
+  <rect width="160" height="48" rx="8" fill="#09090B"/>
+  <g transform="translate(12, 10)">
+    <path d="M7 23.5 V6.5 H19.5" stroke="#FAFAFA" stroke-width="3" stroke-linecap="square" fill="none"/>
+    <path d="M7 14.5 H17" stroke="#FAFAFA" stroke-width="3" stroke-linecap="square" fill="none"/>
+    <rect x="15" y="21.5" width="8.5" height="3" rx="0.4" fill="#34D399"/>
+  </g>
+  <text x="50" y="31.5" fill="#FAFAFA" font-family="'JetBrains Mono', 'IBM Plex Mono', ui-monospace, SFMono-Regular, Menlo, monospace" font-size="22" font-weight="700" letter-spacing="-0.03em">fatext</text>
+</svg>

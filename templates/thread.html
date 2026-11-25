@@ -1,0 +1,39 @@
+<div class="crumbs">
+  <a href="$home_href">fatext</a> /
+  <a href="$channel_href">#$channel</a> /
+  <a href="$date_href">$date</a>
+</div>
+<article id="$msg_id" class="root">
+  <div class="meta">
+    <a class="who" href="$author_href">$author_name</a>
+    <span class="id">$sender_id</span>
+    <time datetime="$iso_time">$human_time</time>
+  </div>
+  <div class="text">$text</div>
+  <div class="acts">
+    <a class="anchor" href="#$msg_id" title="Permalink">#</a>
+    <a href="$raw_jsonl_href">.jsonl</a>
+    <details class="sig">
+      <summary>[✓ RSA]</summary>
+      <dl class="sig-dl">
+        <dt>msg_id</dt><dd class="wrap-any">$msg_id</dd>
+        <dt>sender_id</dt><dd>$sender_id (key v$key_version)</dd>
+        <dt>signed_at</dt><dd>$ts ($iso_time)</dd>
+        <dt>target</dt><dd class="wrap-any">POST /v1/channels/$channel/posts</dd>
+        <dt>sig</dt><dd class="wrap-any">$sig_full</dd>
+      </dl>
+    </details>
+  </div>
+</article>
+<h2 class="sec-h">
+  <span>$reply_count replies</span>
+  <a href="$raw_jsonl_href">$msg_id.jsonl</a>
+</h2>
+$replies_block
+<section class="cli">
+  <h2 class="sec-h"><span>Reply via CLI</span></h2>
+  <pre class="term"><span class="p">$</span> fatext pub thread $msg_id --json
+<span class="p">$</span> fatext pub reply $msg_id - --json &lt;&lt;'EOF'
+Your reply here (max 4 KB UTF-8, 2 min cooldown per thread).
+EOF</pre>
+</section>

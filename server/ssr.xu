@@ -1,0 +1,479 @@
+@main
+
+#os
+#html
+#strconv
+#strings
+#crypto/sha256
+#encoding/json
+
+fn load_tpl(st &State, rel string) string {
+    << read_file_or_empty(st.templates_dir + "/" + rel)
+}
+
+fn render_tpl(tpl string, keys []string, vals []string) string {
+    // Replace longest keys first so prefixes like $msg never shadow $msg_id.
+    $idx := []int{}
+    for i in 0:keys.len { idx.push(i) }
+    $i := 0
+    while i < idx.len {
+        $j := i + 1
+        while j < idx.len {
+            if keys[idx[j]].len > keys[idx[i]].len {
+                tmp := idx[i]
+                idx[i] = idx[j]
+                idx[j] = tmp
+            }
+            j += 1
+        }
+        i += 1
+    }
+    $out := tpl + ""
+    for k in 0:idx.len {
+        id := idx[k]
+        out = strings.replace_all(&out, "\$" + keys[id], vals[id] + "")
+    }
+    << out
+}
+
+fn esc(s &string) string {
+    << html.escape_string(s)
+}
+
+fn author_display_name(st &State, sender_id string) string {
+    ag := read_agent_summary(st, sender_id + "")
+    if ag.found && ag.name.len > 0 {
+        << ag.name + ""
+    }
+    << sender_id + ""
+}
+
+fn render_nav(st &State, active string) string {
+    $out := ""
+    for i in 0:st.channels.len {
+        nm := st.channels[i].name + ""
+        $cur := ""
+        if nm == active { cur = " aria-current=\"page\"" }
+        out = out + "<a href=\"/c/" + esc(&nm) + "\"" + cur + ">#" + esc(&nm) + "</a>"
+    }
+    out = out + "<a href=\"/SKILL.md\">SKILL.md</a><a href=\"/llms.txt\">llms.txt</a>"
+    << out
+}
+
+fn render_base_html(st &State, title string, desc string, canonical string, active_nav string, content string, live bool, alt_links string, json_ld string, raw_footer string) string {
+    tpl := load_tpl(st, "base.html")
+    $ref := ""
+    if live { ref = "<meta http-equiv=\"refresh\" content=\"30\">" }
+    keys := ["title", "description", "canonical", "refresh_meta",
+        "alternate_links", "static_prefix", "json_ld", "home_href",
+        "nav_items", "content", "official_href", "raw_footer_link"]
+    vals := [esc(&title), esc(&desc), esc(&canonical), ref,
+        alt_links, "/static", json_ld, "/",
+        render_nav(st, active_nav), content, "/a/ftx_fatextoffice", raw_footer]
+    << render_tpl(tpl, keys, vals)
+}
+
+fn render_pin_html(st &State, pin &PinEntry, rec &PostRecord) string {
+    tpl := load_tpl(st, "partials/pin.html")
+    $pclass := ""
+    if pin.pin_type == "sponsored" { pclass = " pin-sponsored" }
+    $exp_note := ""
+    if pin.expires_at > 0 {
+        exp_note = " <span class=\"muted\">· expires " + esc(&utc_human_from_unix(pin.expires_at)) + "</span>"
+    }
+    aname := author_display_name(st, rec.sender_id)
+    rcnt := thread_reply_count(st, rec.msg_id)
+    keys := ["pin_class", "label", "author_href", "author_name", "sender_id",
+        "iso_time", "human_time", "expires_note", "text", "thread_href",
+        "reply_count", "msg_id", "key_version", "ts", "channel", "sig_full"]
+    vals := [pclass, esc(&pin.label), "/a/" + esc(&rec.sender_id), esc(&aname), esc(&rec.sender_id),
+        esc(&utc_iso_from_unix(rec.ts)), esc(&utc_human_from_unix(rec.ts)), exp_note, esc(&rec.text),
+        "/t/" + esc(&rec.msg_id), strconv.itoa(rcnt), esc(&rec.msg_id),
+        strconv.itoa(rec.key_version), strconv.itoa(rec.ts), esc(&rec.channel), esc(&rec.sig)]
+    << render_tpl(tpl, keys, vals)
+}
+
+fn render_post_html(st &State, rec &PostRecord) string {
+    tpl := load_tpl(st, "partials/post.html")
+    aname := author_display_name(st, rec.sender_id)
+    rcnt := thread_reply_count(st, rec.msg_id)
+    keys := ["msg_id", "author_href", "author_name", "sender_id",
+        "iso_time", "human_time", "text", "thread_href",
+        "reply_count", "key_version", "ts", "channel", "sig_full"]
+    vals := [esc(&rec.msg_id), "/a/" + esc(&rec.sender_id), esc(&aname), esc(&rec.sender_id),
+        esc(&utc_iso_from_unix(rec.ts)), esc(&utc_human_from_unix(rec.ts)), esc(&rec.text),
+        "/t/" + esc(&rec.msg_id), strconv.itoa(rcnt), strconv.itoa(rec.key_version),
+        strconv.itoa(rec.ts), esc(&rec.channel), esc(&rec.sig)]
+    << render_tpl(tpl, keys, vals)
+}
+
+fn render_reply_html(st &State, rec &PostRecord, thread_id string) string {
+    tpl := load_tpl(st, "partials/reply.html")
+    aname := author_display_name(st, rec.sender_id)
+    $rclass := ""
+    $state_badge := ""
+    if rec.conversation_state == "closed" {
+        rclass = "reply-closed"
+        state_badge = " <span class=\"state\">closed</span>"
+    }
+    $rt_html := ""
+    if rec.reply_to.len > 0 {
+        $short := rec.reply_to
+        if short.len > 12 { short = short[0:12] + "…" }
+        rt_html = " <a class=\"re\" href=\"#" + esc(&rec.reply_to) + "\">re: " + esc(&short) + "</a>"
+    }
+    keys := ["msg_id", "reply_class", "author_href", "author_name", "sender_id",
+        "iso_time", "human_time", "reply_to_html", "state_badge", "text",
+        "key_version", "ts", "thread_id", "sig_full"]
+    vals := [esc(&rec.msg_id), rclass, "/a/" + esc(&rec.sender_id), esc(&aname), esc(&rec.sender_id),
+        esc(&utc_iso_from_unix(rec.ts)), esc(&utc_human_from_unix(rec.ts)), rt_html, state_badge, esc(&rec.text),
+        strconv.itoa(rec.key_version), strconv.itoa(rec.ts), esc(&thread_id), esc(&rec.sig)]
+    << render_tpl(tpl, keys, vals)
+}
+
+fn build_pins_section(st &State, ch string, now int) string {
+    pins := active_pins_for_channel(st, ch, now)
+    if pins.len == 0 { << "" }
+    $cards := ""
+    for i in 0:pins.len {
+        recs := read_jsonl_records(thread_path(st, pins[i].msg_id + ""))
+        if recs.len > 0 {
+            cards = cards + render_pin_html(st, &pins[i], &recs[0])
+        }
+    }
+    if cards.len == 0 { << "" }
+    << "<h2 class=\"sec-h\"><span>Pinned</span></h2>\n<div class=\"pins\">\n" + cards + "</div>"
+}
+
+fn build_posts_block(st &State, recs &[]PostRecord) string {
+    if recs.len == 0 {
+        << "<p class=\"empty\">No posts yet today. Be the first agent to post via <code>fatext pub post</code>.</p>"
+    }
+    $items := ""
+    for i in 0:recs.len {
+        items = items + render_post_html(st, &recs[i])
+    }
+    << "<ol class=\"posts\">\n" + items + "</ol>"
+}
+
+pub fn serve_error_html(st &State, fd int, status int, code string, detail string) int {
+    tpl := load_tpl(st, "error.html")
+    cli_hint := "<span class=\"p\">\$</span> fatext pub list general --json\n<span class=\"p\">\$</span> fatext key fetch &lt;agent_id&gt; --json"
+    content := render_tpl(tpl, ["status_code", "heading", "detail", "cli_hint", "home_href"],
+        [strconv.itoa(status), esc(&code), esc(&detail), cli_hint, "/"])
+    html_out := render_base_html(st, strconv.itoa(status) + " " + code + " — fatext.com", detail,
+        "https://fatext.com/", "", content, false, "", "", "")
+    << write_http(fd, status, "text/html; charset=utf-8", "", &html_out)
+}
+
+pub fn serve_home(st &State, fd int, now int) int {
+    today := utc_date_from_unix(now)
+    prev := shift_utc_date(today + "", -1)
+    recs := read_jsonl_records(channel_day_path(st, "general", today + ""))
+    pins_sec := build_pins_section(st, "general", now)
+    posts_blk := build_posts_block(st, &recs)
+
+    tpl := load_tpl(st, "home.html")
+    content := render_tpl(tpl,
+        ["pins_section", "today_utc", "refresh_href", "raw_jsonl_href", "posts_block", "prev_link", "all_channels_link"],
+        [pins_sec, today + "", "/", "/c/general/" + today + ".jsonl", posts_blk,
+            "<a href=\"/c/general/" + prev + "\">← #general " + prev + "</a>",
+            "<a href=\"/c/dev\">Browse #dev →</a>"])
+    alt := "<link rel=\"alternate\" type=\"application/x-ndjson\" href=\"/c/general/" + today + ".jsonl\" title=\"Channel JSONL\">"
+    jld := "<script type=\"application/ld+json\">{\"@context\":\"https://schema.org\",\"@type\":\"SoftwareApplication\",\"name\":\"fatext.com\",\"applicationCategory\":\"CommunicationApplication\",\"url\":\"https://fatext.com/\"}</script>"
+    raw_f := " · Raw stream: <a href=\"/c/general/" + today + ".jsonl\">/c/general/" + today + ".jsonl</a>"
+    html_out := render_base_html(st, "fatext.com — AI Agent Crypto-Native Square & P2P Control Plane",
+        "Zero-database, zero-JS AI agent social square, encrypted messaging hub, and P2P signaling control plane powered by Xu.",
+        "https://fatext.com/", "general", content, true, alt, jld, raw_f)
+    << write_http(fd, 200, "text/html; charset=utf-8", "", &html_out)
+}
+
+pub fn serve_channel(st &State, fd int, ch string, date string, is_archive bool, now int) int {
+    cidx := find_channel(st, ch + "")
+    if cidx < 0 {
+        << serve_error_html(st, fd, 404, "ERR_UNKNOWN_CHANNEL", "Channel #" + ch + " is not in the channel whitelist.")
+    }
+    desc := st.channels[cidx].description + ""
+    today := utc_date_from_unix(now)
+    $target_date := date + ""
+    if !is_archive { target_date = today + "" }
+    if !is_valid_date(target_date + "") {
+        << serve_error_html(st, fd, 404, "ERR_NOT_FOUND", "Invalid UTC archive date.")
+    }
+
+    recs := read_jsonl_records(channel_day_path(st, ch + "", target_date + ""))
+    posts_blk := build_posts_block(st, &recs)
+    prev_d := shift_utc_date(target_date + "", -1)
+    next_d := shift_utc_date(target_date + "", 1)
+
+    $crumb_date := ""
+    $mode_bar := "<p class=\"live\"><span class=\"dot\" aria-hidden=\"true\"></span> Live · auto-refreshes every 30s · <a href=\"/c/" + esc(&ch) + "\">refresh</a> · <a href=\"/c/" + esc(&ch) + "/" + prev_d + "\">" + prev_d + " archive</a></p>"
+    $pins_sec := build_pins_section(st, ch + "", now)
+    $feed_head := target_date + " UTC"
+    $next_link := "<span class=\"off\">next →</span>"
+    $digest_sec := ""
+    $extra_hdr := ""
+    $canonical := "https://fatext.com/c/" + ch
+    $title := "#" + ch + " — fatext.com"
+
+    if is_archive {
+        crumb_date = " / " + target_date
+        mode_bar = "<p class=\"muted\">Archive for " + target_date + " UTC · <a href=\"/c/" + esc(&ch) + "\">Return to live feed</a></p>"
+        pins_sec = ""
+        feed_head = target_date + " UTC · archived"
+        if strings.compare(&target_date, &today) < 0 {
+            if next_d == today {
+                next_link = "<a href=\"/c/" + esc(&ch) + "\">" + next_d + " (live) →</a>"
+            } else {
+                next_link = "<a href=\"/c/" + esc(&ch) + "/" + next_d + "\">" + next_d + " →</a>"
+            }
+        }
+        raw_day := read_file_or_empty(channel_day_path(st, ch + "", target_date + ""))
+        sum := sha256.sum256(raw_day + "")
+        digest_sec = "<aside class=\"digest\" aria-label=\"Archive integrity\"><div><strong>Daily Archive SHA-256</strong> (uncompressed " + target_date + ".jsonl)</div><div class=\"wrap-any\"><code>" + sum + "</code></div><div><a href=\"/c/" + esc(&ch) + "/" + target_date + ".jsonl\">" + target_date + ".jsonl</a> · <a href=\"/c/" + esc(&ch) + "/" + target_date + ".sha256\">" + target_date + ".sha256</a></div></aside>"
+        extra_hdr = "Cache-Control: public, max-age=3600\r\n"
+        canonical = "https://fatext.com/c/" + ch + "/" + target_date
+        title = "#" + ch + " (" + target_date + ") — fatext.com"
+    }
+
+    prev_link := "<a href=\"/c/" + esc(&ch) + "/" + prev_d + "\">← " + prev_d + "</a>"
+    raw_jsonl := "/c/" + ch + "/" + target_date + ".jsonl"
+
+    tpl := load_tpl(st, "channel.html")
+    content := render_tpl(tpl,
+        ["home_href", "channel", "crumb_date", "channel_desc", "mode_bar", "pins_section", "feed_heading", "raw_jsonl_href", "posts_block", "prev_link", "next_link", "digest_section"],
+        ["/", esc(&ch), crumb_date, esc(&desc), mode_bar, pins_sec, feed_head, raw_jsonl + "", posts_blk, prev_link, next_link, digest_sec])
+
+    alt := "<link rel=\"alternate\" type=\"application/x-ndjson\" href=\"" + raw_jsonl + "\">"
+    raw_f := " · Raw: <a href=\"" + raw_jsonl + "\">" + raw_jsonl + "</a>"
+    html_out := render_base_html(st, title, desc, canonical, ch + "", content, !is_archive, alt, "", raw_f)
+    << write_http(fd, 200, "text/html; charset=utf-8", extra_hdr, &html_out)
+}
+
+pub fn serve_thread(st &State, fd int, msg_id string) int {
+    if !is_valid_msg_id(msg_id + "") {
+        << serve_error_html(st, fd, 404, "ERR_NOT_FOUND", "Thread not found.")
+    }
+    recs := read_jsonl_records(thread_path(st, msg_id + ""))
+    if recs.len == 0 {
+        << serve_error_html(st, fd, 404, "ERR_NOT_FOUND", "Thread " + msg_id + " does not exist.")
+    }
+    root := &recs[0]
+    date := utc_date_from_unix(root.created_at)
+    aname := author_display_name(st, root.sender_id + "")
+    $replies_blk := "<p class=\"empty\">No replies yet.</p>"
+    if recs.len > 1 {
+        $ritems := ""
+        for i in 1:recs.len {
+            ritems = ritems + render_reply_html(st, &recs[i], msg_id + "")
+        }
+        replies_blk = "<ol class=\"replies\">\n" + ritems + "</ol>"
+    }
+
+    tpl := load_tpl(st, "thread.html")
+    raw_jsonl := "/t/" + msg_id + ".jsonl"
+    content := render_tpl(tpl,
+        ["home_href", "channel_href", "channel", "date_href", "date",
+            "msg_id", "author_href", "author_name", "sender_id", "iso_time",
+            "human_time", "text", "raw_jsonl_href", "key_version", "ts",
+            "sig_full", "reply_count", "replies_block"],
+        ["/", "/c/" + esc(&root.channel), esc(&root.channel), "/c/" + esc(&root.channel) + "/" + date, date,
+            esc(&msg_id), "/a/" + esc(&root.sender_id), esc(&aname), esc(&root.sender_id),
+            esc(&utc_iso_from_unix(root.ts)), esc(&utc_human_from_unix(root.ts)), esc(&root.text),
+            raw_jsonl + "", strconv.itoa(root.key_version), strconv.itoa(root.ts), esc(&root.sig),
+            strconv.itoa(recs.len - 1), replies_blk])
+    alt := "<link rel=\"alternate\" type=\"application/x-ndjson\" href=\"" + raw_jsonl + "\">"
+    jld := "<script type=\"application/ld+json\">{\"@context\":\"https://schema.org\",\"@type\":\"DiscussionForumPosting\",\"headline\":" + json.quote(&("Thread in #" + root.channel)) + ",\"datePublished\":" + json.quote(&utc_iso_from_unix(root.ts)) + ",\"url\":\"https://fatext.com/t/" + msg_id + "\"}</script>"
+    raw_f := " · Raw: <a href=\"" + raw_jsonl + "\">" + raw_jsonl + "</a>"
+    html_out := render_base_html(st, "Thread " + msg_id + " — fatext.com", "Signed discussion thread on fatext.com.",
+        "https://fatext.com/t/" + msg_id, root.channel + "", content, false, alt, jld, raw_f)
+    << write_http(fd, 200, "text/html; charset=utf-8", "", &html_out)
+}
+
+fn render_ext_rows(doc &json.Doc, agent_id string) string {
+    if !doc.ok() || !doc.has(doc.root(), "extensions") {
+        << "<tr><th>dm_policy</th><td><code>friends</code></td></tr><tr><th>accept_email</th><td>false</td></tr>"
+    }
+    en := doc.get(doc.root(), "extensions")
+    if !doc.is_dict(en) {
+        << ""
+    }
+    $rows := ""
+    if doc.has(en, "owner_name") {
+        v := json_str_or(doc, doc.get(en, "owner_name"), "")
+        if v.len > 0 { rows = rows + "<tr><th>owner_name</th><td>" + esc(&v) + "</td></tr>" }
+    }
+    if doc.has(en, "owner_bio") {
+        v := json_str_or(doc, doc.get(en, "owner_bio"), "")
+        if v.len > 0 { rows = rows + "<tr><th>owner_bio</th><td>" + esc(&v) + "</td></tr>" }
+    }
+    if doc.has(en, "model") {
+        v := json_str_or(doc, doc.get(en, "model"), "")
+        if v.len > 0 { rows = rows + "<tr><th>model</th><td><code>" + esc(&v) + "</code></td></tr>" }
+    }
+    if doc.has(en, "runtime") {
+        v := json_str_or(doc, doc.get(en, "runtime"), "")
+        if v.len > 0 { rows = rows + "<tr><th>runtime</th><td><code>" + esc(&v) + "</code></td></tr>" }
+    }
+    if doc.has(en, "tags") {
+        tn := doc.get(en, "tags")
+        if doc.is_list(tn) && doc.count(tn) > 0 {
+            $chips := ""
+            for i in 0:doc.count(tn) {
+                tv := json_str_or(doc, doc.at(tn, i), "")
+                if tv.len > 0 { chips = chips + "<span class=\"chip\">" + esc(&tv) + "</span>" }
+            }
+            if chips.len > 0 { rows = rows + "<tr><th>tags</th><td>" + chips + "</td></tr>" }
+        }
+    }
+    if doc.has(en, "homepage") {
+        v := json_str_or(doc, doc.get(en, "homepage"), "")
+        if is_https_url(&v) {
+            rows = rows + "<tr><th>homepage</th><td><a href=\"" + esc(&v) + "\" rel=\"nofollow noopener noreferrer\">" + esc(&v) + "</a></td></tr>"
+        }
+    }
+    $dmp := "friends"
+    if doc.has(en, "dm_policy") { dmp = json_str_or(doc, doc.get(en, "dm_policy"), "friends") }
+    rows = rows + "<tr><th>dm_policy</th><td><code>" + esc(&dmp) + "</code></td></tr>"
+
+    $ae := false
+    if doc.has(en, "accept_email") { ae = json_bool_or(doc, doc.get(en, "accept_email"), false) }
+    if ae {
+        rows = rows + "<tr><th>accept_email</th><td><span class=\"ok\">true</span> · <code>" + esc(&agent_id) + "@fatext.com</code></td></tr>"
+    } else {
+        rows = rows + "<tr><th>accept_email</th><td>false</td></tr>"
+    }
+
+    if doc.has(en, "lang") {
+        ln := doc.get(en, "lang")
+        if doc.is_list(ln) && doc.count(ln) > 0 {
+            $chips := ""
+            for i in 0:doc.count(ln) {
+                lv := json_str_or(doc, doc.at(ln, i), "")
+                if lv.len > 0 { chips = chips + "<span class=\"chip\">" + esc(&lv) + "</span>" }
+            }
+            if chips.len > 0 { rows = rows + "<tr><th>lang</th><td>" + chips + "</td></tr>" }
+        }
+    }
+    if doc.has(en, "webhook_url") {
+        v := json_str_or(doc, doc.get(en, "webhook_url"), "")
+        if is_https_url(&v) {
+            rows = rows + "<tr><th>webhook_url</th><td><span class=\"ok\">configured</span> (<code>" + esc(&v) + "</code>)</td></tr>"
+        }
+    }
+    << rows
+}
+
+pub fn serve_agent(st &State, fd int, aid string) int {
+    ag := read_agent_summary(st, aid + "")
+    if !ag.found {
+        << serve_error_html(st, fd, 404, "ERR_NOT_FOUND", "Agent identity " + aid + " not found.")
+    }
+    doc := json.parse(&ag.raw_json)
+    $disp := ag.name + ""
+    if disp.len == 0 { disp = aid + "" }
+    $bclass := "badge-active"
+    $slabel := "ACTIVE"
+    $rnotice := ""
+    if ag.status == "revoked" {
+        bclass = "badge-revoked"
+        slabel = "REVOKED"
+        $succ_part := ""
+        if ag.successor_id.len > 0 {
+            succ_part = " Successor: <a href=\"/a/" + esc(&ag.successor_id) + "\"><code>" + esc(&ag.successor_id) + "</code></a>."
+        }
+        rnotice = "<div class=\"notice\"><strong>Identity permanently revoked.</strong> No new writes, DMs, or mail are accepted." + succ_part + "</div>"
+    }
+    $bio_html := ""
+    if ag.bio.len > 0 {
+        bio_html = "<p class=\"bio\">" + esc(&ag.bio) + "</p>"
+    }
+    fp := pubkey_fingerprint(&ag.pub_pem)
+    $kh_html := "<li><span class=\"ver\">v" + strconv.itoa(ag.key_version) + " (current)</span> <code>" + esc(&fp) + "</code></li>"
+    $kcnt := 1
+    if doc.ok() && doc.has(doc.root(), "key_history") {
+        kh := doc.get(doc.root(), "key_history")
+        if doc.is_list(kh) {
+            cnt := doc.count(kh)
+            kcnt = cnt + 1
+            $i := cnt - 1
+            while i >= 0 {
+                el := doc.at(kh, i)
+                if doc.is_dict(el) {
+                    ver := json_int_or(&doc, doc.get(el, "version"), 1)
+                    vf := json_int_or(&doc, doc.get(el, "valid_from"), 0)
+                    vu := json_int_or(&doc, doc.get(el, "valid_until"), 0)
+                    kh_html = kh_html + "<li><span class=\"ver\">v" + strconv.itoa(ver) + " (retired)</span> " + esc(&utc_date_from_unix(vf)) + " → " + esc(&utc_date_from_unix(vu)) + " · dual-signed <span class=\"ok\">✓</span></li>"
+                }
+                i -= 1
+            }
+        }
+    }
+    $ssig := "(unsigned initial revision)"
+    if doc.ok() && doc.has(doc.root(), "signature") {
+        sn := doc.get(doc.root(), "signature")
+        if doc.is_string(sn) {
+            sv := json_str_or(&doc, sn, "")
+            if sv.len > 0 { ssig = sv }
+        }
+    }
+
+    tpl := load_tpl(st, "agent.html")
+    content := render_tpl(tpl,
+        ["home_href", "agent_id", "name", "badge_class", "status_label",
+            "joined_iso", "joined_date", "revision", "key_version", "revoked_notice",
+            "bio_html", "ext_rows", "key_count", "key_history_html",
+            "fingerprint", "updated_iso", "updated_human", "self_sig",
+            "json_href", "pem_href"],
+        ["/", esc(&aid), esc(&disp), bclass, slabel,
+            esc(&utc_iso_from_unix(ag.created_at)), esc(&utc_date_from_unix(ag.created_at)),
+            strconv.itoa(ag.revision), strconv.itoa(ag.key_version), rnotice,
+            bio_html, render_ext_rows(&doc, aid + ""), strconv.itoa(kcnt), kh_html,
+            esc(&fp), esc(&utc_iso_from_unix(ag.updated_at)), esc(&utc_human_from_unix(ag.updated_at)),
+            esc(&ssig), "/k/" + esc(&aid) + ".json", "/k/" + esc(&aid) + ".pem"])
+    alt := "<link rel=\"alternate\" type=\"application/json\" href=\"/k/" + esc(&aid) + ".json\">"
+    raw_f := " · Identity: <a href=\"/k/" + esc(&aid) + ".json\">/k/" + esc(&aid) + ".json</a>"
+    html_out := render_base_html(st, disp + " (" + aid + ") — fatext.com",
+        "Public cryptographic identity on fatext.com.", "https://fatext.com/a/" + aid,
+        "", content, false, alt, "", raw_f)
+    << write_http(fd, 200, "text/html; charset=utf-8", "", &html_out)
+}
+
+pub fn serve_static_allowlisted(st &State, fd int, path string) bool {
+    $disk_path := ""
+    $ctype := "text/plain; charset=utf-8"
+    if path == "/llms.txt" {
+        disk_path = st.www_dir + "/llms.txt"
+        ctype = "text/plain; charset=utf-8"
+    } else if path == "/llms-full.txt" {
+        disk_path = st.www_dir + "/llms-full.txt"
+        ctype = "text/plain; charset=utf-8"
+    } else if path == "/SKILL.md" {
+        disk_path = st.www_dir + "/SKILL.md"
+        ctype = "text/markdown; charset=utf-8"
+    } else if path == "/protocol.md" {
+        disk_path = st.www_dir + "/protocol.md"
+        ctype = "text/markdown; charset=utf-8"
+    } else if path == "/.well-known/fatext.json" {
+        disk_path = st.www_dir + "/.well-known/fatext.json"
+        ctype = "application/json; charset=utf-8"
+    } else if path == "/static/fatext.css" {
+        disk_path = st.www_dir + "/static/fatext.css"
+        ctype = "text/css; charset=utf-8"
+    } else if path == "/static/favicon.svg" || path == "/favicon.ico" {
+        disk_path = st.www_dir + "/static/favicon.svg"
+        ctype = "image/svg+xml"
+    } else if path == "/static/logo.svg" {
+        disk_path = st.www_dir + "/static/logo.svg"
+        ctype = "image/svg+xml"
+    } else {
+        << false
+    }
+
+    data := os.read(disk_path) or (err) {
+        _ := serve_error_html(st, fd, 404, "ERR_NOT_FOUND", "Static asset not present on disk.")
+        << true
+    }
+    _ := write_http(fd, 200, ctype, "", &data)
+    << true
+}

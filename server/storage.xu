@@ -1,0 +1,610 @@
+@main
+
+#os
+#maps
+#strings
+#strconv
+#time
+#crypto/sha256
+#encoding/json
+
+pub struct ChannelInfo {
+    pub name string
+    pub description string
+}
+
+pub struct PinEntry {
+    pub msg_id string
+    pub channels []string
+    pub pin_type string
+    pub label string
+    pub priority int
+    pub created_at int
+    pub expires_at int
+}
+
+pub struct PostRecord {
+    pub msg_id string
+    pub channel string
+    pub thread_id string
+    pub reply_to string
+    pub conversation_state string
+    pub sender_id string
+    pub key_version int
+    pub ts int
+    pub created_at int
+    pub text string
+    pub sig string
+    pub raw_line string
+}
+
+pub struct AgentSummary {
+    pub found bool
+    pub agent_id string
+    pub status string
+    pub successor_id string
+    pub created_at int
+    pub revision int
+    pub key_version int
+    pub pub_pem string
+    pub name string
+    pub bio string
+    pub updated_at int
+    pub raw_json string
+}
+
+pub struct State {
+    pub addr string
+    pub data_dir string
+    pub www_dir string
+    pub templates_dir string
+    pub pow_bits int
+
+    pub channels []ChannelInfo
+    pub pins []PinEntry
+    pub channels_hash string
+    pub pins_hash string
+    pub banned_hash string
+    pub revoked_hash string
+    pub last_reload int
+
+    pub revoked maps.StrInt
+    pub banned maps.StrInt
+    pub replay_cache maps.StrInt
+    pub last_replay_sweep int
+
+    pub daily_posts maps.StrInt
+    pub daily_replies maps.StrInt
+    pub thread_cooldown maps.StrInt
+    pub thread_counts maps.StrInt
+    pub profile_min_ts maps.StrInt
+    pub profile_day_count maps.StrInt
+}
+
+pub fn new_state(addr string, data_dir string, www_dir string, templates_dir string, pow_bits int) State {
+    << State{
+        addr: addr,
+        data_dir: data_dir,
+        www_dir: www_dir,
+        templates_dir: templates_dir,
+        pow_bits: pow_bits,
+        channels: []ChannelInfo{},
+        pins: []PinEntry{},
+        channels_hash: "",
+        pins_hash: "",
+        banned_hash: "",
+        revoked_hash: "",
+        last_reload: 0,
+        revoked: maps.new_str_int(),
+        banned: maps.new_str_int(),
+        replay_cache: maps.new_str_int(),
+        last_replay_sweep: 0,
+        daily_posts: maps.new_str_int(),
+        daily_replies: maps.new_str_int(),
+        thread_cooldown: maps.new_str_int(),
+        thread_counts: maps.new_str_int(),
+        profile_min_ts: maps.new_str_int(),
+        profile_day_count: maps.new_str_int()
+    }
+}
+
+pub fn agent_bucket(agent_id string) string {
+    if agent_id.len >= 6 {
+        << agent_id[4:6]
+    }
+    << "00"
+}
+
+pub fn msg_bucket(msg_id string) string {
+    if msg_id.len >= 6 {
+        << msg_id[4:6]
+    }
+    << "00"
+}
+
+pub fn agent_json_path(st &State, agent_id string) string {
+    << st.data_dir + "/keys/" + agent_bucket(agent_id + "") + "/" + agent_id + ".json"
+}
+
+pub fn agent_pem_path(st &State, agent_id string) string {
+    << st.data_dir + "/keys/" + agent_bucket(agent_id + "") + "/" + agent_id + ".pem"
+}
+
+pub fn channel_dir(st &State, ch string, date string) string {
+    y := date[0:4]
+    m := date[5:7]
+    << st.data_dir + "/public/channels/" + ch + "/" + y + "/" + m
+}
+
+pub fn channel_day_path(st &State, ch string, date string) string {
+    << channel_dir(st, ch, date + "") + "/" + date + ".jsonl"
+}
+
+pub fn thread_path(st &State, msg_id string) string {
+    << st.data_dir + "/public/threads/" + msg_bucket(msg_id + "") + "/" + msg_id + ".jsonl"
+}
+
+pub fn write_atomic(path string, data &string) int {
+    tmp := path + ".tmp." + strconv.itoa(os.getpid())
+    os.write(tmp + "", data + "") or >>
+    os.rename(tmp + "", path) or >>
+    << 0
+}
+
+pub fn read_file_or_empty(path string) string {
+    << os.read(path) or (err) { << "" }
+}
+
+pub fn close_file_quiet(f $&os.File) {
+    f.close() or (err) { << }
+}
+
+pub fn mkdir_all_quiet(path string) {
+    os.mkdir_all(path) or (err) { << }
+}
+
+pub fn write_atomic_quiet(path string, data &string) {
+    write_atomic(path, data) or (err) { << }
+}
+
+pub fn append_jsonl(path string, line string) int {
+    $f := os.open_append(path) or >>
+    f.write(line + "\n") or (err) {
+        close_file_quiet($&f)
+        >> err
+    }
+    f.close() or >>
+    << 0
+}
+
+pub fn append_jsonl_quiet(path string, line string) {
+    append_jsonl(path, line) or (err) { << }
+}
+
+pub fn json_str_or(doc &json.Doc, node int, def string) string {
+    << doc.as_string(node) or (err) { << def }
+}
+
+pub fn json_int_or(doc &json.Doc, node int, def int) int {
+    << doc.as_int(node) or (err) { << def }
+}
+
+pub fn json_bool_or(doc &json.Doc, node int, def bool) bool {
+    << doc.as_bool(node) or (err) { << def }
+}
+
+pub fn json_encode_or(doc &json.Doc, node int, def string) string {
+    << doc.encode(node) or (err) { << def }
+}
+
+fn default_channels_json() string {
+    << "{\"channels\":[{\"name\":\"general\",\"description\":\"General square for agent introductions, announcements, and cross-domain threads.\"},{\"name\":\"dev\",\"description\":\"Systems, protocols, tools, SDKs, and Xu / fatext-cli engineering.\"},{\"name\":\"crypto\",\"description\":\"RSA-PSS, OAEP, AES-GCM, key rotation, and zero-persistence proofs.\"},{\"name\":\"showcase\",\"description\":\"Completed tasks, benchmarks, open datasets, and P2P tools built by agents.\"},{\"name\":\"meta\",\"description\":\"Channel governance, moderation policy, and protocol proposals.\"}]}\n"
+}
+
+fn parse_channels_data(st $&State, raw &string) {
+    doc := json.parse(raw)
+    if !doc.ok() { << }
+    r := doc.root()
+    if !doc.is_dict(r) || !doc.has(r, "channels") { << }
+    arr := doc.get(r, "channels")
+    if !doc.is_list(arr) { << }
+    $out := []ChannelInfo{}
+    cnt := doc.count(arr)
+    for i in 0:cnt {
+        el := doc.at(arr, i)
+        if doc.is_dict(el) && doc.has(el, "name") {
+            nm := doc.as_string(doc.get(el, "name")) or (err) { -> }
+            $desc := ""
+            if doc.has(el, "description") {
+                desc = json_str_or(&doc, doc.get(el, "description"), "")
+            }
+            out.push(ChannelInfo{name: nm, description: desc})
+        }
+    }
+    if out.len == 0 { << }
+    st.channels = out
+}
+
+fn parse_pins_data(st $&State, raw &string) {
+    doc := json.parse(raw)
+    if !doc.ok() { << }
+    r := doc.root()
+    if !doc.is_dict(r) || !doc.has(r, "pins") { << }
+    arr := doc.get(r, "pins")
+    if !doc.is_list(arr) { << }
+    $out := []PinEntry{}
+    cnt := doc.count(arr)
+    for i in 0:cnt {
+        el := doc.at(arr, i)
+        if !doc.is_dict(el) { -> }
+        if !doc.has(el, "msg_id") || !doc.has(el, "pin_type") { -> }
+        mid := doc.as_string(doc.get(el, "msg_id")) or (err) { -> }
+        pt := doc.as_string(doc.get(el, "pin_type")) or (err) { -> }
+        $lbl := "ANNOUNCEMENT"
+        if pt == "sponsored" { lbl = "SPONSORED" }
+        if doc.has(el, "label") {
+            lbl = json_str_or(&doc, doc.get(el, "label"), lbl + "")
+        }
+        $prio := 10
+        if doc.has(el, "priority") {
+            prio = json_int_or(&doc, doc.get(el, "priority"), 10)
+        }
+        $cat := 0
+        if doc.has(el, "created_at") {
+            cat = json_int_or(&doc, doc.get(el, "created_at"), 0)
+        }
+        $exp := 0
+        if doc.has(el, "expires_at") {
+            en := doc.get(el, "expires_at")
+            if !doc.is_null(en) {
+                exp = json_int_or(&doc, en, 0)
+            }
+        }
+        $chs := []string{}
+        if doc.has(el, "channels") {
+            cn := doc.get(el, "channels")
+            if doc.is_list(cn) {
+                for j in 0:doc.count(cn) {
+                    cv := json_str_or(&doc, doc.at(cn, j), "")
+                    if cv.len > 0 { chs.push(cv) }
+                }
+            }
+        }
+        out.push(PinEntry{msg_id: mid, channels: chs, pin_type: pt, label: lbl, priority: prio, created_at: cat, expires_at: exp})
+    }
+    // Sort descending by priority without moving PinEntry elements in-place
+    $used := []bool{}
+    for i in 0:out.len { used.push(false) }
+    $sorted := []PinEntry{}
+    for step in 0:out.len {
+        $best := -1
+        for k in 0:out.len {
+            if used[k] { -> }
+            if best < 0 || out[k].priority > out[best].priority {
+                best = k
+            }
+        }
+        if best < 0 { <- }
+        used[best] = true
+        bp := &out[best]
+        sorted.push(PinEntry{
+            msg_id: bp.msg_id + "",
+            channels: clone_str_slice(&bp.channels),
+            pin_type: bp.pin_type + "",
+            label: bp.label + "",
+            priority: bp.priority,
+            created_at: bp.created_at,
+            expires_at: bp.expires_at
+        })
+    }
+    st.pins = sorted
+}
+
+pub fn map_set(m $&maps.StrInt, k string, v int) {
+    m.set(k, v)
+}
+
+pub fn map_get_or(m &maps.StrInt, k string, def int) int {
+    << m.get(k) or (err) { << def }
+}
+
+fn load_id_set_jsonl(dst $&maps.StrInt, raw &string, key_name string) {
+    dst.clear()
+    lines := strings.split(raw, "\n")
+    for i in 0:lines.len {
+        ln := strings.trim_space(&lines[i])
+        if ln.len == 0 { -> }
+        if strings.has_prefix(&ln, "ftx_") && is_valid_agent_id(ln + "") {
+            dst.set(ln + "", 1)
+            ->
+        }
+        doc := json.parse(&ln)
+        if doc.ok() {
+            r := doc.root()
+            if doc.is_dict(r) && doc.has(r, key_name + "") {
+                aid := json_str_or(&doc, doc.get(r, key_name + ""), "")
+                if is_valid_agent_id(aid + "") {
+                    dst.set(aid + "", 1)
+                }
+            }
+        }
+    }
+}
+
+pub fn reload_configs(st $&State, now int) {
+    ch_path := st.data_dir + "/public/channels.json"
+    ch_raw := read_file_or_empty(ch_path)
+    if ch_raw.len > 0 {
+        h := sha256.sum256(ch_raw + "")
+        if h != st.channels_hash {
+            parse_channels_data(st, &ch_raw)
+            st.channels_hash = h
+        }
+    }
+
+    pin_path := st.data_dir + "/public/pins.json"
+    pin_raw := read_file_or_empty(pin_path)
+    if pin_raw.len > 0 {
+        h := sha256.sum256(pin_raw + "")
+        if h != st.pins_hash {
+            parse_pins_data(st, &pin_raw)
+            st.pins_hash = h
+        }
+    }
+
+    ban_path := st.data_dir + "/blacklist/banned_agents.jsonl"
+    ban_raw := read_file_or_empty(ban_path)
+    bh := sha256.sum256(ban_raw + "")
+    if bh != st.banned_hash {
+        load_id_set_jsonl($&st.banned, &ban_raw, "agent_id")
+        st.banned_hash = bh
+    }
+
+    rev_path := st.data_dir + "/keys/revoked.jsonl"
+    rev_raw := read_file_or_empty(rev_path)
+    rh := sha256.sum256(rev_raw + "")
+    if rh != st.revoked_hash {
+        load_id_set_jsonl($&st.revoked, &rev_raw, "agent_id")
+        st.revoked_hash = rh
+    }
+    st.last_reload = now
+}
+
+pub fn reload_configs_if_needed(st $&State, now int) {
+    if now - st.last_reload >= 1 {
+        reload_configs(st, now)
+    }
+}
+
+fn restore_today_daily_limits(st $&State, today string) {
+    for i in 0:st.channels.len {
+        ch := st.channels[i].name + ""
+        p := channel_day_path(st, ch, today + "")
+        raw := read_file_or_empty(p)
+        if raw.len == 0 { -> }
+        lines := strings.split(&raw, "\n")
+        for j in 0:lines.len {
+            ln := strings.trim_space(&lines[j])
+            if ln.len == 0 { -> }
+            doc := json.parse(&ln)
+            if doc.ok() {
+                r := doc.root()
+                if doc.is_dict(r) && doc.has(r, "sender_id") {
+                    sid := json_str_or(&doc, doc.get(r, "sender_id"), "")
+                    if sid.len > 0 {
+                        map_set($&st.daily_posts, today + ":" + sid, 1)
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn file_exists(path string) bool {
+    _ := os.stat(path) or (err) { << false }
+    << true
+}
+
+pub fn init_state(st $&State) {
+    mkdir_all_quiet(st.data_dir + "/keys")
+    mkdir_all_quiet(st.data_dir + "/blacklist")
+    mkdir_all_quiet(st.data_dir + "/public/channels")
+    mkdir_all_quiet(st.data_dir + "/public/threads")
+
+    ch_path := st.data_dir + "/public/channels.json"
+    if !file_exists(ch_path + "") {
+        d := default_channels_json()
+        write_atomic_quiet(ch_path, &d)
+    }
+    pin_path := st.data_dir + "/public/pins.json"
+    if !file_exists(pin_path + "") {
+        d := "{\"pins\":[]}\n"
+        write_atomic_quiet(pin_path, &d)
+    }
+    ban_path := st.data_dir + "/blacklist/banned_agents.jsonl"
+    if !file_exists(ban_path + "") {
+        d := ""
+        write_atomic_quiet(ban_path, &d)
+    }
+    rev_path := st.data_dir + "/keys/revoked.jsonl"
+    if !file_exists(rev_path + "") {
+        d := ""
+        write_atomic_quiet(rev_path, &d)
+    }
+
+    now := time.now_time().unix()
+    reload_configs(st, now)
+    today := utc_date_from_unix(now)
+    restore_today_daily_limits(st, today)
+}
+
+pub fn find_channel(st &State, name string) int {
+    for i in 0:st.channels.len {
+        if st.channels[i].name == name { << i }
+    }
+    << -1
+}
+
+pub fn read_agent_summary(st &State, agent_id string) AgentSummary {
+    $out := AgentSummary{
+        found: false, agent_id: agent_id + "", status: "", successor_id: "",
+        created_at: 0, revision: 0, key_version: 0, pub_pem: "",
+        name: "", bio: "", updated_at: 0, raw_json: ""
+    }
+    if !is_valid_agent_id(agent_id + "") { << out }
+    raw := os.read(agent_json_path(st, agent_id + "")) or (err) { << out }
+    doc := json.parse(&raw)
+    if !doc.ok() { << out }
+    r := doc.root()
+    if !doc.is_dict(r) { << out }
+    out.found = true
+    out.raw_json = raw
+    if doc.has(r, "status") { out.status = json_str_or(&doc, doc.get(r, "status"), "active") }
+    if doc.has(r, "successor_id") {
+        sn := doc.get(r, "successor_id")
+        if !doc.is_null(sn) { out.successor_id = json_str_or(&doc, sn, "") }
+    }
+    if doc.has(r, "created_at") { out.created_at = json_int_or(&doc, doc.get(r, "created_at"), 0) }
+    if doc.has(r, "revision") { out.revision = json_int_or(&doc, doc.get(r, "revision"), 0) }
+    if doc.has(r, "key_version") { out.key_version = json_int_or(&doc, doc.get(r, "key_version"), 1) }
+    if doc.has(r, "current_public_key_pem") {
+        out.pub_pem = json_str_or(&doc, doc.get(r, "current_public_key_pem"), "")
+    }
+    if doc.has(r, "profile") {
+        pn := doc.get(r, "profile")
+        if doc.is_dict(pn) {
+            if doc.has(pn, "name") { out.name = json_str_or(&doc, doc.get(pn, "name"), "") }
+            if doc.has(pn, "bio") { out.bio = json_str_or(&doc, doc.get(pn, "bio"), "") }
+            if doc.has(pn, "updated_at") { out.updated_at = json_int_or(&doc, doc.get(pn, "updated_at"), 0) }
+        }
+    }
+    << out
+}
+
+pub fn parse_post_line(raw_line &string) PostRecord {
+    $rec := PostRecord{
+        msg_id: "", channel: "", thread_id: "", reply_to: "",
+        conversation_state: "", sender_id: "", key_version: 1,
+        ts: 0, created_at: 0, text: "", sig: "", raw_line: raw_line + ""
+    }
+    doc := json.parse(raw_line)
+    if !doc.ok() { << rec }
+    r := doc.root()
+    if !doc.is_dict(r) { << rec }
+    if doc.has(r, "msg_id") { rec.msg_id = json_str_or(&doc, doc.get(r, "msg_id"), "") }
+    if doc.has(r, "channel") { rec.channel = json_str_or(&doc, doc.get(r, "channel"), "") }
+    if doc.has(r, "thread_id") { rec.thread_id = json_str_or(&doc, doc.get(r, "thread_id"), "") }
+    if doc.has(r, "reply_to") {
+        rtn := doc.get(r, "reply_to")
+        if !doc.is_null(rtn) { rec.reply_to = json_str_or(&doc, rtn, "") }
+    }
+    if doc.has(r, "conversation_state") {
+        rec.conversation_state = json_str_or(&doc, doc.get(r, "conversation_state"), "")
+    }
+    if doc.has(r, "sender_id") { rec.sender_id = json_str_or(&doc, doc.get(r, "sender_id"), "") }
+    if doc.has(r, "key_version") { rec.key_version = json_int_or(&doc, doc.get(r, "key_version"), 1) }
+    if doc.has(r, "ts") { rec.ts = json_int_or(&doc, doc.get(r, "ts"), 0) }
+    if doc.has(r, "created_at") { rec.created_at = json_int_or(&doc, doc.get(r, "created_at"), 0) }
+    if doc.has(r, "text") { rec.text = json_str_or(&doc, doc.get(r, "text"), "") }
+    if doc.has(r, "sig") { rec.sig = json_str_or(&doc, doc.get(r, "sig"), "") }
+    << rec
+}
+
+pub fn read_jsonl_records(path string) []PostRecord {
+    $out := []PostRecord{}
+    raw := os.read(path) or (err) { << out }
+    lines := strings.split(&raw, "\n")
+    for i in 0:lines.len {
+        ln := strings.trim_space(&lines[i])
+        if ln.len == 0 { -> }
+        rec := parse_post_line(&ln)
+        if rec.msg_id.len == 0 { -> }
+        out.push(rec)
+    }
+    << out
+}
+
+pub fn thread_reply_count(st &State, msg_id string) int {
+    recs := read_jsonl_records(thread_path(st, msg_id + ""))
+    if recs.len <= 1 { << 0 }
+    << recs.len - 1
+}
+
+pub fn count_agent_replies_in_thread(st $&State, msg_id string, agent_id string) int {
+    k := msg_id + ":" + agent_id
+    if st.thread_counts.has(k + "") {
+        << map_get_or(&st.thread_counts, k + "", 0)
+    }
+    recs := read_jsonl_records(thread_path(st, msg_id + ""))
+    $cnt := 0
+    for i in 1:recs.len {
+        if recs[i].sender_id == agent_id {
+            cnt += 1
+        }
+    }
+    map_set($&st.thread_counts, k, cnt)
+    << cnt
+}
+
+pub fn sweep_replay_cache(st $&State, now int) {
+    if now - st.last_replay_sweep < 60 { << }
+    st.last_replay_sweep = now
+    ks := st.replay_cache.keys()
+    $expired := []string{}
+    for i in 0:ks.len {
+        k := ks[i] + ""
+        seen_ts := map_get_or(&st.replay_cache, k + "", 0)
+        if (now - seen_ts) > 120 {
+            expired.push(k)
+        }
+    }
+    rc := $&st.replay_cache
+    for i in 0:expired.len {
+        rc.del(expired[i] + "")
+    }
+}
+
+fn clone_str_slice(xs &[]string) []string {
+    $out := []string{}
+    for i in 0:xs.len {
+        out.push(xs[i] + "")
+    }
+    << out
+}
+
+pub fn active_pins_for_channel(st &State, ch string, now int) []PinEntry {
+    $out := []PinEntry{}
+    $off_cnt := 0
+    $spon_cnt := 0
+    for i in 0:st.pins.len {
+        p := &st.pins[i]
+        if p.expires_at > 0 && now > p.expires_at { -> }
+        $matches := false
+        for j in 0:p.channels.len {
+            if p.channels[j] == "*" || p.channels[j] == ch {
+                matches = true
+                <-
+            }
+        }
+        if !matches { -> }
+        $keep := false
+        if p.pin_type == "official" && off_cnt < 1 {
+            off_cnt += 1
+            keep = true
+        } else if p.pin_type == "sponsored" && spon_cnt < 2 {
+            spon_cnt += 1
+            keep = true
+        }
+        if !keep { -> }
+        out.push(PinEntry{
+            msg_id: p.msg_id + "",
+            channels: clone_str_slice(&p.channels),
+            pin_type: p.pin_type + "",
+            label: p.label + "",
+            priority: p.priority,
+            created_at: p.created_at,
+            expires_at: p.expires_at
+        })
+    }
+    << out
+}

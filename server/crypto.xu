@@ -1,0 +1,174 @@
+@main
+
+#errors
+#math/big
+#crypto/rand
+#crypto/rsa
+#crypto/rsa/oaep
+#crypto/sha256
+#encoding/asn1
+#encoding/base64
+#encoding/pem
+#strings
+#time
+
+fn oid_is_rsa(arcs &[]int) bool {
+    if arcs.len != 7 { << false }
+    << arcs[0] == 1 && arcs[1] == 2 && arcs[2] == 840 && arcs[3] == 113549 && arcs[4] == 1 && arcs[5] == 1 && arcs[6] == 1
+}
+
+pub fn parse_spki_rsa_pem(pem_str &string) rsa.PublicKey {
+    blk := pem.decode(pem_str)
+    if blk.typ != "PUBLIC KEY" || blk.bytes.len == 0 {
+        >> errors.new("crypto: expected PUBLIC KEY PEM")
+    }
+    spki := asn1.unmarshal(&blk.bytes) or >>
+    if spki.tag != asn1.TAG_SEQUENCE {
+        >> errors.new("crypto: invalid SPKI sequence")
+    }
+    $d := asn1.new_decoder(&spki.bytes)
+    alg := d.next() or >>
+    keyv := d.next() or >>
+    if alg.tag != asn1.TAG_SEQUENCE {
+        >> errors.new("crypto: invalid SPKI algorithm")
+    }
+    $ad := asn1.new_decoder(&alg.bytes)
+    oidv := ad.next() or >>
+    arcs := oidv.as_oid() or >>
+    if !oid_is_rsa(&arcs) {
+        >> errors.new("crypto: public key must be RSA")
+    }
+    bits := keyv.as_bit_string() or >>
+    rseq := asn1.unmarshal(&bits) or >>
+    if rseq.tag != asn1.TAG_SEQUENCE {
+        >> errors.new("crypto: invalid RSAPublicKey sequence")
+    }
+    $rd := asn1.new_decoder(&rseq.bytes)
+    nv := rd.next() or >>
+    ev := rd.next() or >>
+    if nv.tag != asn1.TAG_INTEGER || ev.tag != asn1.TAG_INTEGER {
+        >> errors.new("crypto: invalid RSA integers")
+    }
+    $n := big.new_int(0)
+    n.set_bytes(nv.bytes + "")
+    e := ev.as_int() or >>
+    if e != 65537 {
+        >> errors.new("crypto: RSA public exponent must be 65537")
+    }
+    nbits := n.bit_len()
+    if nbits < 2048 || nbits > 4096 {
+        >> errors.new("crypto: RSA key size must be 2048..4096 bits")
+    }
+    << rsa.PublicKey{n: n, e: e}
+}
+
+pub fn verify_pss_message(pk &rsa.PublicKey, msg &string, sig_b64 string) bool {
+    trimmed := strings.trim_space(&sig_b64)
+    if trimmed.len == 0 { << false }
+    sig := base64.decode_string(trimmed) or (err) { << false }
+    hashed := sha256.sum256_bytes(msg + "")
+    rc := oaep.verify_pss(pk, rsa.SHA256, &hashed, &sig) or (err) { << false }
+    << rc == 0
+}
+
+pub fn verify_request_sig(pk &rsa.PublicKey, method string, raw_path string, ts string, body &string, sig_b64 string) bool {
+    body_hex := sha256.sum256(body + "")
+    sts := method + "\n" + raw_path + "\n" + ts + "\n" + body_hex
+    << verify_pss_message(pk, &sts, sig_b64)
+}
+
+pub fn leading_zero_bits(digest &string) int {
+    $bits := 0
+    for i in 0:digest.len {
+        b := digest[i] & 255
+        if b == 0 {
+            bits += 8
+            ->
+        }
+        $mask := 128
+        while mask > 0 {
+            if (b & mask) != 0 {
+                << bits
+            }
+            bits += 1
+            mask = mask >> 1
+        }
+    }
+    << bits
+}
+
+pub fn is_uint64_decimal(s &string) bool {
+    if s.len == 0 || s.len > 20 { << false }
+    for i in 0:s.len {
+        c := s[i] & 255
+        if c < 48 || c > 57 { << false }
+    }
+    << true
+}
+
+pub fn verify_pow_register(pub_pem &string, ts string, nonce string, bits int) bool {
+    if !is_uint64_decimal(&nonce) { << false }
+    pem_hex := sha256.sum256(pub_pem + "")
+    input := pem_hex + ":" + ts + ":" + nonce
+    digest := sha256.sum256_bytes(input)
+    << leading_zero_bits(&digest) >= bits
+}
+
+pub fn verify_pow_post(agent_id string, ts string, nonce string, bits int) bool {
+    if !is_uint64_decimal(&nonce) { << false }
+    input := agent_id + ":" + ts + ":" + nonce
+    digest := sha256.sum256_bytes(input)
+    << leading_zero_bits(&digest) >= bits
+}
+
+pub fn generate_agent_id() string {
+    alphabet := "abcdefghijklmnopqrstuvwxyz0123456789"
+    rnd := rand.read(12) or >>
+    $out := "ftx_"
+    for i in 0:12 {
+        idx := (rnd[i] & 255) % 36
+        out = out + alphabet[idx:(idx + 1)]
+    }
+    << out
+}
+
+pub fn pubkey_fingerprint(pub_pem &string) string {
+    blk := pem.decode(pub_pem)
+    if blk.bytes.len == 0 { << "" }
+    d := sha256.sum256_bytes(blk.bytes + "")
+    << "SHA256:" + base64.encode_to_string(d)
+}
+
+pub fn normalize_pem(pem_str &string) string {
+    t := strings.trim_space(pem_str)
+    << t + "\n"
+}
+
+pub fn new_ulid() string {
+    b32 := "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+    ms := time.now_time().unix_milli()
+    rnd := rand.read(10) or >>
+    $out := ""
+    // 48-bit timestamp in 10 Crockford base32 characters (2 leading zero bits)
+    $shift := 45
+    while shift >= 0 {
+        idx := (ms >> shift) & 31
+        out = out + b32[idx:(idx + 1)]
+        shift -= 5
+    }
+    // 80-bit randomness in two 40-bit (5-byte -> 8-char) blocks
+    for blk in 0:2 {
+        off := blk * 5
+        $acc := 0
+        for j in 0:5 {
+            acc = (acc << 8) | (rnd[off + j] & 255)
+        }
+        $rshift := 35
+        while rshift >= 0 {
+            idx := (acc >> rshift) & 31
+            out = out + b32[idx:(idx + 1)]
+            rshift -= 5
+        }
+    }
+    << out
+}
