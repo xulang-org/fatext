@@ -1,6 +1,7 @@
 @main
 
 #net
+#maps
 #os
 #os/signal
 #strconv
@@ -36,17 +37,72 @@ fn empty_req() HttpReq {
     << HttpReq{req_method: "", req_path: "", hdr_names: []string{}, hdr_vals: []string{}, req_body: "", remote_ip: ""}
 }
 
-fn handle_connection(fd int, req_seq int, tls_on bool, cert_pem string, key_pem string, jobs chan HubJob, log_ch chan string, slow_ms int, trust_proxy bool) {
+pub struct ConnGateMsg {
+    pub acquire bool
+    pub ip string
+    pub reply_ch chan bool
+}
+
+fn conn_guard_loop(max_conns int, max_per_ip int, ch chan ConnGateMsg) {
+    $total := 0
+    $by_ip := maps.new_str_int()
+    while true {
+        msg := <-ch
+        if msg.acquire {
+            $ok := true
+            if max_conns > 0 && total >= max_conns { ok = false }
+            cur := map_get_or(&by_ip, msg.ip + "", 0)
+            if max_per_ip > 0 && cur >= max_per_ip { ok = false }
+            if ok {
+                total += 1
+                by_ip.set(msg.ip + "", cur + 1)
+            }
+            msg.reply_ch <- ok
+        } else {
+            if total > 0 { total -= 1 }
+            cur := map_get_or(&by_ip, msg.ip + "", 0)
+            if cur <= 1 {
+                by_ip.del(msg.ip + "")
+            } else {
+                by_ip.set(msg.ip + "", cur - 1)
+            }
+        }
+    }
+}
+
+fn acquire_conn_slot(ch chan ConnGateMsg, ip string) bool {
+    rc := chan bool{cap: 1}
+    ch <- ConnGateMsg{acquire: true, ip: ip + "", reply_ch: rc}
+    << <-rc
+}
+
+fn release_conn_slot(ch chan ConnGateMsg, ip string) {
+    ch <- ConnGateMsg{acquire: false, ip: ip + "", reply_ch: chan bool{cap: 1}}
+}
+
+fn is_static_or_dl_path(p &string) bool {
+    << *p == "/llms.txt" || *p == "/llms-full.txt" || *p == "/SKILL.md" ||
+        *p == "/protocol.md" || *p == "/.well-known/fatext.json" ||
+        *p == "/static/fatext.css" || *p == "/static/favicon.svg" ||
+        *p == "/favicon.ico" || *p == "/static/logo.svg" ||
+        (strings.has_prefix(p, "/dl/") && p.len > 4)
+}
+
+fn handle_connection_guarded(fd int, req_seq int, peer_ip string, tls_on bool, tls_hs_ns int, cert_pem string, key_pem string, gate_ch chan ConnGateMsg, static_ch chan StaticJob, jobs chan HubJob, log_ch chan string, slow_ms int, trust_proxy bool) {
+    handle_connection(fd, req_seq, peer_ip + "", tls_on, tls_hs_ns, cert_pem, key_pem, static_ch, jobs, log_ch, slow_ms, trust_proxy)
+    release_conn_slot(gate_ch, peer_ip + "")
+}
+
+fn handle_connection(fd int, req_seq int, peer_ip string, tls_on bool, tls_hs_ns int, cert_pem string, key_pem string, static_ch chan StaticJob, jobs chan HubJob, log_ch chan string, slow_ms int, trust_proxy bool) {
     cc_disable_sigpipe(fd)
     t0_ns := time.now()
-    peer_ip := resolve_peer_ip(fd)
     req_prefix := "r_" + strconv.itoa(req_seq)
 
     $cc := cc_from_tcp(fd, peer_ip + "")
     $tls_ms := 0
     if tls_on {
         t_tls0 := time.now()
-        cc = cc_from_tls(fd, &cert_pem, &key_pem, peer_ip + "") or (err) {
+        cc = cc_from_tls(fd, &cert_pem, &key_pem, peer_ip + "", tls_hs_ns) or (err) {
             tls_ms = (time.now() - t_tls0) / 1000000
             if tls_ms < 0 { tls_ms = 0 }
             jobs <- HubJob{kind: HUB_METRIC_TLS, req: empty_req(), sse_id: 0, enqueued_ns: 0, flag: 0, reply_ch: chan HubReply{cap: 1}}
@@ -209,6 +265,33 @@ fn handle_connection(fd int, req_seq int, tls_on bool, cert_pem string, key_pem 
         }
 
         ka := wants_keep_alive(&req) && req_n + 1 < 200
+        req_p_only := path_only(raw_p + "")
+        if meth == "GET" && is_static_or_dl_path(&req_p_only) {
+            t_st0 := time.now()
+            st_rch := chan HttpResp{cap: 1}
+            static_ch <- StaticJob{path: req_p_only, reply_ch: st_rch}
+            sresp := <-st_rch
+            if sresp.status != 0 {
+                $sh_ms := (time.now() - t_st0) / 1000000
+                if sh_ms < 0 { sh_ms = 0 }
+                t_w0 := time.now()
+                w_rc := write_http_resp_ka($&cc, &sresp, ka)
+                $w_ms := (time.now() - t_w0) / 1000000
+                if w_ms < 0 { w_ms = 0 }
+                $tot_us := (time.now() - req_t0) / 1000
+                if tot_us < 0 { tot_us = 0 }
+                $secode := ""
+                if sresp.status >= 400 { secode = "ERR_NOT_FOUND" }
+                log_access_json(log_ch, slow_ms, time.now_time().unix(), req_id + "", meth + "", route + "",
+                    sresp.status, secode, tls_on, client_ip + "", "anon", "",
+                    req_bytes, sresp.body.len, req_tls_ms, read_ms, 0, sh_ms, w_ms, tot_us / 1000, tot_us)
+                req_n += 1
+                if !ka || w_rc < 0 {
+                    <-
+                }
+                ->
+            }
+        }
         jobs <- HubJob{kind: HUB_HTTP, req: req, sse_id: 0, enqueued_ns: time.now(), flag: 0, reply_ch: reply_ch}
         rep := <-reply_ch
         req_n += 1
@@ -288,6 +371,10 @@ fn main() int {
     metrics_interval_sec := getenv_int_or("FATEXT_METRICS_INTERVAL_SEC", 60)
     stdout_mirror := getenv_int_or("FATEXT_LOG_STDOUT", 0) != 0
     trust_proxy := getenv_int_or("FATEXT_TRUST_PROXY", 0) != 0
+    max_conns := getenv_int_or("FATEXT_MAX_CONNS", 4096)
+    max_conns_per_ip := getenv_int_or("FATEXT_MAX_CONNS_PER_IP", 64)
+    tls_handshake_ms := getenv_int_or("FATEXT_TLS_HANDSHAKE_MS", 5000)
+    tls_hs_ns := tls_handshake_ms * 1000000
 
     $tls_on := false
     $cert_pem := ""
@@ -315,6 +402,12 @@ fn main() int {
     jobs := chan HubJob{cap: 128}
     xu hub_loop(hub, jobs)
 
+    static_ch := chan StaticJob{cap: 64}
+    xu static_loop(www_dir + "", dl_dir + "", static_ch)
+
+    gate_ch := chan ConnGateMsg{cap: 128}
+    xu conn_guard_loop(max_conns, max_conns_per_ip, gate_ch)
+
     if metrics_interval_sec > 0 {
         xu metrics_ticker_loop(metrics_interval_sec, jobs)
     }
@@ -336,6 +429,8 @@ fn main() int {
     log_event_json(log_ch, now0, "server_start",
         "\"addr\":" + json.quote(&addr) + ",\"tls\":" + tls_s +
         ",\"pow_bits\":" + strconv.itoa(pow_bits) + ",\"ip_rpm\":" + strconv.itoa(ip_rpm) +
+        ",\"max_conns\":" + strconv.itoa(max_conns) + ",\"max_conns_per_ip\":" + strconv.itoa(max_conns_per_ip) +
+        ",\"tls_handshake_ms\":" + strconv.itoa(tls_handshake_ms) +
         ",\"log_dir\":" + json.quote(&log_dir) + ",\"retain_days\":" + strconv.itoa(retain_days) +
         ",\"slow_ms\":" + strconv.itoa(slow_ms) + ",\"metrics_interval_sec\":" + strconv.itoa(metrics_interval_sec))
     println("fatext-server listening on " + scheme + "://" + addr + " (data=" + data_dir + ", pow=" + str(pow_bits) + ", logs=" + log_dir + ")")
@@ -343,8 +438,15 @@ fn main() int {
     $req_seq := 0
     while true {
         fd := net.accept(lfd) or (err) { -> }
+        peer_ip := resolve_peer_ip(fd)
+        if !acquire_conn_slot(gate_ch, peer_ip + "") {
+            log_event_json(log_ch, time.now_time().unix(), "conn_rejected",
+                "\"ip\":" + json.quote(&peer_ip) + ",\"reason\":\"conn_limit\"")
+            close_raw_fd_quiet(fd)
+            ->
+        }
         req_seq += 1
-        xu handle_connection(fd, req_seq, tls_on, cert_pem + "", key_pem + "", jobs, log_ch, slow_ms, trust_proxy)
+        xu handle_connection_guarded(fd, req_seq, peer_ip + "", tls_on, tls_hs_ns, cert_pem + "", key_pem + "", gate_ch, static_ch, jobs, log_ch, slow_ms, trust_proxy)
     }
     << 0
 }

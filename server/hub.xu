@@ -527,7 +527,7 @@ fn dispatch_http(hub $&HubState, req &HttpReq, now int) HttpResp {
         rest := path[3:path.len]
         parts := strings.split(&rest, "/")
         if parts.len == 1 && parts[0].len > 0 {
-            << serve_channel(&hub.st, parts[0] + "", "", false, now)
+            << serve_channel($&hub.st, parts[0] + "", "", false, now)
         }
         if parts.len == 2 {
             ch := parts[0] + ""
@@ -538,7 +538,7 @@ fn dispatch_http(hub $&HubState, req &HttpReq, now int) HttpResp {
             if strings.has_suffix(&seg, ".sha256") {
                 << handle_get_channel_sha256(&hub.st, ch, seg[0:(seg.len - 7)])
             }
-            << serve_channel(&hub.st, ch, seg, true, now)
+            << serve_channel($&hub.st, ch, seg, true, now)
         }
     }
 
@@ -548,7 +548,7 @@ fn dispatch_http(hub $&HubState, req &HttpReq, now int) HttpResp {
             << handle_get_thread_jsonl(&hub.st, rest[0:(rest.len - 6)])
         }
         if rest.len > 0 && !strings.contains(&rest, "/") {
-            << serve_thread(&hub.st, rest)
+            << serve_thread($&hub.st, rest)
         }
     }
 

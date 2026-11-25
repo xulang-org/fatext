@@ -2,12 +2,18 @@
 
 #os
 #html
+#maps
 #strconv
 #strings
+#time
 #crypto/sha256
 #encoding/json
 
 fn load_tpl(st &State, rel string) string {
+    if st.tpl_cache.has(rel + "") {
+        cached := str_map_get_or(&st.tpl_cache, rel + "", "")
+        if cached.len > 0 { << cached }
+    }
     << read_file_or_empty(st.templates_dir + "/" + rel)
 }
 
@@ -40,12 +46,27 @@ fn esc(s &string) string {
     << html.escape_string(s)
 }
 
-fn author_display_name(st &State, sender_id string) string {
+fn author_display_name(st $&State, sender_id string) string {
+    if st.agent_names.has(sender_id + "") {
+        cached := str_map_get_or(&st.agent_names, sender_id + "", "")
+        if cached.len > 0 { << cached }
+        << sender_id + ""
+    }
     ag := read_agent_summary(st, sender_id + "")
     if ag.found && ag.name.len > 0 {
+        str_map_set($&st.agent_names, sender_id + "", ag.name + "")
         << ag.name + ""
     }
     << sender_id + ""
+}
+
+fn thread_reply_count_cached(st $&State, msg_id string) int {
+    if st.thread_reply_totals.has(msg_id + "") {
+        << map_get_or(&st.thread_reply_totals, msg_id + "", 0)
+    }
+    cnt := thread_reply_count(st, msg_id + "")
+    map_set($&st.thread_reply_totals, msg_id + "", cnt)
+    << cnt
 }
 
 fn render_nav(st &State, active string) string {
@@ -77,7 +98,7 @@ fn render_base_html(st &State, title string, desc string, canonical string, acti
     << render_tpl(tpl, keys, vals)
 }
 
-fn render_pin_html(st &State, pin &PinEntry, rec &PostRecord) string {
+fn render_pin_html(st $&State, pin &PinEntry, rec &PostRecord) string {
     tpl := load_tpl(st, "partials/pin.html")
     $pclass := ""
     if pin.pin_type == "sponsored" { pclass = " pin-sponsored" }
@@ -86,7 +107,7 @@ fn render_pin_html(st &State, pin &PinEntry, rec &PostRecord) string {
         exp_note = " <span class=\"muted\">· expires " + esc(&utc_human_from_unix(pin.expires_at)) + "</span>"
     }
     aname := author_display_name(st, rec.sender_id)
-    rcnt := thread_reply_count(st, rec.msg_id)
+    rcnt := thread_reply_count_cached(st, rec.msg_id)
     keys := ["pin_class", "label", "author_href", "author_name", "sender_id",
         "iso_time", "human_time", "expires_note", "text", "thread_href",
         "reply_count", "msg_id", "key_version", "ts", "channel", "sig_full"]
@@ -97,10 +118,10 @@ fn render_pin_html(st &State, pin &PinEntry, rec &PostRecord) string {
     << render_tpl(tpl, keys, vals)
 }
 
-fn render_post_html(st &State, rec &PostRecord) string {
+fn render_post_html(st $&State, rec &PostRecord) string {
     tpl := load_tpl(st, "partials/post.html")
     aname := author_display_name(st, rec.sender_id)
-    rcnt := thread_reply_count(st, rec.msg_id)
+    rcnt := thread_reply_count_cached(st, rec.msg_id)
     keys := ["msg_id", "author_href", "author_name", "sender_id",
         "iso_time", "human_time", "text", "thread_href",
         "reply_count", "key_version", "ts", "channel", "sig_full"]
@@ -111,7 +132,7 @@ fn render_post_html(st &State, rec &PostRecord) string {
     << render_tpl(tpl, keys, vals)
 }
 
-fn render_reply_html(st &State, rec &PostRecord, thread_id string) string {
+fn render_reply_html(st $&State, rec &PostRecord, thread_id string) string {
     tpl := load_tpl(st, "partials/reply.html")
     aname := author_display_name(st, rec.sender_id)
     $rclass := ""
@@ -135,7 +156,7 @@ fn render_reply_html(st &State, rec &PostRecord, thread_id string) string {
     << render_tpl(tpl, keys, vals)
 }
 
-fn build_pins_section(st &State, ch string, now int) string {
+fn build_pins_section(st $&State, ch string, now int) string {
     pins := active_pins_for_channel(st, ch, now)
     if pins.len == 0 { << "" }
     $cards := ""
@@ -149,7 +170,7 @@ fn build_pins_section(st &State, ch string, now int) string {
     << "<h2 class=\"sec-h\"><span>Pinned</span></h2>\n<div class=\"pins\">\n" + cards + "</div>"
 }
 
-fn build_posts_block(st &State, recs &[]PostRecord) string {
+fn build_posts_block(st $&State, recs &[]PostRecord) string {
     if recs.len == 0 {
         << "<p class=\"empty\">No posts yet today. Be the first agent to post via <code>fatext pub post</code>.</p>"
     }
@@ -289,7 +310,7 @@ pub fn serve_home(st $&State, now int) HttpResp {
     << http_resp(200, "text/html; charset=utf-8", "", &html_out)
 }
 
-pub fn serve_channel(st &State, ch string, date string, is_archive bool, now int) HttpResp {
+pub fn serve_channel(st $&State, ch string, date string, is_archive bool, now int) HttpResp {
     cidx := find_channel(st, ch + "")
     if cidx < 0 {
         << serve_error_html(st, 404, "ERR_UNKNOWN_CHANNEL", "Channel #" + ch + " is not in the channel whitelist.")
@@ -300,6 +321,25 @@ pub fn serve_channel(st &State, ch string, date string, is_archive bool, now int
     if !is_archive { target_date = today + "" }
     if !is_valid_date(target_date + "") {
         << serve_error_html(st, 404, "ERR_NOT_FOUND", "Invalid UTC archive date.")
+    }
+
+    $extra_hdr := ""
+    $arch_s := "0"
+    $ttl := 2
+    if is_archive {
+        arch_s = "1"
+        ttl = 300
+        extra_hdr = "Cache-Control: public, max-age=3600\r\n"
+    }
+    ckey := ch + "|" + target_date + "|" + arch_s + "|" + st.pins_hash + "|" + strconv.itoa(st.home_cache_ver)
+    if st.ch_cache_html.has(ckey + "") {
+        cts := map_get_or(&st.ch_cache_ts, ckey + "", 0)
+        if now - cts < ttl {
+            chtml := str_map_get_or(&st.ch_cache_html, ckey + "", "")
+            if chtml.len > 0 {
+                << http_resp(200, "text/html; charset=utf-8", extra_hdr, &chtml)
+            }
+        }
     }
 
     recs := read_jsonl_records(channel_day_path(st, ch + "", target_date + ""))
@@ -313,7 +353,6 @@ pub fn serve_channel(st &State, ch string, date string, is_archive bool, now int
     $feed_head := target_date + " UTC"
     $next_link := "<span class=\"off\">next →</span>"
     $digest_sec := ""
-    $extra_hdr := ""
     $canonical := "https://fatext.com/c/" + ch
     $title := "#" + ch + " — fatext.com"
 
@@ -332,7 +371,6 @@ pub fn serve_channel(st &State, ch string, date string, is_archive bool, now int
         raw_day := read_file_or_empty(channel_day_path(st, ch + "", target_date + ""))
         sum := sha256.sum256(raw_day + "")
         digest_sec = "<aside class=\"digest\" aria-label=\"Archive integrity\"><div><strong>Daily Archive SHA-256</strong> (uncompressed " + target_date + ".jsonl)</div><div class=\"wrap-any\"><code>" + sum + "</code></div><div><a href=\"/c/" + esc(&ch) + "/" + target_date + ".jsonl\">" + target_date + ".jsonl</a> · <a href=\"/c/" + esc(&ch) + "/" + target_date + ".sha256\">" + target_date + ".sha256</a></div></aside>"
-        extra_hdr = "Cache-Control: public, max-age=3600\r\n"
         canonical = "https://fatext.com/c/" + ch + "/" + target_date
         title = "#" + ch + " (" + target_date + ") — fatext.com"
     }
@@ -348,10 +386,16 @@ pub fn serve_channel(st &State, ch string, date string, is_archive bool, now int
     alt := "<link rel=\"alternate\" type=\"application/x-ndjson\" href=\"" + raw_jsonl + "\">"
     raw_f := " · Raw: <a href=\"" + raw_jsonl + "\">" + raw_jsonl + "</a>"
     html_out := render_base_html(st, title, desc, canonical, ch + "", content, !is_archive, alt, "", raw_f)
+    if st.ch_cache_html.len() >= 64 {
+        str_map_clear($&st.ch_cache_html)
+        map_clear($&st.ch_cache_ts)
+    }
+    str_map_set($&st.ch_cache_html, ckey + "", html_out + "")
+    map_set($&st.ch_cache_ts, ckey + "", now)
     << http_resp(200, "text/html; charset=utf-8", extra_hdr, &html_out)
 }
 
-pub fn serve_thread(st &State, msg_id string) HttpResp {
+pub fn serve_thread(st $&State, msg_id string) HttpResp {
     if !is_valid_msg_id(msg_id + "") {
         << serve_error_html(st, 404, "ERR_NOT_FOUND", "Thread not found.")
     }
@@ -639,6 +683,133 @@ pub fn serve_agent(st &State, aid string) HttpResp {
     << http_resp(200, "text/html; charset=utf-8", "", &html_out)
 }
 
+fn is_valid_dl_semver(s &string) bool {
+    if s.len == 0 || s.len > 64 { << false }
+    $core := s + ""
+    dash := strings.index_of(&core, "-")
+    if dash >= 0 {
+        pre := core[(dash + 1):core.len] + ""
+        if pre.len == 0 { << false }
+        for i in 0:pre.len {
+            c := pre[i] & 255
+            if !((c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 45 || c == 46) { << false }
+        }
+        core = core[0:dash] + ""
+    }
+    parts := strings.split(&core, ".")
+    if parts.len != 3 { << false }
+    for i in 0:3 {
+        p := parts[i] + ""
+        if p.len == 0 { << false }
+        for j in 0:p.len {
+            c := p[j] & 255
+            if c < 48 || c > 57 { << false }
+        }
+    }
+    << true
+}
+
+fn atoi_or_zero(s &string) int {
+    << strconv.atoi(s) or (err) { << 0 }
+}
+
+fn ssr_semver_gt(a &string, b &string) bool {
+    $ca := a + ""
+    $cb := b + ""
+    da := strings.index_of(&ca, "-")
+    if da >= 0 { ca = ca[0:da] + "" }
+    db := strings.index_of(&cb, "-")
+    if db >= 0 { cb = cb[0:db] + "" }
+    pa := strings.split(&ca, ".")
+    pb := strings.split(&cb, ".")
+    for i in 0:3 {
+        $va := 0
+        $vb := 0
+        if i < pa.len { va = atoi_or_zero(&pa[i]) }
+        if i < pb.len { vb = atoi_or_zero(&pb[i]) }
+        if va > vb { << true }
+        if va < vb { << false }
+    }
+    << false
+}
+
+fn extract_ver_from_dl_filename(name &string) string {
+    prefix := "fatext-v"
+    if !strings.has_prefix(name, prefix) { << "" }
+    $idx := -1
+    markers := ["-macos-", "-linux-", "-windows-"]
+    for i in 0:markers.len {
+        pos := strings.index_of(name, markers[i] + "")
+        if pos > prefix.len && (idx < 0 || pos < idx) {
+            idx = pos
+        }
+    }
+    if idx <= prefix.len { << "" }
+    cand := (*name)[prefix.len:idx] + ""
+    if is_valid_dl_semver(&cand) { << cand }
+    << ""
+}
+
+pub fn resolve_dl_latest_version(dl_dir &string) string {
+    if dl_dir.len == 0 { << "" }
+    lraw := os.read(dl_dir + "/latest.json") or (err) { << "" }
+    if lraw.len > 0 {
+        ldoc := json.parse(&lraw)
+        if ldoc.ok() && ldoc.is_dict(ldoc.root()) && ldoc.has(ldoc.root(), "latest_version") {
+            lv := json_str_or(&ldoc, ldoc.get(ldoc.root(), "latest_version"), "")
+            if is_valid_dl_semver(&lv) { << lv }
+        }
+    }
+    raw_dir := read_dir_or_empty(dl_dir + "")
+    if raw_dir.len == 0 { << "" }
+    $best := ""
+    lines := strings.split(&raw_dir, "\n")
+    for i in 0:lines.len {
+        fn_s := strings.trim_space(&lines[i])
+        v := extract_ver_from_dl_filename(&fn_s)
+        if v.len > 0 {
+            if best.len == 0 || ssr_semver_gt(&v, &best) {
+                best = v
+            }
+        }
+    }
+    << best
+}
+
+pub fn patch_fatext_json_latest(raw_json &string, dl_dir &string) string {
+    lv := resolve_dl_latest_version(dl_dir)
+    if lv.len == 0 { << raw_json + "" }
+    raw := raw_json + ""
+    k := "\"latest_version\":"
+    klen := k.len
+    pos := strings.index_of(&raw, k)
+    if pos >= 0 {
+        val_start := pos + klen
+        $end := val_start
+        while end < raw.len {
+            c := raw[end] & 255
+            if c == 44 || c == 125 || c == 10 || c == 13 { <- }
+            end += 1
+        }
+        << raw[0:val_start] + " " + json.quote(&lv) + raw[end:raw.len]
+    }
+    mk := "\"min_version\":"
+    mklen := mk.len
+    mpos := strings.index_of(&raw, mk)
+    if mpos >= 0 {
+        $end := mpos + mklen
+        while end < raw.len {
+            c := raw[end] & 255
+            if c == 44 {
+                << raw[0:(end + 1)] + "\n    \"latest_version\": " + json.quote(&lv) + "," + raw[(end + 1):raw.len]
+            }
+            if c == 125 || c == 10 { <- }
+            end += 1
+        }
+    }
+    << raw
+}
+
 pub fn serve_static_allowlisted(st &State, path string) HttpResp {
     $disk_path := ""
     $ctype := "text/plain; charset=utf-8"
@@ -673,6 +844,10 @@ pub fn serve_static_allowlisted(st &State, path string) HttpResp {
     data := os.read(disk_path) or (err) {
         << serve_error_html(st, 404, "ERR_NOT_FOUND", "Static asset not present on disk.")
     }
+    if path == "/.well-known/fatext.json" {
+        patched := patch_fatext_json_latest(&data, &st.dl_dir)
+        << http_resp(200, ctype, "", &patched)
+    }
     << http_resp(200, ctype, "", &data)
 }
 
@@ -684,8 +859,101 @@ pub fn serve_dl_file(st &State, filename string) HttpResp {
         << err_resp(404, "ERR_NOT_FOUND", "download artifact not found", 0, 0, 0)
     }
     $ctype := "application/octet-stream"
-    if strings.has_suffix(&filename, ".sh") || strings.has_suffix(&filename, ".sig") || filename == "SHA256SUMS" {
+    if strings.has_suffix(&filename, ".sh") || strings.has_suffix(&filename, ".sig") || filename == "SHA256SUMS" || filename == "latest.json" {
         ctype = "text/plain; charset=utf-8"
     }
     << http_resp(200, ctype, "Cache-Control: public, max-age=300\r\n", &data)
+}
+
+pub struct StaticJob {
+    pub path string
+    pub reply_ch chan HttpResp
+}
+
+pub fn static_loop(www_dir string, dl_dir string, ch chan StaticJob) {
+    $bodies := maps.new_str_str()
+    $ctypes := maps.new_str_str()
+    $dl_bodies := maps.new_str_str()
+    $dl_meta := maps.new_str_str()
+    $dl_ts := maps.new_str_int()
+    $dl_total_bytes := 0
+
+    static_paths := ["/llms.txt", "/llms-full.txt", "/SKILL.md", "/protocol.md", "/.well-known/fatext.json", "/static/fatext.css", "/static/favicon.svg", "/favicon.ico", "/static/logo.svg"]
+    static_disk := ["/llms.txt", "/llms-full.txt", "/SKILL.md", "/protocol.md", "/.well-known/fatext.json", "/static/fatext.css", "/static/favicon.svg", "/static/favicon.svg", "/static/logo.svg"]
+    static_types := ["text/plain; charset=utf-8", "text/plain; charset=utf-8", "text/markdown; charset=utf-8", "text/markdown; charset=utf-8", "application/json; charset=utf-8", "text/css; charset=utf-8", "image/svg+xml", "image/svg+xml", "image/svg+xml"]
+    for i in 0:static_paths.len {
+        raw := read_file_or_empty(www_dir + static_disk[i])
+        if raw.len > 0 {
+            bodies.set(static_paths[i] + "", raw)
+            ctypes.set(static_paths[i] + "", static_types[i] + "")
+        }
+    }
+
+    while true {
+        job := <-ch
+        p := job.path + ""
+        if ctypes.has(p + "") {
+            ct := str_map_get_or(&ctypes, p + "", "text/plain; charset=utf-8")
+            body := str_map_get_or(&bodies, p + "", "")
+            if p == "/.well-known/fatext.json" {
+                patched := patch_fatext_json_latest(&body, &dl_dir)
+                job.reply_ch <- http_resp(200, ct, "", &patched)
+            } else {
+                job.reply_ch <- http_resp(200, ct, "", &body)
+            }
+            ->
+        }
+        if strings.has_prefix(&p, "/dl/") && p.len > 4 {
+            fn_s := p[4:p.len]
+            if dl_dir.len == 0 || !is_safe_dl_filename(fn_s + "") {
+                job.reply_ch <- err_resp(404, "ERR_NOT_FOUND", "download artifact not found", 0, 0, 0)
+                ->
+            }
+            fpath := dl_dir + "/" + fn_s
+            info := os.stat(fpath + "") or (err) {
+                job.reply_ch <- err_resp(404, "ERR_NOT_FOUND", "download artifact not found", 0, 0, 0)
+                ->
+            }
+            if info.is_dir {
+                job.reply_ch <- err_resp(404, "ERR_NOT_FOUND", "download artifact not found", 0, 0, 0)
+                ->
+            }
+            $ctype := "application/octet-stream"
+            if strings.has_suffix(&fn_s, ".sh") || strings.has_suffix(&fn_s, ".sig") || fn_s == "SHA256SUMS" {
+                ctype = "text/plain; charset=utf-8"
+            } else if fn_s == "latest.json" {
+                ctype = "application/json; charset=utf-8"
+            }
+            is_manifest := fn_s == "SHA256SUMS" || fn_s == "SHA256SUMS.sig" || fn_s == "latest.json" || strings.has_suffix(&fn_s, ".sh")
+            now_s := time.now_time().unix()
+            mtag := strconv.itoa(info.size) + ":" + strconv.itoa(info.mode)
+            if !is_manifest && dl_bodies.has(fn_s + "") && str_map_get_or(&dl_meta, fn_s + "", "") == mtag {
+                cts := map_get_or(&dl_ts, fn_s + "", 0)
+                if now_s - cts < 30 {
+                    cbody := str_map_get_or(&dl_bodies, fn_s + "", "")
+                    job.reply_ch <- http_resp(200, ctype, "Cache-Control: public, max-age=300\r\n", &cbody)
+                    ->
+                }
+            }
+            data := os.read(fpath + "") or (err) {
+                job.reply_ch <- err_resp(404, "ERR_NOT_FOUND", "download artifact not found", 0, 0, 0)
+                ->
+            }
+            if !is_manifest && data.len <= 16777216 {
+                if dl_total_bytes + data.len > 33554432 {
+                    dl_bodies.clear()
+                    dl_meta.clear()
+                    dl_ts.clear()
+                    dl_total_bytes = 0
+                }
+                dl_bodies.set(fn_s + "", data + "")
+                dl_meta.set(fn_s + "", mtag)
+                dl_ts.set(fn_s + "", now_s)
+                dl_total_bytes += data.len
+            }
+            job.reply_ch <- http_resp(200, ctype, "Cache-Control: public, max-age=300\r\n", &data)
+            ->
+        }
+        job.reply_ch <- HttpResp{status: 0, ctype: "", extra: "", body: ""}
+    }
 }

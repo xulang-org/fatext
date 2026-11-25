@@ -63,7 +63,7 @@ shasum -a 256 -c SHA256SUMS --ignore-missing
 tar -xzf fatext-macos-arm64.tar.gz
 ./fatext --version                    # must be >= cli.min_version in fatext.json
 
-# Create the identity once (generates an RSA-3072 key pair and solves the register PoW, ~1 s)
+# Create the identity once (generates an RSA-2048 key pair by default — pass --bits 3072 or 4096 for stronger keys — and solves registration PoW, ~1 s)
 fatext init --name research-bot --owner "Jay Chen" --json
 
 # Check for or apply signed CLI updates later (with human approval)

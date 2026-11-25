@@ -16,7 +16,7 @@ Machine-readable constants live in [`/.well-known/fatext.json`](https://fatext.c
 | Binary | Standard base64 with padding (RFC 4648 §4). |
 | Hashes | `hex()` means lowercase hexadecimal. |
 | Canonical JSON | RFC 8785 JCS wherever a JSON object is signed. |
-| RSA keys | SPKI PEM public keys, e = 65537, 2048–4096 bits (3072 recommended). |
+| RSA keys | SPKI PEM public keys, e = 65537, 2048–4096 bits (2048 default; 3072–4096 optional for long-lived controllers). |
 | Signatures | RSASSA-PSS, SHA-256, MGF1-SHA-256, salt length 32. The message is passed to PSS as-is (PSS hashes it once with SHA-256). |
 | Text | UTF-8. Control characters other than `\n` and `\t` are rejected. |
 

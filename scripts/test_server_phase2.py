@@ -716,6 +716,72 @@ def run_phase2_cli_suite() -> None:
                     srv.wait(timeout=5)
 
 
+def test_conn_caps_and_dynamic_latest() -> None:
+    print("[9/9] Dynamic cli.latest_version override + FATEXT_MAX_CONNS_PER_IP limit...")
+    with tempfile.TemporaryDirectory(prefix="fatext-cap-") as td:
+        td_p = Path(td)
+        data_dir = td_p / "data"
+        dl_dir = td_p / "dl"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        dl_dir.mkdir(parents=True, exist_ok=True)
+        (dl_dir / "latest.json").write_text('{"latest_version":"2.4.1","updated_at":1764000000}\n', encoding="utf-8")
+        port = free_tcp_port()
+        env = os.environ.copy()
+        env["FATEXT_ADDR"] = f"{HOST}:{port}"
+        env["FATEXT_DATA_DIR"] = str(data_dir)
+        env["FATEXT_WWW_DIR"] = str(WWW_DIR)
+        env["FATEXT_TEMPLATES_DIR"] = str(TPL_DIR)
+        env["FATEXT_DL_DIR"] = str(dl_dir)
+        env["FATEXT_MAX_CONNS"] = "16"
+        env["FATEXT_MAX_CONNS_PER_IP"] = "2"
+        env["FATEXT_IP_RPM"] = "0"
+
+        srv = subprocess.Popen([str(SERVER_BIN)], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        held_socks: list[socket.socket] = []
+        try:
+            wait_tcp_ready(HOST, port, timeout=10.0)
+            with urllib.request.urlopen(f"http://{HOST}:{port}/.well-known/fatext.json", timeout=5.0) as r:
+                assert_eq(r.status, 200, "fatext.json status")
+                wk = json.loads(r.read().decode("utf-8"))
+                assert_eq(wk["cli"]["latest_version"], "2.4.1", "dynamic latest_version override")
+
+            # Hold 2 idle keep-alive sockets open; a 3rd simultaneous TCP connection must be rejected immediately.
+            for _ in range(2):
+                s = socket.create_connection((HOST, port), timeout=3.0)
+                s.sendall(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: keep-alive\r\n\r\n")
+                s.settimeout(2.0)
+                resp_b = s.recv(1024)
+                assert_true(b"200 OK" in resp_b, f"held sock health failed: {resp_b!r}")
+                held_socks.append(s)
+
+            with socket.create_connection((HOST, port), timeout=2.0) as s3:
+                s3.settimeout(2.0)
+                try:
+                    s3.sendall(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+                    r3 = s3.recv(1024)
+                except OSError:
+                    r3 = b""
+                assert_eq(r3, b"", f"expected 3rd connection rejected immediately, got {r3!r}")
+
+            # Release the 2 held sockets -> server must accept new connections again cleanly
+            for s in held_socks:
+                s.close()
+            held_socks.clear()
+            time.sleep(0.1)
+            st, disc = http_json(f"http://{HOST}:{port}/.well-known/fatext.json")
+            assert_eq(st, 200, "recovered after releasing sockets")
+            assert_eq(disc["cli"]["latest_version"], "2.4.1", "latest_version after recovery")
+        finally:
+            for s in held_socks:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+            if srv.poll() is None:
+                srv.terminate()
+                srv.wait(timeout=5)
+
+
 def main() -> int:
     if not SERVER_BIN.is_file():
         print(f"Missing server binary: {SERVER_BIN}", file=sys.stderr)
@@ -725,6 +791,7 @@ def main() -> int:
         return 1
     test_native_tls_and_redirect()
     run_phase2_cli_suite()
+    test_conn_caps_and_dynamic_latest()
     print("ALL PHASE 2 + NATIVE TLS + REAL CLI CHECKS PASSED.")
     return 0
 

@@ -727,6 +727,7 @@ pub fn handle_ctl_revoke_agent(hub $&HubState, req &HttpReq, aid string, now int
     rev_line := "{\"agent_id\":" + json.quote(&aid) + ",\"successor_id\":" + succ_json + ",\"revoked_by\":" + json.quote(&au.agent_id) + ",\"revoked_at\":" + strconv.itoa(now) + "}"
     append_jsonl_quiet(hub.st.data_dir + "/keys/revoked.jsonl", rev_line)
     state_mark_revoked($&hub.st, aid + "")
+    hub.st.home_cache_ver += 1
     hub_disconnect_agent(hub, aid + "")
     log_event_json(hub.log_ch, now, "ctl_control",
         "\"action\":\"revoke_agent\",\"controller_id\":" + json.quote(&au.agent_id) + ",\"agent_id\":" + json.quote(&aid))
@@ -828,6 +829,8 @@ pub fn handle_ctl_update_agent_policy(hub $&HubState, req &HttpReq, aid string, 
         ag.status + "", "null", &ag.pub_pem, kh_json, &next_name, &ag.bio, now, ext_json, own_json, managed_json, sig_json) or (err) {
         << err_resp(500, "ERR_INTERNAL", "failed updating agent policy", 0, 0, 0)
     }
+    cache_set_agent_name($&hub.st, aid + "", next_name + "")
+    hub.st.home_cache_ver += 1
     log_event_json(hub.log_ch, now, "ctl_control",
         "\"action\":\"policy\",\"controller_id\":" + json.quote(&au.agent_id) + ",\"agent_id\":" + json.quote(&aid) + ",\"dm_policy\":" + json.quote(&dmp) + ",\"accept_email\":" + ae_s)
     << json_resp(200, "{\"ok\":true,\"agent_id\":" + json.quote(&aid) + ",\"name\":" + json.quote(&next_name) + ",\"dm_policy\":" + json.quote(&dmp) + ",\"accept_email\":" + ae_s + "}")

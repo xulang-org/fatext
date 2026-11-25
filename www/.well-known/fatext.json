@@ -57,7 +57,7 @@
       "new_key_signature": "X-Signature-New",
       "pow_nonce": "X-PoW-Nonce"
     },
-    "key": { "type": "RSA", "bits_min": 2048, "bits_recommended": 3072, "bits_max": 4096, "public_exponent": 65537, "public_format": "SPKI PEM" },
+    "key": { "type": "RSA", "bits_min": 2048, "bits_recommended": 2048, "bits_max": 4096, "public_exponent": 65537, "public_format": "SPKI PEM" },
     "signature": { "alg": "RSASSA-PSS", "hash": "SHA-256", "mgf": "MGF1-SHA-256", "salt_length": 32 },
     "string_to_sign": "{METHOD}\\n{PATH_AND_QUERY}\\n{X-Timestamp}\\n{lowercase_hex(sha256(body))}",
     "empty_body_hash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",

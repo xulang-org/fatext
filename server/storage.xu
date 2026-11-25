@@ -106,6 +106,11 @@ pub struct State {
     pub home_cache_html string
     pub home_cache_ts int
     pub home_cache_ver int
+    pub tpl_cache maps.StrStr
+    pub agent_names maps.StrStr
+    pub thread_reply_totals maps.StrInt
+    pub ch_cache_html maps.StrStr
+    pub ch_cache_ts maps.StrInt
 }
 
 pub fn new_state(addr string, data_dir string, www_dir string, templates_dir string, dl_dir string, pow_bits int, mail_secret string, ip_rpm int) State {
@@ -143,7 +148,12 @@ pub fn new_state(addr string, data_dir string, www_dir string, templates_dir str
         home_cache_key: "",
         home_cache_html: "",
         home_cache_ts: 0,
-        home_cache_ver: 0
+        home_cache_ver: 0,
+        tpl_cache: maps.new_str_str(),
+        agent_names: maps.new_str_str(),
+        thread_reply_totals: maps.new_str_int(),
+        ch_cache_html: maps.new_str_str(),
+        ch_cache_ts: maps.new_str_int()
     }
 }
 
@@ -371,6 +381,34 @@ pub fn map_get_or(m &maps.StrInt, k string, def int) int {
     << m.get(k) or (err) { << def }
 }
 
+pub fn str_map_get_or(m &maps.StrStr, k string, def string) string {
+    << m.get(k) or (err) { << def }
+}
+
+pub fn str_map_set(m $&maps.StrStr, k string, v string) {
+    m.set(k, v)
+}
+
+pub fn str_map_del(m $&maps.StrStr, k string) {
+    m.del(k)
+}
+
+pub fn str_map_clear(m $&maps.StrStr) {
+    m.clear()
+}
+
+pub fn map_clear(m $&maps.StrInt) {
+    m.clear()
+}
+
+pub fn cache_set_agent_name(st $&State, aid string, name string) {
+    if name.len > 0 {
+        str_map_set($&st.agent_names, aid + "", name + "")
+    } else {
+        str_map_del($&st.agent_names, aid + "")
+    }
+}
+
 fn load_id_set_jsonl(dst $&maps.StrInt, raw &string, key_name string) {
     dst.clear()
     lines := strings.split(raw, "\n")
@@ -547,6 +585,14 @@ pub fn init_state(st $&State) {
     reload_configs(st, now)
     today := utc_date_from_unix(now)
     restore_today_daily_limits(st, today)
+    tpl_names := ["base.html", "home.html", "channel.html", "thread.html", "agent.html", "download.html", "help.html", "error.html", "partials/pin.html", "partials/post.html", "partials/reply.html"]
+    for ti in 0:tpl_names.len {
+        rel := tpl_names[ti] + ""
+        raw := read_file_or_empty(st.templates_dir + "/" + rel)
+        if raw.len > 0 {
+            str_map_set($&st.tpl_cache, rel, raw)
+        }
+    }
 }
 
 pub fn find_channel(st &State, name string) int {

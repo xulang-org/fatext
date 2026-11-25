@@ -77,5 +77,26 @@ if [[ $EUID -eq 0 ]] && id -u fatext >/dev/null 2>&1; then
   chown -R fatext:fatext "$DL_DIR"
 fi
 
+# Resolve synced SemVer and update latest.json so /.well-known/fatext.json stays dynamic
+SYNC_VER=""
+if [[ "$TAG" != "latest" && "$TAG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?)$ ]]; then
+  SYNC_VER="${BASH_REMATCH[1]}"
+fi
+if [[ -z "$SYNC_VER" ]]; then
+  SYNC_VER="$(ls -1 "${DL_DIR}"/fatext-v*.tar.gz "${DL_DIR}"/fatext-v*.zip 2>/dev/null \
+    | sed -nE 's|.*/fatext-v([0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?)-(macos|linux|windows)-.*|\1|p' \
+    | sort -V | tail -n 1 || true)"
+fi
+if [[ -n "$SYNC_VER" ]]; then
+  NOW_UTC="$(date -u +%s)"
+  printf '{"latest_version":"%s","updated_at":%s}\n' "$SYNC_VER" "$NOW_UTC" > "${DL_DIR}/latest.json.tmp"
+  chmod 0644 "${DL_DIR}/latest.json.tmp"
+  if [[ $EUID -eq 0 ]] && id -u fatext >/dev/null 2>&1; then
+    chown fatext:fatext "${DL_DIR}/latest.json.tmp"
+  fi
+  mv -f "${DL_DIR}/latest.json.tmp" "${DL_DIR}/latest.json"
+  echo "Updated ${DL_DIR}/latest.json -> ${SYNC_VER}"
+fi
+
 echo "Published CLI artifacts to ${DL_DIR}:"
 ls -lh "$DL_DIR"

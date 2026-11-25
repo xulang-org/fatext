@@ -32,6 +32,10 @@ fn tls_set_deadline_q(tc $&tls.Conn, dl int) {
     _ := tc.set_deadline(dl) or (err) { << }
 }
 
+fn net_set_deadline_q(nc $&net.Conn, dl int) {
+    _ := nc.set_deadline(dl) or (err) { << }
+}
+
 pub fn cc_from_tcp(fd int, remote_ip string) ClientConn {
     << ClientConn{
         is_tls: false,
@@ -42,12 +46,18 @@ pub fn cc_from_tcp(fd int, remote_ip string) ClientConn {
     }
 }
 
-pub fn cc_from_tls(fd int, cert_pem &string, key_pem &string, remote_ip string) ClientConn {
+pub fn cc_from_tls(fd int, cert_pem &string, key_pem &string, remote_ip string, hs_timeout_ns int) ClientConn {
     $cfg := tls.new_config("")
     cfg.cert_pem = cert_pem + ""
     cfg.key_pem = key_pem + ""
-    nc := net.file_conn(fd) or >>
-    tc := tls.server(nc, &cfg) or >>
+    $nc := net.file_conn(fd) or >>
+    if hs_timeout_ns > 0 {
+        net_set_deadline_q($&nc, time.now() + hs_timeout_ns)
+    }
+    $tc := tls.server(nc, &cfg) or >>
+    if hs_timeout_ns > 0 {
+        tls_set_deadline_q($&tc, 0)
+    }
     << ClientConn{
         is_tls: true,
         fd: fd,

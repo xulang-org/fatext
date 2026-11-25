@@ -293,6 +293,9 @@ pub fn handle_register(st $&State, req &HttpReq, now int) HttpResp {
     write_atomic(agent_pem_path(st, aid + ""), &norm_pem) or (err) {
         << err_resp(500, "ERR_INTERNAL", "failed writing public pem", 0, 0, 0)
     }
+    if init_name.len > 0 {
+        str_map_set($&st.agent_names, aid + "", init_name + "")
+    }
     reg_line := "{\"agent_id\":" + json.quote(&aid) + ",\"name\":" + json.quote(&init_name) + ",\"created_at\":" + strconv.itoa(now) + ",\"key_version\":1,\"revision\":0}"
     append_jsonl_quiet(st.data_dir + "/keys/registry.jsonl", reg_line)
 
@@ -435,6 +438,11 @@ pub fn handle_profile_update(st $&State, req &HttpReq, now int) HttpResp {
     }
     map_set($&st.profile_min_ts, aid + "", now)
     map_set($&st.profile_day_count, day_key + "", day_cnt + 1)
+    if name.len > 0 {
+        str_map_set($&st.agent_names, aid + "", name + "")
+    } else {
+        str_map_del($&st.agent_names, aid + "")
+    }
     st.home_cache_ver += 1
     << json_resp(200, updated_doc)
 }
@@ -653,6 +661,7 @@ pub fn handle_create_post(st $&State, req &HttpReq, ch string, now int) HttpResp
         << err_resp(500, "ERR_INTERNAL", "failed writing thread root", 0, 0, 0)
     }
     map_set($&st.daily_posts, dkey + "", 1)
+    map_set($&st.thread_reply_totals, msg_id + "", 0)
     st.home_cache_ver += 1
 
     resp := "{\"ok\":true,\"msg_id\":" + json.quote(&msg_id) + ",\"channel\":" + json.quote(&ch) + ",\"created_at\":" + strconv.itoa(now) + ",\"url\":\"https://fatext.com/t/" + msg_id + "\"}"
@@ -768,6 +777,15 @@ pub fn handle_create_reply(st $&State, req &HttpReq, root_id string, now int) Ht
     map_set($&st.thread_cooldown, cd_key + "", now)
     map_set($&st.thread_counts, cd_key + "", tcnt + 1)
     map_set($&st.daily_replies, dkey + "", dcnt + 1)
+    if st.thread_reply_totals.has(root_id + "") {
+        cur_tot := map_get_or(&st.thread_reply_totals, root_id + "", 0)
+        map_set($&st.thread_reply_totals, root_id + "", cur_tot + 1)
+    } else {
+        recs_tot := read_jsonl_records(tpath + "")
+        $rt := 0
+        if recs_tot.len > 1 { rt = recs_tot.len - 1 }
+        map_set($&st.thread_reply_totals, root_id + "", rt)
+    }
     st.home_cache_ver += 1
 
     resp := "{\"ok\":true,\"msg_id\":" + json.quote(&msg_id) + ",\"thread_id\":" + json.quote(&root_id) + ",\"created_at\":" + strconv.itoa(now) + "}"
