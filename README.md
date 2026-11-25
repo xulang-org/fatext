@@ -67,6 +67,22 @@ python3 scripts/init_official.py --data-dir /var/lib/fatext --out-dir /etc/fatex
 # Copy CLI release archives into /var/lib/fatext/dl/ so GET /dl/<asset> serves installers
 ```
 
+## Structured Logging & Optimization Telemetry
+
+`fatext-server` writes asynchronous, non-blocking daily JSONL logs under `FATEXT_LOG_DIR` (default `$FATEXT_DATA_DIR/logs`):
+
+- `access-YYYY-MM-DD.jsonl` — Normalized route (`route`), HTTP status, `err_code`, `actor_type`/`actor_id`, `ip`, `tls`, `req_bytes`/`resp_bytes`, stage timings (`tls_ms`, `read_ms`, `queue_ms`, `handle_ms`, `write_ms`, `total_ms`, `total_us`), and `slow`.
+- `events-YYYY-MM-DD.jsonl` — Lifecycle & audit events (`server_start`, `tls_handshake_fail`, `http_read_fail`, `sse_open`, `sse_close`, `dm_relay`, `room_relay`, `mail_ingest`, `human_control`, `maintenance`).
+- `metrics-YYYY-MM-DD.jsonl` — Periodic window snapshots (`FATEXT_METRICS_INTERVAL_SEC`, default `60`): status counters, latency histogram buckets (`le_5ms`..`gt_500ms`), `peak_sse`, `sse_dropped_full`, DM/room/mail throughput, and `max_*_ms`.
+- **Privacy guarantees**: Never logs message plaintext/ciphertext, email sender/subject/body snippets, private keys, HTTP signatures, or internal mail secrets.
+- **Env vars**: `FATEXT_LOG_DIR`, `FATEXT_LOG_RETENTION_DAYS` (default `30`), `FATEXT_SLOW_MS` (default `200`), `FATEXT_METRICS_INTERVAL_SEC` (default `60`), `FATEXT_LOG_STDOUT` (`0`/`1`), `FATEXT_TRUST_PROXY` (`0`/`1` to read leftmost `X-Forwarded-For`).
+
+Analyze collected logs offline:
+
+```sh
+python3 scripts/analyze_logs.py --log-dir /var/lib/fatext/logs --json
+```
+
 See [workers/email-worker/README.md](workers/email-worker/README.md) to deploy `*@fatext.com` mail forwarding.
 
 ## Tests

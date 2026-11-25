@@ -513,9 +513,6 @@ pub fn handle_dm_send(hub $&HubState, req &HttpReq, to_id string, now int) HttpR
     if tag.owner_human_id.len > 0 && hub.st.revoked_humans.has(tag.owner_human_id + "") {
         << err_resp(403, "ERR_HUMAN_REVOKED", "recipient owning human revoked", 0, 0, 0)
     }
-    if tag.owner_human_id.len > 0 && hub.st.revoked_humans.has(tag.owner_human_id + "") {
-        << err_resp(403, "ERR_HUMAN_REVOKED", "recipient owning human revoked", 0, 0, 0)
-    }
     if tag.ownership_status == "suspended" {
         << err_resp(403, "ERR_AGENT_SUSPENDED", "recipient suspended by owning human", 0, 0, 0)
     }
@@ -539,10 +536,22 @@ pub fn handle_dm_send(hub $&HubState, req &HttpReq, to_id string, now int) HttpR
         if is_https_url(&wh) {
             wh_body := "{\"event\":\"dm\",\"data\":" + ev_json + "}"
             xu deliver_webhook(wh, wh_body)
+            hub.metrics.dm_webhook += 1
+            log_event_json(hub.log_ch, now, "dm_relay",
+                "\"from\":" + json.quote(&au.agent_id) + ",\"to\":" + json.quote(&to_id) +
+                ",\"delivered\":\"webhook\",\"streams\":0,\"bytes\":" + strconv.itoa(body.len))
             << json_resp(202, "{\"ok\":true,\"delivered\":\"webhook\"}")
         }
+        hub.metrics.dm_dropped += 1
+        log_event_json(hub.log_ch, now, "dm_relay",
+            "\"from\":" + json.quote(&au.agent_id) + ",\"to\":" + json.quote(&to_id) +
+            ",\"delivered\":\"dropped_offline\",\"streams\":0,\"bytes\":" + strconv.itoa(body.len))
         << json_resp(202, "{\"ok\":true,\"delivered\":\"dropped_offline\"}")
     }
+    hub.metrics.dm_sse += 1
+    log_event_json(hub.log_ch, now, "dm_relay",
+        "\"from\":" + json.quote(&au.agent_id) + ",\"to\":" + json.quote(&to_id) +
+        ",\"delivered\":\"sse\",\"streams\":" + strconv.itoa(delivered) + ",\"bytes\":" + strconv.itoa(body.len))
     << json_resp(202, "{\"ok\":true,\"delivered\":\"sse\",\"streams\":" + strconv.itoa(delivered) + "}")
 }
 
@@ -561,6 +570,10 @@ pub fn handle_room_send(hub $&HubState, req &HttpReq, room_id string, now int) H
     }
     ev_json := "{\"room_id\":" + json.quote(&room_id) + ",\"from\":" + json.quote(&au.agent_id) + ",\"frame\":" + body + "}"
     delivered := hub_push_room(hub, room_id + "", au.agent_id + "", &ev_json)
+    hub.metrics.room_events += 1
+    log_event_json(hub.log_ch, now, "room_relay",
+        "\"from\":" + json.quote(&au.agent_id) + ",\"room_id\":" + json.quote(&room_id) +
+        ",\"streams\":" + strconv.itoa(delivered) + ",\"bytes\":" + strconv.itoa(body.len))
     << json_resp(202, "{\"ok\":true,\"room_id\":" + json.quote(&room_id) + ",\"streams\":" + strconv.itoa(delivered) + "}")
 }
 
@@ -650,6 +663,11 @@ pub fn handle_mail_ingest(hub $&HubState, req &HttpReq, now int) HttpResp {
     }
     ev_data := "{\"mail_id\":" + json.quote(&mail_id) + ",\"received_at\":" + strconv.itoa(rat) + "}"
     _ := hub_push_to_agent(hub, to_id + "", "mail", &ev_data)
+    hub.metrics.mail_ingested += 1
+    log_event_json(hub.log_ch, now, "mail_ingest",
+        "\"to\":" + json.quote(&to_id) + ",\"mail_id\":" + json.quote(&mail_id) +
+        ",\"bytes\":" + strconv.itoa(stored_json.len) +
+        ",\"spf\":" + spf_s + ",\"dkim\":" + dkim_s + ",\"dmarc\":" + dmarc_s)
     << json_resp(201, "{\"ok\":true,\"mail_id\":" + json.quote(&mail_id) + ",\"to_key_version\":" + strconv.itoa(tag.key_version) + "}")
 }
 

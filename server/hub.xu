@@ -11,6 +11,8 @@
 pub const HUB_HTTP = 1
 pub const HUB_SSE_SUB = 2
 pub const HUB_SSE_UNSUB = 3
+pub const HUB_METRIC_TLS = 4
+pub const HUB_METRIC_FLUSH = 5
 pub const SSE_CTRL_CLOSE = "__FATEXT_SSE_CLOSE__"
 
 pub struct SseClient {
@@ -26,12 +28,19 @@ pub struct HubReply {
     pub is_sse bool
     pub sse_id int
     pub sse_ch chan string
+    pub queue_ms int
+    pub handle_ms int
+    pub err_code string
+    pub actor_type string
+    pub actor_id string
 }
 
 pub struct HubJob {
     pub kind int
     pub req HttpReq
     pub sse_id int
+    pub enqueued_ns int
+    pub flag int
     pub reply_ch chan HubReply
 }
 
@@ -41,15 +50,21 @@ pub struct HubState {
     pub next_sse_id int
     pub ip_hits maps.StrInt
     pub ip_window int
+    pub log_ch chan string
+    pub slow_ms int
+    pub metrics MetricsState
 }
 
-pub fn new_hub_state(st State) HubState {
+pub fn new_hub_state(st State, log_ch chan string, slow_ms int, now int) HubState {
     << HubState{
         st: st,
         clients: []SseClient{},
         next_sse_id: 1,
         ip_hits: maps.new_str_int(),
-        ip_window: 0
+        ip_window: 0,
+        log_ch: log_ch,
+        slow_ms: slow_ms,
+        metrics: new_metrics_state(now)
     }
 }
 
@@ -57,24 +72,32 @@ fn empty_sse_ch() chan string {
     << chan string{cap: 1}
 }
 
-fn reply_http(resp HttpResp) HubReply {
-    << HubReply{resp: resp, is_sse: false, sse_id: 0, sse_ch: empty_sse_ch()}
-}
-
-fn send_sse_msg(cli &SseClient, msg string) {
-    select {
-        cli.ch <- msg {}
-        else {}
+fn reply_http(resp HttpResp, queue_ms int, handle_ms int, err_code string, actor_type string, actor_id string) HubReply {
+    << HubReply{
+        resp: resp, is_sse: false, sse_id: 0, sse_ch: empty_sse_ch(),
+        queue_ms: queue_ms, handle_ms: handle_ms, err_code: err_code,
+        actor_type: actor_type, actor_id: actor_id
     }
 }
 
-pub fn hub_push_to_agent(hub &HubState, agent_id string, event_type string, data_json &string) int {
+fn send_sse_msg(cli &SseClient, msg string) bool {
+    select {
+        cli.ch <- msg { << true }
+        else { << false }
+    }
+}
+
+pub fn hub_push_to_agent(hub $&HubState, agent_id string, event_type string, data_json &string) int {
     msg := "event: " + event_type + "\ndata: " + data_json + "\n\n"
     $sent := 0
     for i in 0:hub.clients.len {
         if hub.clients[i].agent_id == agent_id {
-            send_sse_msg(&hub.clients[i], msg + "")
-            sent += 1
+            if send_sse_msg(&hub.clients[i], msg + "") {
+                sent += 1
+                hub.metrics.sse_events_pushed += 1
+            } else {
+                hub.metrics.sse_dropped_full += 1
+            }
         }
     }
     << sent
@@ -85,7 +108,7 @@ pub fn hub_disconnect_agent(hub $&HubState, agent_id string) {
     for i in 0:hub.clients.len {
         c := &hub.clients[i]
         if c.agent_id == agent_id {
-            send_sse_msg(c, SSE_CTRL_CLOSE)
+            _ := send_sse_msg(c, SSE_CTRL_CLOSE)
         } else {
             next_clients.push(SseClient{
                 id: c.id,
@@ -99,32 +122,40 @@ pub fn hub_disconnect_agent(hub $&HubState, agent_id string) {
     hub.clients = next_clients
 }
 
-pub fn hub_push_dm(hub &HubState, to_id string, data_json &string) int {
+pub fn hub_push_dm(hub $&HubState, to_id string, data_json &string) int {
     << hub_push_to_agent(hub, to_id, "dm", data_json)
 }
 
-pub fn hub_push_room(hub &HubState, room_id string, sender_id string, data_json &string) int {
+pub fn hub_push_room(hub $&HubState, room_id string, sender_id string, data_json &string) int {
     msg := "event: room\ndata: " + data_json + "\n\n"
     $sent := 0
     for i in 0:hub.clients.len {
         c := &hub.clients[i]
         if c.agent_id == sender_id { -> }
         if str_list_contains(&c.rooms, room_id + "") || c.rooms.len == 0 {
-            send_sse_msg(c, msg + "")
-            sent += 1
+            if send_sse_msg(c, msg + "") {
+                sent += 1
+                hub.metrics.sse_events_pushed += 1
+            } else {
+                hub.metrics.sse_dropped_full += 1
+            }
         }
     }
     << sent
 }
 
-pub fn hub_push_channel(hub &HubState, ch string, event_type string, data_json &string) int {
+pub fn hub_push_channel(hub $&HubState, ch string, event_type string, data_json &string) int {
     msg := "event: " + event_type + "\ndata: " + data_json + "\n\n"
     $sent := 0
     for i in 0:hub.clients.len {
         c := &hub.clients[i]
         if c.channels.len == 0 || str_list_contains(&c.channels, ch + "") {
-            send_sse_msg(c, msg + "")
-            sent += 1
+            if send_sse_msg(c, msg + "") {
+                sent += 1
+                hub.metrics.sse_events_pushed += 1
+            } else {
+                hub.metrics.sse_dropped_full += 1
+            }
         }
     }
     << sent
@@ -208,30 +239,38 @@ fn hex_val(c int) int {
     << -1
 }
 
-fn maybe_run_maintenance(st $&State, now int) {
+fn maybe_run_maintenance(hub $&HubState, now int) {
     // Daily anchor .sha256 generation for yesterday's UTC channel archives
     today := utc_date_from_unix(now)
-    if st.last_anchor_date != today {
-        st.last_anchor_date = today + ""
+    if hub.st.last_anchor_date != today {
+        hub.st.last_anchor_date = today + ""
         yday := shift_utc_date(today + "", -1)
-        for i in 0:st.channels.len {
-            ch := st.channels[i].name + ""
-            p := channel_day_path(st, ch + "", yday + "")
+        $anchors := 0
+        for i in 0:hub.st.channels.len {
+            ch := hub.st.channels[i].name + ""
+            p := channel_day_path(&hub.st, ch + "", yday + "")
             raw := read_file_or_empty(p + "")
             if raw.len > 0 {
                 sha_p := p + ".sha256"
                 if read_file_or_empty(sha_p + "").len == 0 {
                     anchor := sha256.sum256(raw + "") + "  " + yday + ".jsonl\n"
                     write_atomic_quiet(sha_p, &anchor)
+                    anchors += 1
                 }
             }
+        }
+        if anchors > 0 {
+            log_event_json(hub.log_ch, now, "maintenance",
+                "\"task\":\"daily_anchors\",\"date\":" + json.quote(&yday) + ",\"anchors\":" + strconv.itoa(anchors))
         }
     }
 
     // Periodic 10-day mail GC every 3600s
-    if now - st.last_gc >= 3600 {
-        st.last_gc = now
-        mail_root := st.data_dir + "/mail"
+    if now - hub.st.last_gc >= 3600 {
+        t0 := time.now()
+        hub.st.last_gc = now
+        $deleted := 0
+        mail_root := hub.st.data_dir + "/mail"
         buckets := os.read_dir(mail_root + "") or (err) { << }
         blines := strings.split(&buckets, "\n")
         for bi in 0:blines.len {
@@ -256,11 +295,16 @@ fn maybe_run_maintenance(st $&State, now int) {
                         rat := json_int_or(&doc, doc.get(doc.root(), "received_at"), 0)
                         if rat > 0 && now - rat > MAIL_TTL_SEC {
                             _ := os.remove(fpath + "") or (err) { -> }
+                            deleted += 1
                         }
                     }
                 }
             }
         }
+        hub.metrics.mail_gc_deleted += deleted
+        dur_ms := (time.now() - t0) / 1000000
+        log_event_json(hub.log_ch, now, "maintenance",
+            "\"task\":\"mail_gc\",\"deleted\":" + strconv.itoa(deleted) + ",\"duration_ms\":" + strconv.itoa(dur_ms))
     }
 }
 
@@ -518,13 +562,60 @@ fn dispatch_http(hub $&HubState, req &HttpReq, now int) HttpResp {
     << serve_error_html(&hub.st, 404, "ERR_NOT_FOUND", "No page or data resource exists at " + path)
 }
 
+pub struct ActorPair {
+    pub actor_type string
+    pub actor_id string
+}
+
+fn resolve_actor_type_id(req &HttpReq, resp &HttpResp) ActorPair {
+    aid := strings.trim_space(&req.header("X-Agent-Id"))
+    if aid.len > 0 { << ActorPair{actor_type: "agent", actor_id: aid} }
+    hid := strings.trim_space(&req.header("X-Human-Id"))
+    if hid.len > 0 { << ActorPair{actor_type: "human", actor_id: hid} }
+    sec := strings.trim_space(&req.header("X-Internal-Secret"))
+    if sec.len > 0 { << ActorPair{actor_type: "internal", actor_id: ""} }
+    if resp.status == 201 && resp.body.len > 0 {
+        doc := json.parse(&resp.body)
+        if doc.ok() && doc.is_dict(doc.root()) {
+            if doc.has(doc.root(), "agent_id") {
+                ra := json_str_or(&doc, doc.get(doc.root(), "agent_id"), "")
+                if ra.len > 0 { << ActorPair{actor_type: "agent", actor_id: ra} }
+            }
+            if doc.has(doc.root(), "human_id") {
+                rh := json_str_or(&doc, doc.get(doc.root(), "human_id"), "")
+                if rh.len > 0 { << ActorPair{actor_type: "human", actor_id: rh} }
+            }
+        }
+    }
+    << ActorPair{actor_type: "anon", actor_id: ""}
+}
+
 pub fn hub_loop(hub_init HubState, jobs chan HubJob) {
     $hub := hub_init
     while true {
         job := <-jobs
+        t_start := time.now()
         now := time.now_time().unix()
         reload_configs_if_needed($&hub.st, now)
-        maybe_run_maintenance($&hub.st, now)
+        maybe_run_maintenance($&hub, now)
+
+        if job.kind == HUB_METRIC_FLUSH {
+            acl := hub.clients.len
+            lch := hub.log_ch
+            metrics_flush_and_reset($&hub.metrics, acl, now, lch)
+            ->
+        }
+        if job.kind == HUB_METRIC_TLS {
+            if job.flag == 1 { hub.metrics.tls_ok += 1 }
+            else { hub.metrics.tls_fail += 1 }
+            ->
+        }
+
+        $q_ms := 0
+        if job.enqueued_ns > 0 {
+            d := (t_start - job.enqueued_ns) / 1000000
+            if d > 0 { q_ms = d }
+        }
 
         if job.kind == HUB_SSE_UNSUB {
             $next_clients := []SseClient{}
@@ -541,23 +632,37 @@ pub fn hub_loop(hub_init HubState, jobs chan HubJob) {
                 }
             }
             hub.clients = next_clients
-            job.reply_ch <- reply_http(json_resp(200, "{\"ok\":true}"))
+            hub.metrics.sse_closed += 1
+            job.reply_ch <- reply_http(json_resp(200, "{\"ok\":true}"), 0, 0, "", "", "")
             ->
         }
 
         if !check_ip_rate_limit($&hub, job.req.remote_ip + "", now) {
-            job.reply_ch <- reply_http(err_resp(429, "ERR_RATE_LIMITED", "IP rate limit exceeded", 60, now + 60, 0))
+            r429 := err_resp(429, "ERR_RATE_LIMITED", "IP rate limit exceeded", 60, now + 60, 0)
+            slow := hub.slow_ms
+            metrics_record_http($&hub.metrics, 429, job.req.req_body.len, r429.body.len, q_ms, 0, q_ms, slow)
+            job.reply_ch <- reply_http(r429, q_ms, 0, "ERR_RATE_LIMITED", "anon", "")
             ->
         }
 
         if job.kind == HUB_SSE_SUB {
             if job.req.method() != "GET" {
-                job.reply_ch <- reply_http(err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0))
+                r405 := err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0)
+                slow := hub.slow_ms
+                metrics_record_http($&hub.metrics, 405, job.req.req_body.len, r405.body.len, q_ms, 0, q_ms, slow)
+                job.reply_ch <- reply_http(r405, q_ms, 0, "ERR_BAD_REQUEST", "anon", "")
                 ->
             }
             au := authenticate_scoped($&hub.st, &job.req, now, "stream")
             if !au.ok {
-                job.reply_ch <- reply_http(err_resp(au.status, au.code, au.message, 0, 0, 0))
+                h_ms := (time.now() - t_start) / 1000000
+                r_err := err_resp(au.status, au.code, au.message, 0, 0, 0)
+                aid_hdr := strings.trim_space(&job.req.header("X-Agent-Id"))
+                $atyp := "anon"
+                if aid_hdr.len > 0 { atyp = "agent" }
+                slow := hub.slow_ms
+                metrics_record_http($&hub.metrics, au.status, job.req.req_body.len, r_err.body.len, q_ms, h_ms, q_ms + h_ms, slow)
+                job.reply_ch <- reply_http(r_err, q_ms, h_ms, au.code + "", atyp, aid_hdr)
                 ->
             }
             sid := hub.next_sse_id
@@ -573,16 +678,37 @@ pub fn hub_loop(hub_init HubState, jobs chan HubJob) {
                 ch: ch
             }
             hub.clients.push(cli)
+            hub.metrics.sse_opened += 1
+            if hub.clients.len > hub.metrics.peak_sse {
+                hub.metrics.peak_sse = hub.clients.len
+            }
+            h_ms := (time.now() - t_start) / 1000000
+            ev_f := "\"sse_id\":" + strconv.itoa(sid) +
+                ",\"agent_id\":" + json.quote(&au.agent_id) +
+                ",\"active_sse\":" + strconv.itoa(hub.clients.len) +
+                ",\"ip\":" + json.quote(&job.req.remote_ip)
+            log_event_json(hub.log_ch, now, "sse_open", ev_f)
             job.reply_ch <- HubReply{
                 resp: HttpResp{status: 200, ctype: "text/event-stream", extra: "", body: ""},
                 is_sse: true,
                 sse_id: sid,
-                sse_ch: ch
+                sse_ch: ch,
+                queue_ms: q_ms,
+                handle_ms: h_ms,
+                err_code: "",
+                actor_type: "agent",
+                actor_id: au.agent_id + ""
             }
             ->
         }
 
         resp := dispatch_http($&hub, &job.req, now)
-        job.reply_ch <- reply_http(resp)
+        $h_ms := (time.now() - t_start) / 1000000
+        if h_ms < 0 { h_ms = 0 }
+        ec := extract_err_code(resp.status, &resp.body)
+        actor_pair := resolve_actor_type_id(&job.req, &resp)
+        slow := hub.slow_ms
+        metrics_record_http($&hub.metrics, resp.status, job.req.req_body.len, resp.body.len, q_ms, h_ms, q_ms + h_ms, slow)
+        job.reply_ch <- reply_http(resp, q_ms, h_ms, ec, actor_pair.actor_type + "", actor_pair.actor_id + "")
     }
 }

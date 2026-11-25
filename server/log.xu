@@ -1,0 +1,403 @@
+@main
+
+#os
+#net
+#strconv
+#strings
+#time
+#encoding/json
+
+pub struct LogEntry {
+    pub stream string
+    pub line string
+}
+
+pub struct LogConfig {
+    pub log_dir string
+    pub retain_days int
+    pub slow_ms int
+    pub metrics_interval_sec int
+    pub stdout_mirror bool
+    pub trust_proxy bool
+}
+
+pub struct MetricsState {
+    pub started_at int
+    pub window_start int
+    pub peak_sse int
+
+    pub req_total int
+    pub req_2xx int
+    pub req_4xx int
+    pub req_5xx int
+    pub req_429 int
+    pub bytes_in int
+    pub bytes_out int
+
+    pub tls_ok int
+    pub tls_fail int
+    pub sse_opened int
+    pub sse_closed int
+    pub sse_events_pushed int
+    pub sse_dropped_full int
+
+    pub dm_sse int
+    pub dm_webhook int
+    pub dm_dropped int
+    pub room_events int
+    pub mail_ingested int
+    pub mail_gc_deleted int
+
+    pub slow_requests int
+    pub b_le5 int
+    pub b_le20 int
+    pub b_le100 int
+    pub b_le500 int
+    pub b_gt500 int
+    pub max_total_ms int
+    pub max_queue_ms int
+    pub max_handle_ms int
+}
+
+pub fn new_metrics_state(now int) MetricsState {
+    << MetricsState{
+        started_at: now, window_start: now, peak_sse: 0,
+        req_total: 0, req_2xx: 0, req_4xx: 0, req_5xx: 0, req_429: 0,
+        bytes_in: 0, bytes_out: 0,
+        tls_ok: 0, tls_fail: 0, sse_opened: 0, sse_closed: 0,
+        sse_events_pushed: 0, sse_dropped_full: 0,
+        dm_sse: 0, dm_webhook: 0, dm_dropped: 0,
+        room_events: 0, mail_ingested: 0, mail_gc_deleted: 0,
+        slow_requests: 0, b_le5: 0, b_le20: 0, b_le100: 0, b_le500: 0, b_gt500: 0,
+        max_total_ms: 0, max_queue_ms: 0, max_handle_ms: 0
+    }
+}
+
+pub fn metrics_record_http(m $&MetricsState, status int, req_bytes int, resp_bytes int, queue_ms int, handle_ms int, total_ms int, slow_ms int) {
+    m.req_total += 1
+    if status >= 200 && status < 300 { m.req_2xx += 1 }
+    else if status >= 400 && status < 500 {
+        m.req_4xx += 1
+        if status == 429 { m.req_429 += 1 }
+    } else if status >= 500 {
+        m.req_5xx += 1
+    }
+    m.bytes_in += req_bytes
+    m.bytes_out += resp_bytes
+
+    if total_ms <= 5 { m.b_le5 += 1 }
+    else if total_ms <= 20 { m.b_le20 += 1 }
+    else if total_ms <= 100 { m.b_le100 += 1 }
+    else if total_ms <= 500 { m.b_le500 += 1 }
+    else { m.b_gt500 += 1 }
+
+    if slow_ms > 0 && total_ms >= slow_ms { m.slow_requests += 1 }
+    if total_ms > m.max_total_ms { m.max_total_ms = total_ms }
+    if queue_ms > m.max_queue_ms { m.max_queue_ms = queue_ms }
+    if handle_ms > m.max_handle_ms { m.max_handle_ms = handle_ms }
+}
+
+pub fn log_emit(ch chan string, stream string, line string) {
+    tagged := stream + "\t" + line
+    select {
+        ch <- tagged {}
+        else {}
+    }
+}
+
+pub fn log_event_json(ch chan string, now int, kind string, fields_json string) {
+    t_iso := utc_iso_from_unix(now)
+    $s := "{\"ts\":" + strconv.itoa(now) + ",\"time\":" + json.quote(&t_iso) + ",\"kind\":" + json.quote(&kind)
+    if fields_json.len > 0 {
+        s = s + "," + fields_json
+    }
+    s = s + "}"
+    log_emit(ch, "events", s)
+}
+
+pub fn metrics_flush_and_reset(m $&MetricsState, active_sse int, now int, ch chan string) {
+    t_iso := utc_iso_from_unix(now)
+    win_sec := now - m.window_start
+    uptime := now - m.started_at
+    line := "{\"ts\":" + strconv.itoa(now) +
+        ",\"time\":" + json.quote(&t_iso) +
+        ",\"window_sec\":" + strconv.itoa(win_sec) +
+        ",\"uptime_sec\":" + strconv.itoa(uptime) +
+        ",\"req_total\":" + strconv.itoa(m.req_total) +
+        ",\"req_2xx\":" + strconv.itoa(m.req_2xx) +
+        ",\"req_4xx\":" + strconv.itoa(m.req_4xx) +
+        ",\"req_5xx\":" + strconv.itoa(m.req_5xx) +
+        ",\"req_429\":" + strconv.itoa(m.req_429) +
+        ",\"bytes_in\":" + strconv.itoa(m.bytes_in) +
+        ",\"bytes_out\":" + strconv.itoa(m.bytes_out) +
+        ",\"tls_ok\":" + strconv.itoa(m.tls_ok) +
+        ",\"tls_fail\":" + strconv.itoa(m.tls_fail) +
+        ",\"active_sse\":" + strconv.itoa(active_sse) +
+        ",\"peak_sse\":" + strconv.itoa(m.peak_sse) +
+        ",\"sse_opened\":" + strconv.itoa(m.sse_opened) +
+        ",\"sse_closed\":" + strconv.itoa(m.sse_closed) +
+        ",\"sse_events_pushed\":" + strconv.itoa(m.sse_events_pushed) +
+        ",\"sse_dropped_full\":" + strconv.itoa(m.sse_dropped_full) +
+        ",\"dm_sse\":" + strconv.itoa(m.dm_sse) +
+        ",\"dm_webhook\":" + strconv.itoa(m.dm_webhook) +
+        ",\"dm_dropped\":" + strconv.itoa(m.dm_dropped) +
+        ",\"room_events\":" + strconv.itoa(m.room_events) +
+        ",\"mail_ingested\":" + strconv.itoa(m.mail_ingested) +
+        ",\"mail_gc_deleted\":" + strconv.itoa(m.mail_gc_deleted) +
+        ",\"slow_requests\":" + strconv.itoa(m.slow_requests) +
+        ",\"latency_buckets\":{\"le_5ms\":" + strconv.itoa(m.b_le5) +
+        ",\"le_20ms\":" + strconv.itoa(m.b_le20) +
+        ",\"le_100ms\":" + strconv.itoa(m.b_le100) +
+        ",\"le_500ms\":" + strconv.itoa(m.b_le500) +
+        ",\"gt_500ms\":" + strconv.itoa(m.b_gt500) + "}" +
+        ",\"max_total_ms\":" + strconv.itoa(m.max_total_ms) +
+        ",\"max_queue_ms\":" + strconv.itoa(m.max_queue_ms) +
+        ",\"max_handle_ms\":" + strconv.itoa(m.max_handle_ms) + "}"
+    log_emit(ch, "metrics", line)
+
+    m.window_start = now
+    m.peak_sse = active_sse
+    m.req_total = 0
+    m.req_2xx = 0
+    m.req_4xx = 0
+    m.req_5xx = 0
+    m.req_429 = 0
+    m.bytes_in = 0
+    m.bytes_out = 0
+    m.tls_ok = 0
+    m.tls_fail = 0
+    m.sse_opened = 0
+    m.sse_closed = 0
+    m.sse_events_pushed = 0
+    m.sse_dropped_full = 0
+    m.dm_sse = 0
+    m.dm_webhook = 0
+    m.dm_dropped = 0
+    m.room_events = 0
+    m.mail_ingested = 0
+    m.mail_gc_deleted = 0
+    m.slow_requests = 0
+    m.b_le5 = 0
+    m.b_le20 = 0
+    m.b_le100 = 0
+    m.b_le500 = 0
+    m.b_gt500 = 0
+    m.max_total_ms = 0
+    m.max_queue_ms = 0
+    m.max_handle_ms = 0
+}
+
+fn is_rotated_log_filename(fname string) int {
+    // Returns prefix length if matching access|events|metrics-YYYY-MM-DD.jsonl, else -1
+    if !strings.has_suffix(&fname, ".jsonl") { << -1 }
+    if fname.len == 23 && strings.has_prefix(&fname, "access-") { << 7 }
+    if fname.len == 23 && strings.has_prefix(&fname, "events-") { << 7 }
+    if fname.len == 24 && strings.has_prefix(&fname, "metrics-") { << 8 }
+    << -1
+}
+
+fn cleanup_old_logs(log_dir string, today string, retain_days int) {
+    if log_dir.len == 0 || retain_days <= 0 { << }
+    cutoff := shift_utc_date(today + "", 0 - retain_days)
+    raw := os.read_dir(log_dir + "") or (err) { << }
+    lines := strings.split(&raw, "\n")
+    for i in 0:lines.len {
+        fn_s := strings.trim_space(&lines[i])
+        pref := is_rotated_log_filename(fn_s + "")
+        if pref <= 0 { -> }
+        dt_part := fn_s[pref:(pref + 10)]
+        if is_valid_date(dt_part + "") && strings.compare(&dt_part, &cutoff) < 0 {
+            _ := os.remove(log_dir + "/" + fn_s) or (err) { -> }
+        }
+    }
+}
+
+pub fn logger_loop(log_dir string, retain_days int, stdout_mirror bool, ch chan string) {
+    if log_dir.len > 0 {
+        mkdir_all_quiet(log_dir + "")
+    }
+    $last_date := ""
+    while true {
+        tagged := <-ch
+        tidx := strings.index_of(&tagged, "\t")
+        if tidx <= 0 || tidx + 1 >= tagged.len { -> }
+        stream := tagged[0:tidx]
+        line := tagged[(tidx + 1):tagged.len]
+        now := time.now_time().unix()
+        today := utc_date_from_unix(now)
+        if today != last_date {
+            last_date = today + ""
+            if log_dir.len > 0 {
+                cleanup_old_logs(log_dir + "", today + "", retain_days)
+            }
+        }
+        if log_dir.len > 0 {
+            fpath := log_dir + "/" + stream + "-" + today + ".jsonl"
+            append_jsonl_quiet(fpath, line + "")
+        }
+        if stdout_mirror {
+            println("[" + stream + "] " + line)
+        }
+    }
+}
+
+pub fn extract_err_code(status int, body &string) string {
+    if status < 400 || body.len == 0 { << "" }
+    doc := json.parse(body)
+    if !doc.ok() || !doc.is_dict(doc.root()) || !doc.has(doc.root(), "error") { << "" }
+    en := doc.get(doc.root(), "error")
+    if !doc.is_dict(en) || !doc.has(en, "code") { << "" }
+    << json_str_or(&doc, doc.get(en, "code"), "")
+}
+
+pub fn extract_host_from_sockaddr_str(raw string) string {
+    s := strings.trim_space(&raw)
+    if s.len == 0 { << "127.0.0.1" }
+    if (s[0] & 255) == 91 {
+        // [ipv6]:port
+        rb := strings.index_of(&s, "]")
+        if rb > 1 { << s[1:rb] }
+    }
+    $last_colon := -1
+    for i in 0:s.len {
+        if (s[i] & 255) == 58 { last_colon = i }
+    }
+    if last_colon > 0 { << s[0:last_colon] }
+    << s
+}
+
+pub fn resolve_peer_ip(fd int) string {
+    if fd < 0 { << "127.0.0.1" }
+    raw := net.socket_remote_addr(fd)
+    << extract_host_from_sockaddr_str(raw)
+}
+
+pub fn effective_client_ip(peer_ip string, req &HttpReq, trust_proxy bool) string {
+    if !trust_proxy { << peer_ip + "" }
+    xff := strings.trim_space(&req.header("X-Forwarded-For"))
+    if xff.len == 0 { << peer_ip + "" }
+    $first := xff + ""
+    cidx := strings.index_of(&first, ",")
+    if cidx >= 0 {
+        first = strings.trim_space(&first[0:cidx])
+    }
+    if first.len > 0 && first.len <= 64 && !has_forbidden_ctrl(&first) {
+        << first
+    }
+    << peer_ip + ""
+}
+
+pub fn normalize_route(raw_path string) string {
+    path := path_only(raw_path + "")
+    if path == "/" || path == "/health" || path == "/llms.txt" || path == "/llms-full.txt" ||
+       path == "/SKILL.md" || path == "/protocol.md" || path == "/.well-known/fatext.json" ||
+       path == "/static/fatext.css" || path == "/static/favicon.svg" || path == "/favicon.ico" ||
+       path == "/static/logo.svg" || path == "/internal/mail/ingest" ||
+       path == "/v1/agents/register" || path == "/v1/agents/profile" || path == "/v1/agents/rotate-key" ||
+       path == "/v1/agents/revoke" || path == "/v1/humans/register" || path == "/v1/humans/profile" ||
+       path == "/v1/humans/rotate-key" || path == "/v1/humans/revoke" || path == "/v1/humans/agents" ||
+       path == "/v1/friends" || path == "/v1/friends/request" || path == "/v1/friends/accept" ||
+       path == "/v1/friends/reject" || path == "/v1/blocks" || path == "/v1/mail" || path == "/v1/stream" {
+        << path
+    }
+    if strings.has_prefix(&path, "/dl/") { << "/dl/{file}" }
+    if strings.has_prefix(&path, "/v1/friends/") { << "/v1/friends/{id}" }
+    if strings.has_prefix(&path, "/v1/blocks/") { << "/v1/blocks/{target}" }
+    if strings.has_prefix(&path, "/v1/dm/") { << "/v1/dm/{id}" }
+    if strings.has_prefix(&path, "/v1/mail/") { << "/v1/mail/{id}" }
+    if strings.has_prefix(&path, "/v1/rooms/") && strings.has_suffix(&path, "/send") { << "/v1/rooms/{id}/send" }
+    if strings.has_prefix(&path, "/v1/humans/agents/") {
+        rest := path[18:path.len]
+        parts := strings.split(&rest, "/")
+        if parts.len == 2 {
+            << "/v1/humans/agents/{id}/" + parts[1]
+        }
+        << "/v1/humans/agents/{other}"
+    }
+    if strings.has_prefix(&path, "/v1/channels/") {
+        if strings.has_suffix(&path, "/pins") { << "/v1/channels/{ch}/pins" }
+        if strings.has_suffix(&path, "/posts") { << "/v1/channels/{ch}/posts" }
+        << "/v1/channels/{other}"
+    }
+    if strings.has_prefix(&path, "/v1/threads/") && strings.has_suffix(&path, "/replies") {
+        << "/v1/threads/{id}/replies"
+    }
+    if strings.has_prefix(&path, "/k/") {
+        if strings.has_suffix(&path, ".json") { << "/k/{id}.json" }
+        if strings.has_suffix(&path, ".pem") { << "/k/{id}.pem" }
+    }
+    if strings.has_prefix(&path, "/h/") {
+        if strings.has_suffix(&path, ".json") { << "/h/{id}.json" }
+        if strings.has_suffix(&path, ".pem") { << "/h/{id}.pem" }
+    }
+    if strings.has_prefix(&path, "/c/") {
+        rest := path[3:path.len]
+        parts := strings.split(&rest, "/")
+        if parts.len == 1 { << "/c/{ch}" }
+        if parts.len == 2 {
+            if strings.has_suffix(&parts[1], ".jsonl") { << "/c/{ch}/{date}.jsonl" }
+            if strings.has_suffix(&parts[1], ".sha256") { << "/c/{ch}/{date}.sha256" }
+            << "/c/{ch}/{date}"
+        }
+    }
+    if strings.has_prefix(&path, "/t/") {
+        if strings.has_suffix(&path, ".jsonl") { << "/t/{id}.jsonl" }
+        << "/t/{id}"
+    }
+    if strings.has_prefix(&path, "/a/") { << "/a/{id}" }
+    if strings.has_prefix(&path, "/u/") { << "/u/{id}" }
+    << "/other"
+}
+
+pub fn log_access_json(
+    ch chan string,
+    slow_ms int,
+    now int,
+    req_id string,
+    method string,
+    route string,
+    status int,
+    err_code string,
+    tls_on bool,
+    ip string,
+    actor_type string,
+    actor_id string,
+    req_bytes int,
+    resp_bytes int,
+    tls_ms int,
+    read_ms int,
+    queue_ms int,
+    handle_ms int,
+    write_ms int,
+    total_ms int,
+    total_us int
+) {
+    t_iso := utc_iso_from_unix(now)
+    $tls_s := "false"
+    if tls_on { tls_s = "true" }
+    $slow_s := "false"
+    if slow_ms > 0 && total_ms >= slow_ms { slow_s = "true" }
+
+    line := "{\"ts\":" + strconv.itoa(now) +
+        ",\"time\":" + json.quote(&t_iso) +
+        ",\"req_id\":" + json.quote(&req_id) +
+        ",\"method\":" + json.quote(&method) +
+        ",\"route\":" + json.quote(&route) +
+        ",\"status\":" + strconv.itoa(status) +
+        ",\"err_code\":" + json.quote(&err_code) +
+        ",\"tls\":" + tls_s +
+        ",\"ip\":" + json.quote(&ip) +
+        ",\"actor_type\":" + json.quote(&actor_type) +
+        ",\"actor_id\":" + json.quote(&actor_id) +
+        ",\"req_bytes\":" + strconv.itoa(req_bytes) +
+        ",\"resp_bytes\":" + strconv.itoa(resp_bytes) +
+        ",\"tls_ms\":" + strconv.itoa(tls_ms) +
+        ",\"read_ms\":" + strconv.itoa(read_ms) +
+        ",\"queue_ms\":" + strconv.itoa(queue_ms) +
+        ",\"handle_ms\":" + strconv.itoa(handle_ms) +
+        ",\"write_ms\":" + strconv.itoa(write_ms) +
+        ",\"total_ms\":" + strconv.itoa(total_ms) +
+        ",\"total_us\":" + strconv.itoa(total_us) +
+        ",\"slow\":" + slow_s + "}"
+    log_emit(ch, "access", line)
+}

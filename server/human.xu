@@ -772,6 +772,8 @@ pub fn handle_human_revoke(hub $&HubState, req &HttpReq, now int) HttpResp {
     for i in 0:owned_ids.len {
         hub_disconnect_agent(hub, owned_ids[i] + "")
     }
+    log_event_json(hub.log_ch, now, "human_control",
+        "\"action\":\"human_revoke\",\"human_id\":" + json.quote(&hid) + ",\"affected_agents\":" + strconv.itoa(owned_ids.len))
     << json_resp(200, "{\"ok\":true,\"human_id\":" + json.quote(&hid) + ",\"status\":\"revoked\"}")
 }
 
@@ -986,6 +988,8 @@ pub fn handle_human_grant_credential(hub $&HubState, req &HttpReq, aid string, n
     sync_human_agent_roster($&hub.st, au.human_id + "", aid + "", cred_id + "", "agent_cert", lbl + "", &sr.scopes, next_ost + "", iat, exp) or (err) {
         << err_resp(500, "ERR_INTERNAL", "failed syncing human agent roster", 0, 0, 0)
     }
+    log_event_json(hub.log_ch, now, "human_control",
+        "\"action\":\"grant\",\"human_id\":" + json.quote(&au.human_id) + ",\"agent_id\":" + json.quote(&aid) + ",\"cred_id\":" + json.quote(&cred_id))
     << json_resp(200, "{\"ok\":true,\"human_id\":" + json.quote(&au.human_id) + ",\"agent_id\":" + json.quote(&aid) + ",\"cred_id\":" + json.quote(&cred_id) + ",\"kind\":\"agent_cert\",\"status\":" + json.quote(&next_ost) + "}")
 }
 
@@ -1067,6 +1071,8 @@ pub fn handle_human_suspend_agent(hub $&HubState, req &HttpReq, aid string, now 
         << err_resp(500, "ERR_INTERNAL", "failed suspending agent", 0, 0, 0)
     }
     hub_disconnect_agent(hub, aid + "")
+    log_event_json(hub.log_ch, now, "human_control",
+        "\"action\":\"suspend\",\"human_id\":" + json.quote(&au.human_id) + ",\"agent_id\":" + json.quote(&aid))
     << json_resp(200, "{\"ok\":true,\"agent_id\":" + json.quote(&aid) + ",\"ownership_status\":\"suspended\"}")
 }
 
@@ -1082,6 +1088,8 @@ pub fn handle_human_resume_agent(hub $&HubState, req &HttpReq, aid string, now i
     update_owned_agent_ownership_status(hub, aid + "", &ag, "active", "", ag.status + "", "null", "", "", now) or (err) {
         << err_resp(500, "ERR_INTERNAL", "failed resuming agent", 0, 0, 0)
     }
+    log_event_json(hub.log_ch, now, "human_control",
+        "\"action\":\"resume\",\"human_id\":" + json.quote(&au.human_id) + ",\"agent_id\":" + json.quote(&aid))
     << json_resp(200, "{\"ok\":true,\"agent_id\":" + json.quote(&aid) + ",\"ownership_status\":\"active\"}")
 }
 
@@ -1128,6 +1136,8 @@ pub fn handle_human_revoke_agent(hub $&HubState, req &HttpReq, aid string, now i
     append_jsonl_quiet(hub.st.data_dir + "/keys/revoked.jsonl", rev_line)
     mark_agent_revoked($&hub.st, aid + "")
     hub_disconnect_agent(hub, aid + "")
+    log_event_json(hub.log_ch, now, "human_control",
+        "\"action\":\"revoke_agent\",\"human_id\":" + json.quote(&au.human_id) + ",\"agent_id\":" + json.quote(&aid))
     << json_resp(200, "{\"ok\":true,\"agent_id\":" + json.quote(&aid) + ",\"status\":\"revoked\",\"revoked_by\":" + json.quote(&au.human_id) + ",\"successor_id\":" + succ_json + "}")
 }
 
@@ -1213,5 +1223,7 @@ pub fn handle_human_update_agent_policy(hub $&HubState, req &HttpReq, aid string
         ag.status + "", "null", &ag.pub_pem, kh_json, &ag.name, &ag.bio, now, ext_json, own_json, sig_json) or (err) {
         << err_resp(500, "ERR_INTERNAL", "failed updating agent policy", 0, 0, 0)
     }
+    log_event_json(hub.log_ch, now, "human_control",
+        "\"action\":\"policy\",\"human_id\":" + json.quote(&au.human_id) + ",\"agent_id\":" + json.quote(&aid) + ",\"dm_policy\":" + json.quote(&dmp) + ",\"accept_email\":" + ae_s)
     << json_resp(200, "{\"ok\":true,\"agent_id\":" + json.quote(&aid) + ",\"dm_policy\":" + json.quote(&dmp) + ",\"accept_email\":" + ae_s + "}")
 }
