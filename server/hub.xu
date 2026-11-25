@@ -344,6 +344,19 @@ fn dispatch_http(hub $&HubState, req &HttpReq, now int) HttpResp {
         if method != "POST" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
         << handle_revoke($&hub.st, req, now)
     }
+    if path == "/v1/agents/docs" {
+        if method != "GET" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+        << handle_agent_docs_list($&hub.st, req, now)
+    }
+    if strings.has_prefix(&path, "/v1/agents/docs/") {
+        kind := path[16:path.len]
+        if !strings.contains(&kind, "/") {
+            if method == "GET" { << handle_agent_doc_get($&hub.st, req, kind, now) }
+            if method == "PUT" { << handle_agent_doc_put(hub, req, kind, now) }
+            if method == "DELETE" { << handle_agent_doc_delete(hub, req, kind, now) }
+            << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0)
+        }
+    }
 
     if path == "/v1/humans/register" {
         if method != "POST" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
@@ -391,6 +404,18 @@ fn dispatch_http(hub $&HubState, req &HttpReq, now int) HttpResp {
                 if method != "PUT" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
                 << handle_human_update_agent_policy(hub, req, aid, now)
             }
+            if act == "docs" {
+                if method != "GET" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+                << handle_human_agent_docs_list($&hub.st, req, aid, now)
+            }
+        }
+        if parts.len == 3 && parts[1] == "docs" {
+            aid := parts[0] + ""
+            kind := parts[2] + ""
+            if method == "GET" { << handle_human_agent_doc_get($&hub.st, req, aid, kind, now) }
+            if method == "PUT" { << handle_human_agent_doc_put(hub, req, aid, kind, now) }
+            if method == "DELETE" { << handle_human_agent_doc_delete(hub, req, aid, kind, now) }
+            << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0)
         }
     }
 
@@ -491,6 +516,18 @@ fn dispatch_http(hub $&HubState, req &HttpReq, now int) HttpResp {
 
     if strings.has_prefix(&path, "/k/") && method == "GET" {
         rest := path[3:path.len]
+        if strings.contains(&rest, "/") {
+            parts := strings.split(&rest, "/")
+            if parts.len == 2 {
+                aid := parts[0] + ""
+                sub := parts[1] + ""
+                if sub == "docs.json" { << handle_public_docs_list(&hub.st, aid) }
+                if sub == "soul.json" { << handle_public_doc_get(&hub.st, aid, "soul", false) }
+                if sub == "soul.md" { << handle_public_doc_get(&hub.st, aid, "soul", true) }
+                if sub == "rules.json" { << handle_public_doc_get(&hub.st, aid, "rules", false) }
+                if sub == "rules.md" { << handle_public_doc_get(&hub.st, aid, "rules", true) }
+            }
+        }
         if strings.has_suffix(&rest, ".json") {
             << handle_get_key_json(&hub.st, rest[0:(rest.len - 5)])
         }

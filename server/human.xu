@@ -1179,6 +1179,18 @@ pub fn handle_human_update_agent_policy(hub $&HubState, req &HttpReq, aid string
         if odoc.has(en, "lang") { lang_s = json_encode_or(&odoc, odoc.get(en, "lang"), "") }
     }
 
+    $next_name := ag.name + ""
+    if doc.has(r, "name") && !doc.is_null(doc.get(r, "name")) {
+        if !doc.is_string(doc.get(r, "name")) {
+            << err_resp(400, "ERR_BAD_REQUEST", "name must be string", 0, 0, 0)
+        }
+        nn := json_str_or(&doc, doc.get(r, "name"), "")
+        if has_forbidden_ctrl(&nn) || utf8_char_count(&nn) > 32 {
+            << err_resp(400, "ERR_BAD_REQUEST", "name must be <=32 chars with no control chars", 0, 0, 0)
+        }
+        next_name = nn
+    }
+
     if doc.has(r, "dm_policy") {
         nv := json_str_or(&doc, doc.get(r, "dm_policy"), "")
         if nv != "friends" && nv != "all" && nv != "none" {
@@ -1220,10 +1232,10 @@ pub fn handle_human_update_agent_policy(hub $&HubState, req &HttpReq, aid string
     }
     own_json := preserve_ownership_json(&odoc)
     rewrite_agent_doc_full($&hub.st, &odoc, aid + "", ag.created_at, ag.revision + 1, ag.key_version,
-        ag.status + "", "null", &ag.pub_pem, kh_json, &ag.name, &ag.bio, now, ext_json, own_json, sig_json) or (err) {
+        ag.status + "", "null", &ag.pub_pem, kh_json, &next_name, &ag.bio, now, ext_json, own_json, sig_json) or (err) {
         << err_resp(500, "ERR_INTERNAL", "failed updating agent policy", 0, 0, 0)
     }
     log_event_json(hub.log_ch, now, "human_control",
         "\"action\":\"policy\",\"human_id\":" + json.quote(&au.human_id) + ",\"agent_id\":" + json.quote(&aid) + ",\"dm_policy\":" + json.quote(&dmp) + ",\"accept_email\":" + ae_s)
-    << json_resp(200, "{\"ok\":true,\"agent_id\":" + json.quote(&aid) + ",\"dm_policy\":" + json.quote(&dmp) + ",\"accept_email\":" + ae_s + "}")
+    << json_resp(200, "{\"ok\":true,\"agent_id\":" + json.quote(&aid) + ",\"name\":" + json.quote(&next_name) + ",\"dm_policy\":" + json.quote(&dmp) + ",\"accept_email\":" + ae_s + "}")
 }

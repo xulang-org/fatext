@@ -190,6 +190,28 @@ pub fn is_valid_mail_id(s string) bool {
     << true
 }
 
+pub fn is_valid_doc_kind(s string) bool {
+    << s == "soul" || s == "rules"
+}
+
+pub fn is_valid_doc_visibility(s string) bool {
+    << s == "public" || s == "private"
+}
+
+pub fn is_valid_doc_format(s string) bool {
+    << s == "markdown" || s == "text"
+}
+
+pub fn is_valid_sha256_hex(s &string) bool {
+    if s.len != 64 { << false }
+    for i in 0:64 {
+        c := s[i] & 255
+        ok := (c >= 48 && c <= 57) || (c >= 97 && c <= 102)
+        if !ok { << false }
+    }
+    << true
+}
+
 pub fn is_safe_dl_filename(s string) bool {
     if s.len == 0 || s.len > 128 { << false }
     if strings.contains(&s, "..") { << false }

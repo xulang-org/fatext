@@ -1,0 +1,569 @@
+@main
+
+#os
+#strconv
+#strings
+#time
+#crypto/sha256
+#encoding/json
+
+pub const DOC_MAX_PLAIN_BYTES = 65536
+pub const DOC_MAX_ENVELOPE_BYTES = 131072
+
+pub struct AgentDocSummary {
+    pub found bool
+    pub agent_id string
+    pub kind string
+    pub version int
+    pub visibility string
+    pub locked bool
+    pub locked_by string
+    pub format string
+    pub content_sha256 string
+    pub content_bytes int
+    pub content string
+    pub signed_by string
+    pub signer_id string
+    pub signer_key_version int
+    pub updated_at int
+    pub signature string
+    pub raw_json string
+}
+
+pub struct DocEnvCheck {
+    pub ok bool
+    pub status int
+    pub code string
+    pub message string
+    pub env_json string
+}
+
+fn empty_doc_summary(aid string, kind string) AgentDocSummary {
+    << AgentDocSummary{
+        found: false,
+        agent_id: aid,
+        kind: kind,
+        version: 0,
+        visibility: "",
+        locked: false,
+        locked_by: "",
+        format: "markdown",
+        content_sha256: "",
+        content_bytes: 0,
+        content: "",
+        signed_by: "",
+        signer_id: "",
+        signer_key_version: 0,
+        updated_at: 0,
+        signature: "",
+        raw_json: ""
+    }
+}
+
+pub fn canonical_doc_payload(
+    agent_id string,
+    content_sha256 string,
+    kind string,
+    locked bool,
+    signer_id string,
+    signer_key_version int,
+    updated_at int,
+    version int,
+    visibility string
+) string {
+    $lck := "false"
+    if locked { lck = "true" }
+    << "{\"agent_id\":" + json.quote(&agent_id) +
+        ",\"content_sha256\":" + json.quote(&content_sha256) +
+        ",\"kind\":" + json.quote(&kind) +
+        ",\"locked\":" + lck +
+        ",\"signer_id\":" + json.quote(&signer_id) +
+        ",\"signer_key_version\":" + strconv.itoa(signer_key_version) +
+        ",\"updated_at\":" + strconv.itoa(updated_at) +
+        ",\"version\":" + strconv.itoa(version) +
+        ",\"visibility\":" + json.quote(&visibility) + "}"
+}
+
+pub fn read_agent_doc(st &State, agent_id string, kind string) AgentDocSummary {
+    $out := empty_doc_summary(agent_id + "", kind + "")
+    if !is_valid_agent_id(agent_id + "") || !is_valid_doc_kind(kind + "") {
+        << out
+    }
+    raw := os.read(agent_doc_path(st, agent_id + "", kind + "")) or (err) { << out }
+    doc := json.parse(&raw)
+    if !doc.ok() || !doc.is_dict(doc.root()) { << out }
+    r := doc.root()
+    out.found = true
+    out.raw_json = raw
+    if doc.has(r, "version") { out.version = json_int_or(&doc, doc.get(r, "version"), 0) }
+    if doc.has(r, "visibility") { out.visibility = json_str_or(&doc, doc.get(r, "visibility"), "public") }
+    if doc.has(r, "locked") { out.locked = json_bool_or(&doc, doc.get(r, "locked"), false) }
+    if doc.has(r, "locked_by") { out.locked_by = json_str_or(&doc, doc.get(r, "locked_by"), "") }
+    if doc.has(r, "format") { out.format = json_str_or(&doc, doc.get(r, "format"), "markdown") }
+    if doc.has(r, "content_sha256") { out.content_sha256 = json_str_or(&doc, doc.get(r, "content_sha256"), "") }
+    if doc.has(r, "content_bytes") { out.content_bytes = json_int_or(&doc, doc.get(r, "content_bytes"), 0) }
+    if doc.has(r, "content") && !doc.is_null(doc.get(r, "content")) {
+        out.content = json_str_or(&doc, doc.get(r, "content"), "")
+    }
+    if doc.has(r, "signed_by") { out.signed_by = json_str_or(&doc, doc.get(r, "signed_by"), "") }
+    if doc.has(r, "signer_id") { out.signer_id = json_str_or(&doc, doc.get(r, "signer_id"), "") }
+    if doc.has(r, "signer_key_version") { out.signer_key_version = json_int_or(&doc, doc.get(r, "signer_key_version"), 0) }
+    if doc.has(r, "updated_at") { out.updated_at = json_int_or(&doc, doc.get(r, "updated_at"), 0) }
+    if doc.has(r, "signature") { out.signature = json_str_or(&doc, doc.get(r, "signature"), "") }
+    << out
+}
+
+pub fn doc_meta_json(d &AgentDocSummary) string {
+    if !d.found { << "null" }
+    $lck := "false"
+    if d.locked { lck = "true" }
+    << "{\"agent_id\":" + json.quote(&d.agent_id) +
+        ",\"kind\":" + json.quote(&d.kind) +
+        ",\"version\":" + strconv.itoa(d.version) +
+        ",\"visibility\":" + json.quote(&d.visibility) +
+        ",\"locked\":" + lck +
+        ",\"locked_by\":" + json.quote(&d.locked_by) +
+        ",\"format\":" + json.quote(&d.format) +
+        ",\"content_sha256\":" + json.quote(&d.content_sha256) +
+        ",\"content_bytes\":" + strconv.itoa(d.content_bytes) +
+        ",\"signed_by\":" + json.quote(&d.signed_by) +
+        ",\"signer_id\":" + json.quote(&d.signer_id) +
+        ",\"signer_key_version\":" + strconv.itoa(d.signer_key_version) +
+        ",\"updated_at\":" + strconv.itoa(d.updated_at) +
+        ",\"signature\":" + json.quote(&d.signature) + "}"
+}
+
+fn env_err(status int, code string, msg string) DocEnvCheck {
+    << DocEnvCheck{ok: false, status: status, code: code, message: msg, env_json: ""}
+}
+
+fn validate_doc_envelope(doc &json.Doc, env_node int, agent_id string, owner_human_id string) DocEnvCheck {
+    if env_node < 0 || !doc.is_dict(env_node) {
+        << env_err(400, "ERR_BAD_REQUEST", "envelope must be a JSON object")
+    }
+    if !doc.has(env_node, "v") || !doc.has(env_node, "alg") || !doc.has(env_node, "iv") || !doc.has(env_node, "ct") || !doc.has(env_node, "recipients") {
+        << env_err(400, "ERR_BAD_REQUEST", "envelope missing required fields")
+    }
+    v := json_int_or(doc, doc.get(env_node, "v"), 0)
+    alg := json_str_or(doc, doc.get(env_node, "alg"), "")
+    iv := json_str_or(doc, doc.get(env_node, "iv"), "")
+    ct := json_str_or(doc, doc.get(env_node, "ct"), "")
+    if v != 1 || alg != "RSA-OAEP-256+A256GCM" {
+        << env_err(400, "ERR_BAD_REQUEST", "envelope must use v=1 and alg=RSA-OAEP-256+A256GCM")
+    }
+    if iv.len == 0 || iv.len > 64 || ct.len == 0 {
+        << env_err(400, "ERR_BAD_REQUEST", "invalid envelope iv or ct")
+    }
+    recs := doc.get(env_node, "recipients")
+    if !doc.is_list(recs) {
+        << env_err(400, "ERR_BAD_REQUEST", "envelope.recipients must be array")
+    }
+    rcnt := doc.count(recs)
+    if rcnt < 1 || rcnt > 4 {
+        << env_err(400, "ERR_BAD_REQUEST", "envelope.recipients count must be 1..4")
+    }
+
+    $has_agent_rec := false
+    $has_human_rec := false
+    for i in 0:rcnt {
+        rn := doc.at(recs, i)
+        if !doc.is_dict(rn) || !doc.has(rn, "role") || !doc.has(rn, "id") || !doc.has(rn, "key_version") || !doc.has(rn, "ek") {
+            << env_err(400, "ERR_BAD_REQUEST", "recipient entry missing role, id, key_version, or ek")
+        }
+        role := json_str_or(doc, doc.get(rn, "role"), "")
+        rid := json_str_or(doc, doc.get(rn, "id"), "")
+        rkv := json_int_or(doc, doc.get(rn, "key_version"), 0)
+        rek := json_str_or(doc, doc.get(rn, "ek"), "")
+        if rkv < 1 || rek.len == 0 || rek.len > 2048 {
+            << env_err(400, "ERR_BAD_REQUEST", "recipient key_version or ek invalid")
+        }
+        if role == "agent" {
+            if !is_valid_agent_id(rid + "") {
+                << env_err(400, "ERR_BAD_REQUEST", "recipient agent id invalid")
+            }
+            if rid == agent_id { has_agent_rec = true }
+        } else if role == "human" {
+            if !is_valid_human_id(rid + "") {
+                << env_err(400, "ERR_BAD_REQUEST", "recipient human id invalid")
+            }
+            if owner_human_id.len > 0 && rid == owner_human_id { has_human_rec = true }
+        } else {
+            << env_err(400, "ERR_BAD_REQUEST", "recipient role must be agent or human")
+        }
+    }
+
+    if !has_agent_rec {
+        << env_err(400, "ERR_BAD_REQUEST", "private doc must include target agent recipient")
+    }
+    if owner_human_id.len > 0 && !has_human_rec {
+        << env_err(400, "ERR_BAD_REQUEST", "private doc for human-owned agent must include owning human recipient")
+    }
+
+    env_json := json_encode_or(doc, env_node, "")
+    if env_json.len == 0 || env_json.len > DOC_MAX_ENVELOPE_BYTES {
+        << env_err(413, "ERR_PAYLOAD_TOO_LARGE", "encrypted doc envelope exceeds size limit")
+    }
+    << DocEnvCheck{ok: true, status: 200, code: "", message: "", env_json: env_json}
+}
+
+fn store_agent_doc(
+    hub $&HubState,
+    aid string,
+    ag &AgentSummary,
+    kind string,
+    actor_type string,
+    signer_id string,
+    signer_kv int,
+    signer_pub_pem &string,
+    body &string,
+    now int
+) HttpResp {
+    doc := json.parse(body)
+    if !doc.ok() || !doc.is_dict(doc.root()) {
+        << err_resp(400, "ERR_BAD_REQUEST", "invalid JSON body", 0, 0, 0)
+    }
+    r := doc.root()
+
+    cur := read_agent_doc(&hub.st, aid + "", kind + "")
+    if actor_type == "agent" && cur.found && cur.locked {
+        << err_resp(403, "ERR_DOC_LOCKED", "document is locked by owning human", 0, 0, 0)
+    }
+
+    if !doc.has(r, "version") {
+        << err_resp(400, "ERR_BAD_REQUEST", "missing version", 0, 0, 0)
+    }
+    ver := doc.as_int(doc.get(r, "version")) or (err) {
+        << err_resp(400, "ERR_BAD_REQUEST", "version must be integer", 0, 0, 0)
+    }
+    expected_ver := cur.version + 1
+    if ver != expected_ver {
+        << err_resp(400, "ERR_VERSION_NOT_MONOTONIC", "version must equal current version + 1 (" + strconv.itoa(expected_ver) + ")", 0, 0, 0)
+    }
+
+    if !doc.has(r, "visibility") || !doc.is_string(doc.get(r, "visibility")) {
+        << err_resp(400, "ERR_BAD_REQUEST", "missing or invalid visibility", 0, 0, 0)
+    }
+    vis := json_str_or(&doc, doc.get(r, "visibility"), "")
+    if !is_valid_doc_visibility(vis + "") {
+        << err_resp(400, "ERR_BAD_REQUEST", "visibility must be public or private", 0, 0, 0)
+    }
+
+    $fmt := "markdown"
+    if doc.has(r, "format") && !doc.is_null(doc.get(r, "format")) {
+        if !doc.is_string(doc.get(r, "format")) {
+            << err_resp(400, "ERR_BAD_REQUEST", "format must be string", 0, 0, 0)
+        }
+        fmt = json_str_or(&doc, doc.get(r, "format"), "")
+        if !is_valid_doc_format(fmt + "") {
+            << err_resp(400, "ERR_BAD_REQUEST", "format must be markdown or text", 0, 0, 0)
+        }
+    }
+
+    $locked := false
+    if doc.has(r, "locked") {
+        if !doc.is_bool(doc.get(r, "locked")) {
+            << err_resp(400, "ERR_BAD_REQUEST", "locked must be boolean", 0, 0, 0)
+        }
+        locked = doc.as_bool(doc.get(r, "locked")) or (err) { << err_resp(400, "ERR_BAD_REQUEST", "invalid locked", 0, 0, 0) }
+    }
+    if actor_type == "agent" && locked {
+        << err_resp(403, "ERR_FORBIDDEN", "only owning human can lock documents", 0, 0, 0)
+    }
+
+    if !doc.has(r, "content_sha256") || !doc.is_string(doc.get(r, "content_sha256")) {
+        << err_resp(400, "ERR_BAD_REQUEST", "missing content_sha256", 0, 0, 0)
+    }
+    csha := json_str_or(&doc, doc.get(r, "content_sha256"), "")
+    if !is_valid_sha256_hex(&csha) {
+        << err_resp(400, "ERR_BAD_REQUEST", "content_sha256 must be 64-char lowercase hex", 0, 0, 0)
+    }
+
+    if !doc.has(r, "updated_at") {
+        << err_resp(400, "ERR_BAD_REQUEST", "missing updated_at", 0, 0, 0)
+    }
+    uat := doc.as_int(doc.get(r, "updated_at")) or (err) {
+        << err_resp(400, "ERR_BAD_REQUEST", "updated_at must be integer", 0, 0, 0)
+    }
+    diff := now - uat
+    if diff > 60 || diff < -60 {
+        << err_resp(401, "ERR_CLOCK_SKEW", "updated_at skew exceeds 60s", 0, 0, 0)
+    }
+
+    if !doc.has(r, "signature") || !doc.is_string(doc.get(r, "signature")) {
+        << err_resp(400, "ERR_BAD_REQUEST", "missing signature", 0, 0, 0)
+    }
+    sig := json_str_or(&doc, doc.get(r, "signature"), "")
+    if sig.len == 0 {
+        << err_resp(400, "ERR_BAD_REQUEST", "empty signature", 0, 0, 0)
+    }
+
+    $content := ""
+    $cbytes := 0
+    $env_json := "null"
+    if vis == "public" {
+        if !doc.has(r, "content") || !doc.is_string(doc.get(r, "content")) {
+            << err_resp(400, "ERR_BAD_REQUEST", "public doc requires string content", 0, 0, 0)
+        }
+        content = doc.as_string(doc.get(r, "content")) or (err) {
+            << err_resp(400, "ERR_BAD_REQUEST", "invalid content string", 0, 0, 0)
+        }
+        if content.len > DOC_MAX_PLAIN_BYTES {
+            << err_resp(413, "ERR_PAYLOAD_TOO_LARGE", "content exceeds 65536 bytes", 0, 0, 0)
+        }
+        if has_forbidden_ctrl(&content) {
+            << err_resp(400, "ERR_BAD_REQUEST", "forbidden control characters in content", 0, 0, 0)
+        }
+        if sha256.sum256(content + "") != csha {
+            << err_resp(400, "ERR_BAD_REQUEST", "content_sha256 does not match content", 0, 0, 0)
+        }
+        cbytes = content.len
+    } else {
+        if doc.has(r, "content") && !doc.is_null(doc.get(r, "content")) {
+            pv := json_str_or(&doc, doc.get(r, "content"), "X")
+            if pv.len > 0 {
+                << err_resp(400, "ERR_BAD_REQUEST", "private doc must not include plaintext content", 0, 0, 0)
+            }
+        }
+        if !doc.has(r, "content_bytes") {
+            << err_resp(400, "ERR_BAD_REQUEST", "private doc requires content_bytes", 0, 0, 0)
+        }
+        cbytes = doc.as_int(doc.get(r, "content_bytes")) or (err) {
+            << err_resp(400, "ERR_BAD_REQUEST", "content_bytes must be integer", 0, 0, 0)
+        }
+        if cbytes < 0 || cbytes > DOC_MAX_PLAIN_BYTES {
+            << err_resp(413, "ERR_PAYLOAD_TOO_LARGE", "content_bytes exceeds 65536 bytes", 0, 0, 0)
+        }
+        if !doc.has(r, "envelope") {
+            << err_resp(400, "ERR_BAD_REQUEST", "private doc requires envelope", 0, 0, 0)
+        }
+        ec := validate_doc_envelope(&doc, doc.get(r, "envelope"), aid + "", ag.owner_human_id + "")
+        if !ec.ok {
+            << err_resp(ec.status, ec.code, ec.message, 0, 0, 0)
+        }
+        env_json = ec.env_json
+    }
+
+    spk := parse_spki_rsa_pem(signer_pub_pem) or (err) {
+        << err_resp(500, "ERR_INTERNAL", "stored signer public key invalid", 0, 0, 0)
+    }
+    canon := canonical_doc_payload(aid + "", csha + "", kind + "", locked, signer_id + "", signer_kv, uat, ver, vis + "")
+    if !verify_pss_message(&spk, &canon, sig + "") {
+        << err_resp(401, "ERR_BAD_SIGNATURE", "document RSA-PSS signature verification failed", 0, 0, 0)
+    }
+
+    $locked_by := ""
+    $lck_s := "false"
+    if locked {
+        locked_by = signer_id + ""
+        lck_s = "true"
+    }
+    $content_json := "null"
+    if vis == "public" {
+        content_json = json.quote(&content)
+    }
+
+    doc_json := "{" +
+        "\"agent_id\":" + json.quote(&aid) + "," +
+        "\"kind\":" + json.quote(&kind) + "," +
+        "\"version\":" + strconv.itoa(ver) + "," +
+        "\"visibility\":" + json.quote(&vis) + "," +
+        "\"locked\":" + lck_s + "," +
+        "\"locked_by\":" + json.quote(&locked_by) + "," +
+        "\"format\":" + json.quote(&fmt) + "," +
+        "\"content_sha256\":" + json.quote(&csha) + "," +
+        "\"content_bytes\":" + strconv.itoa(cbytes) + "," +
+        "\"content\":" + content_json + "," +
+        "\"envelope\":" + env_json + "," +
+        "\"signed_by\":" + json.quote(&actor_type) + "," +
+        "\"signer_id\":" + json.quote(&signer_id) + "," +
+        "\"signer_key_version\":" + strconv.itoa(signer_kv) + "," +
+        "\"updated_at\":" + strconv.itoa(uat) + "," +
+        "\"signature\":" + json.quote(&sig) +
+        "}\n"
+
+    ddir := agent_doc_dir(&hub.st, aid + "")
+    os.mkdir_all(ddir) or (err) {
+        << err_resp(500, "ERR_INTERNAL", "failed creating docs dir", 0, 0, 0)
+    }
+    write_atomic(agent_doc_path(&hub.st, aid + "", kind + ""), &doc_json) or (err) {
+        << err_resp(500, "ERR_INTERNAL", "failed persisting document", 0, 0, 0)
+    }
+
+    log_event_json(hub.log_ch, now, "doc_update",
+        "\"action\":\"put\"" +
+        ",\"actor_type\":" + json.quote(&actor_type) +
+        ",\"actor_id\":" + json.quote(&signer_id) +
+        ",\"agent_id\":" + json.quote(&aid) +
+        ",\"doc_kind\":" + json.quote(&kind) +
+        ",\"version\":" + strconv.itoa(ver) +
+        ",\"visibility\":" + json.quote(&vis) +
+        ",\"locked\":" + lck_s +
+        ",\"content_bytes\":" + strconv.itoa(cbytes) +
+        ",\"content_sha256\":" + json.quote(&csha))
+
+    if actor_type == "human" {
+        saved := read_agent_doc(&hub.st, aid + "", kind + "")
+        meta_s := doc_meta_json(&saved)
+        _ := hub_push_to_agent(hub, aid + "", "doc_update", &meta_s)
+    }
+
+    << json_resp(200, doc_json)
+}
+
+pub fn handle_agent_docs_list(st $&State, req &HttpReq, now int) HttpResp {
+    au := authenticate_scoped(st, req, now, "")
+    if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
+    sd := read_agent_doc(st, au.agent_id + "", "soul")
+    rd := read_agent_doc(st, au.agent_id + "", "rules")
+    << json_resp(200, "{\"agent_id\":" + json.quote(&au.agent_id) + ",\"soul\":" + doc_meta_json(&sd) + ",\"rules\":" + doc_meta_json(&rd) + "}")
+}
+
+pub fn handle_agent_doc_get(st $&State, req &HttpReq, kind string, now int) HttpResp {
+    if !is_valid_doc_kind(kind + "") {
+        << err_resp(404, "ERR_NOT_FOUND", "unknown document kind", 0, 0, 0)
+    }
+    au := authenticate_scoped(st, req, now, "")
+    if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
+    raw := os.read(agent_doc_path(st, au.agent_id + "", kind + "")) or (err) {
+        << err_resp(404, "ERR_NOT_FOUND", kind + " document not found", 0, 0, 0)
+    }
+    << json_resp(200, raw)
+}
+
+pub fn handle_agent_doc_put(hub $&HubState, req &HttpReq, kind string, now int) HttpResp {
+    if !is_valid_doc_kind(kind + "") {
+        << err_resp(404, "ERR_NOT_FOUND", "unknown document kind", 0, 0, 0)
+    }
+    au := authenticate_scoped($&hub.st, req, now, "profile")
+    if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
+    body := req.body()
+    << store_agent_doc(hub, au.agent_id + "", &au.agent, kind + "", "agent", au.agent_id + "", au.key_version, &au.agent.pub_pem, &body, now)
+}
+
+pub fn handle_agent_doc_delete(hub $&HubState, req &HttpReq, kind string, now int) HttpResp {
+    if !is_valid_doc_kind(kind + "") {
+        << err_resp(404, "ERR_NOT_FOUND", "unknown document kind", 0, 0, 0)
+    }
+    au := authenticate_scoped($&hub.st, req, now, "profile")
+    if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
+    cur := read_agent_doc(&hub.st, au.agent_id + "", kind + "")
+    if !cur.found {
+        << err_resp(404, "ERR_NOT_FOUND", kind + " document not found", 0, 0, 0)
+    }
+    if cur.locked {
+        << err_resp(403, "ERR_DOC_LOCKED", "document is locked by owning human", 0, 0, 0)
+    }
+    p := agent_doc_path(&hub.st, au.agent_id + "", kind + "")
+    os.remove(p + "") or (err) {
+        << err_resp(500, "ERR_INTERNAL", "failed removing document", 0, 0, 0)
+    }
+    log_event_json(hub.log_ch, now, "doc_update",
+        "\"action\":\"delete\",\"actor_type\":\"agent\",\"actor_id\":" + json.quote(&au.agent_id) +
+        ",\"agent_id\":" + json.quote(&au.agent_id) + ",\"doc_kind\":" + json.quote(&kind))
+    << json_resp(200, "{\"ok\":true,\"agent_id\":" + json.quote(&au.agent_id) + ",\"kind\":" + json.quote(&kind) + ",\"deleted\":true}")
+}
+
+pub fn handle_human_agent_docs_list(st $&State, req &HttpReq, aid string, now int) HttpResp {
+    au := authenticate_human(st, req, now)
+    if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
+    if !is_valid_agent_id(aid + "") { << err_resp(404, "ERR_NOT_FOUND", "agent not found", 0, 0, 0) }
+    ag := read_agent_summary(st, aid + "")
+    if !ag.found { << err_resp(404, "ERR_NOT_FOUND", "agent not found", 0, 0, 0) }
+    if ag.owner_human_id != au.human_id { << err_resp(403, "ERR_FORBIDDEN", "not owner of agent", 0, 0, 0) }
+    sd := read_agent_doc(st, aid + "", "soul")
+    rd := read_agent_doc(st, aid + "", "rules")
+    << json_resp(200, "{\"agent_id\":" + json.quote(&aid) + ",\"human_id\":" + json.quote(&au.human_id) + ",\"soul\":" + doc_meta_json(&sd) + ",\"rules\":" + doc_meta_json(&rd) + "}")
+}
+
+pub fn handle_human_agent_doc_get(st $&State, req &HttpReq, aid string, kind string, now int) HttpResp {
+    if !is_valid_doc_kind(kind + "") {
+        << err_resp(404, "ERR_NOT_FOUND", "unknown document kind", 0, 0, 0)
+    }
+    au := authenticate_human(st, req, now)
+    if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
+    if !is_valid_agent_id(aid + "") { << err_resp(404, "ERR_NOT_FOUND", "agent not found", 0, 0, 0) }
+    ag := read_agent_summary(st, aid + "")
+    if !ag.found { << err_resp(404, "ERR_NOT_FOUND", "agent not found", 0, 0, 0) }
+    if ag.owner_human_id != au.human_id { << err_resp(403, "ERR_FORBIDDEN", "not owner of agent", 0, 0, 0) }
+    raw := os.read(agent_doc_path(st, aid + "", kind + "")) or (err) {
+        << err_resp(404, "ERR_NOT_FOUND", kind + " document not found", 0, 0, 0)
+    }
+    << json_resp(200, raw)
+}
+
+pub fn handle_human_agent_doc_put(hub $&HubState, req &HttpReq, aid string, kind string, now int) HttpResp {
+    if !is_valid_doc_kind(kind + "") {
+        << err_resp(404, "ERR_NOT_FOUND", "unknown document kind", 0, 0, 0)
+    }
+    au := authenticate_human($&hub.st, req, now)
+    if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
+    if !is_valid_agent_id(aid + "") { << err_resp(404, "ERR_NOT_FOUND", "agent not found", 0, 0, 0) }
+    ag := read_agent_summary(&hub.st, aid + "")
+    if !ag.found { << err_resp(404, "ERR_NOT_FOUND", "agent not found", 0, 0, 0) }
+    if ag.owner_human_id != au.human_id { << err_resp(403, "ERR_FORBIDDEN", "not owner of agent", 0, 0, 0) }
+    if ag.status == "revoked" { << err_resp(403, "ERR_REVOKED", "agent is permanently revoked", 0, 0, 0) }
+    body := req.body()
+    << store_agent_doc(hub, aid + "", &ag, kind + "", "human", au.human_id + "", au.key_version, &au.human.pub_pem, &body, now)
+}
+
+pub fn handle_human_agent_doc_delete(hub $&HubState, req &HttpReq, aid string, kind string, now int) HttpResp {
+    if !is_valid_doc_kind(kind + "") {
+        << err_resp(404, "ERR_NOT_FOUND", "unknown document kind", 0, 0, 0)
+    }
+    au := authenticate_human($&hub.st, req, now)
+    if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
+    if !is_valid_agent_id(aid + "") { << err_resp(404, "ERR_NOT_FOUND", "agent not found", 0, 0, 0) }
+    ag := read_agent_summary(&hub.st, aid + "")
+    if !ag.found { << err_resp(404, "ERR_NOT_FOUND", "agent not found", 0, 0, 0) }
+    if ag.owner_human_id != au.human_id { << err_resp(403, "ERR_FORBIDDEN", "not owner of agent", 0, 0, 0) }
+    if ag.status == "revoked" { << err_resp(403, "ERR_REVOKED", "agent is permanently revoked", 0, 0, 0) }
+    p := agent_doc_path(&hub.st, aid + "", kind + "")
+    _ := os.stat(p + "") or (err) {
+        << err_resp(404, "ERR_NOT_FOUND", kind + " document not found", 0, 0, 0)
+    }
+    os.remove(p + "") or (err) {
+        << err_resp(500, "ERR_INTERNAL", "failed removing document", 0, 0, 0)
+    }
+    log_event_json(hub.log_ch, now, "doc_update",
+        "\"action\":\"delete\",\"actor_type\":\"human\",\"actor_id\":" + json.quote(&au.human_id) +
+        ",\"agent_id\":" + json.quote(&aid) + ",\"doc_kind\":" + json.quote(&kind))
+    del_ev := "{\"agent_id\":" + json.quote(&aid) + ",\"kind\":" + json.quote(&kind) + ",\"deleted\":true}"
+    _ := hub_push_to_agent(hub, aid + "", "doc_update", &del_ev)
+    << json_resp(200, "{\"ok\":true,\"agent_id\":" + json.quote(&aid) + ",\"kind\":" + json.quote(&kind) + ",\"deleted\":true}")
+}
+
+pub fn handle_public_docs_list(st &State, aid string) HttpResp {
+    if !is_valid_agent_id(aid + "") {
+        << err_resp(404, "ERR_NOT_FOUND", "agent not found", 0, 0, 0)
+    }
+    ag := read_agent_summary(st, aid + "")
+    if !ag.found {
+        << err_resp(404, "ERR_NOT_FOUND", "agent not found", 0, 0, 0)
+    }
+    sd := read_agent_doc(st, aid + "", "soul")
+    rd := read_agent_doc(st, aid + "", "rules")
+    << json_resp(200, "{\"agent_id\":" + json.quote(&aid) + ",\"soul\":" + doc_meta_json(&sd) + ",\"rules\":" + doc_meta_json(&rd) + "}")
+}
+
+pub fn handle_public_doc_get(st &State, aid string, kind string, raw_md bool) HttpResp {
+    if !is_valid_agent_id(aid + "") || !is_valid_doc_kind(kind + "") {
+        << err_resp(404, "ERR_NOT_FOUND", "document not found", 0, 0, 0)
+    }
+    d := read_agent_doc(st, aid + "", kind + "")
+    if !d.found {
+        << err_resp(404, "ERR_NOT_FOUND", kind + " document not found", 0, 0, 0)
+    }
+    if d.visibility != "public" {
+        << err_resp(403, "ERR_DOC_PRIVATE", kind + " document is private (E2EE)", 0, 0, 0)
+    }
+    if !raw_md {
+        << json_resp(200, d.raw_json)
+    }
+    $lck_s := "false"
+    if d.locked { lck_s = "true" }
+    extra := "X-Fatext-Version: " + strconv.itoa(d.version) + "\r\n" +
+        "X-Fatext-Sha256: " + d.content_sha256 + "\r\n" +
+        "X-Fatext-Signed-By: " + d.signed_by + "\r\n" +
+        "X-Fatext-Locked: " + lck_s + "\r\n"
+    << http_resp(200, "text/markdown; charset=utf-8", extra, &d.content)
+}

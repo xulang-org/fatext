@@ -187,6 +187,52 @@ pub fn handle_register(st $&State, req &HttpReq, now int) HttpResp {
     if !ec.ok {
         << err_resp(ec.status, ec.code, ec.message, 0, 0, 0)
     }
+
+    $init_name := ""
+    $init_bio := ""
+    if doc.has(r, "name") && !doc.is_null(doc.get(r, "name")) {
+        nv := doc.as_string(doc.get(r, "name")) or (err) {
+            << err_resp(400, "ERR_BAD_REQUEST", "name must be string", 0, 0, 0)
+        }
+        if has_forbidden_ctrl(&nv) || utf8_char_count(&nv) > 32 {
+            << err_resp(400, "ERR_BAD_REQUEST", "profile.name must be <=32 chars with no control chars", 0, 0, 0)
+        }
+        init_name = nv
+    }
+    if doc.has(r, "bio") && !doc.is_null(doc.get(r, "bio")) {
+        bv := doc.as_string(doc.get(r, "bio")) or (err) {
+            << err_resp(400, "ERR_BAD_REQUEST", "bio must be string", 0, 0, 0)
+        }
+        if has_forbidden_ctrl(&bv) || utf8_char_count(&bv) > 256 {
+            << err_resp(400, "ERR_BAD_REQUEST", "profile.bio must be <=256 chars with no control chars", 0, 0, 0)
+        }
+        init_bio = bv
+    }
+    if doc.has(r, "profile") && !doc.is_null(doc.get(r, "profile")) {
+        pn := doc.get(r, "profile")
+        if !doc.is_dict(pn) {
+            << err_resp(400, "ERR_BAD_REQUEST", "profile must be JSON object", 0, 0, 0)
+        }
+        if doc.has(pn, "name") && !doc.is_null(doc.get(pn, "name")) {
+            nv := doc.as_string(doc.get(pn, "name")) or (err) {
+                << err_resp(400, "ERR_BAD_REQUEST", "profile.name must be string", 0, 0, 0)
+            }
+            if has_forbidden_ctrl(&nv) || utf8_char_count(&nv) > 32 {
+                << err_resp(400, "ERR_BAD_REQUEST", "profile.name must be <=32 chars with no control chars", 0, 0, 0)
+            }
+            init_name = nv
+        }
+        if doc.has(pn, "bio") && !doc.is_null(doc.get(pn, "bio")) {
+            bv := doc.as_string(doc.get(pn, "bio")) or (err) {
+                << err_resp(400, "ERR_BAD_REQUEST", "profile.bio must be string", 0, 0, 0)
+            }
+            if has_forbidden_ctrl(&bv) || utf8_char_count(&bv) > 256 {
+                << err_resp(400, "ERR_BAD_REQUEST", "profile.bio must be <=256 chars with no control chars", 0, 0, 0)
+            }
+            init_bio = bv
+        }
+    }
+
     map_set($&st.replay_cache, sig_hash + "", now)
 
     // Mint unique agent_id with O_CREAT | O_EXCL
@@ -220,7 +266,7 @@ pub fn handle_register(st $&State, req &HttpReq, now int) HttpResp {
         "\"successor_id\":null," +
         "\"current_public_key_pem\":" + json.quote(&norm_pem) + "," +
         "\"key_history\":[]," +
-        "\"profile\":{\"name\":\"\",\"bio\":\"\",\"updated_at\":" + strconv.itoa(now) + "}," +
+        "\"profile\":{\"name\":" + json.quote(&init_name) + ",\"bio\":" + json.quote(&init_bio) + ",\"updated_at\":" + strconv.itoa(now) + "}," +
         "\"extensions\":{\"accept_email\":false,\"dm_policy\":\"friends\"}," +
         "\"ownership\":" + ec.ownership_json + "," +
         "\"signature\":null" +
@@ -232,7 +278,7 @@ pub fn handle_register(st $&State, req &HttpReq, now int) HttpResp {
     write_atomic(agent_pem_path(st, aid + ""), &norm_pem) or (err) {
         << err_resp(500, "ERR_INTERNAL", "failed writing public pem", 0, 0, 0)
     }
-    reg_line := "{\"agent_id\":" + json.quote(&aid) + ",\"created_at\":" + strconv.itoa(now) + ",\"key_version\":1,\"revision\":0}"
+    reg_line := "{\"agent_id\":" + json.quote(&aid) + ",\"name\":" + json.quote(&init_name) + ",\"created_at\":" + strconv.itoa(now) + ",\"key_version\":1,\"revision\":0}"
     append_jsonl_quiet(st.data_dir + "/keys/registry.jsonl", reg_line)
 
     if ec.has_enrollment {
@@ -243,7 +289,7 @@ pub fn handle_register(st $&State, req &HttpReq, now int) HttpResp {
     }
 
     fp := pubkey_fingerprint(&norm_pem)
-    $resp := "{\"agent_id\":" + json.quote(&aid) + ",\"created_at\":" + strconv.itoa(now) + ",\"key_version\":1,\"revision\":0,\"fingerprint\":" + json.quote(&fp)
+    $resp := "{\"agent_id\":" + json.quote(&aid) + ",\"name\":" + json.quote(&init_name) + ",\"created_at\":" + strconv.itoa(now) + ",\"key_version\":1,\"revision\":0,\"fingerprint\":" + json.quote(&fp)
     if ec.has_enrollment {
         resp = resp + ",\"human_id\":" + json.quote(&ec.human_id) + ",\"cred_id\":" + json.quote(&ec.cred_id)
     }

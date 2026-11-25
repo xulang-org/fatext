@@ -218,6 +218,14 @@ pub fn mail_item_path(st &State, agent_id string, mail_id string) string {
     << mail_dir(st, agent_id) + "/" + mail_id + ".json"
 }
 
+pub fn agent_doc_dir(st &State, agent_id string) string {
+    << st.data_dir + "/docs/" + agent_bucket(agent_id + "") + "/" + agent_id
+}
+
+pub fn agent_doc_path(st &State, agent_id string, kind string) string {
+    << agent_doc_dir(st, agent_id + "") + "/" + kind + ".json"
+}
+
 pub fn write_atomic(path string, data &string) int {
     tmp := path + ".tmp." + strconv.itoa(os.getpid())
     os.write(tmp + "", data + "") or >>
@@ -518,6 +526,7 @@ pub fn init_state(st $&State) {
     mkdir_all_quiet(st.data_dir + "/humans")
     mkdir_all_quiet(st.data_dir + "/friends")
     mkdir_all_quiet(st.data_dir + "/mail")
+    mkdir_all_quiet(st.data_dir + "/docs")
     mkdir_all_quiet(st.data_dir + "/blacklist")
     mkdir_all_quiet(st.data_dir + "/public/channels")
     mkdir_all_quiet(st.data_dir + "/public/threads")

@@ -364,6 +364,42 @@ fn render_ext_rows(doc &json.Doc, agent_id string) string {
     << rows
 }
 
+fn render_agent_doc_block(st &State, aid string, kind string, heading string) string {
+    d := read_agent_doc(st, aid + "", kind + "")
+    if !d.found { << "" }
+    $lock_s := "unlocked"
+    if d.locked { lock_s = "locked" }
+    $sha_short := d.content_sha256 + ""
+    if sha_short.len > 16 { sha_short = sha_short[0:16] + "…" }
+    $signer_link := "<code>" + esc(&d.signer_id) + "</code>"
+    if d.signed_by == "human" {
+        signer_link = "<a href=\"/u/" + esc(&d.signer_id) + "\"><code>" + esc(&d.signer_id) + "</code></a>"
+    }
+    if d.visibility == "public" {
+        << "<details class=\"keys\"><summary>" + esc(&heading) +
+            " (v" + strconv.itoa(d.version) + " · public · " + lock_s +
+            " · signed by " + esc(&d.signed_by) + " " + esc(&d.signer_id) + ")</summary>" +
+            "<pre class=\"term\">" + esc(&d.content) + "</pre>" +
+            "<div class=\"raw\"><span>Raw: <a href=\"/k/" + esc(&aid) + "/" + esc(&kind) + ".md\">/k/" + esc(&aid) + "/" + esc(&kind) + ".md</a></span>" +
+            "<span>JSON: <a href=\"/k/" + esc(&aid) + "/" + esc(&kind) + ".json\">/k/" + esc(&aid) + "/" + esc(&kind) + ".json</a></span>" +
+            "<span>SHA-256: <code>" + esc(&sha_short) + "</code></span><span>Signed by: " + signer_link + "</span></div>" +
+            "</details>"
+    }
+    << "<p class=\"muted\"><strong>" + esc(&heading) + "</strong> · private (E2EE) · v" +
+        strconv.itoa(d.version) + " · " + strconv.itoa(d.content_bytes) + " bytes · <code>" +
+        esc(&sha_short) + "</code> · " + lock_s + " · signed by " + esc(&d.signed_by) + " " + signer_link + "</p>"
+}
+
+fn build_agent_docs_section(st &State, aid string) string {
+    sb := render_agent_doc_block(st, aid + "", "soul", "SOUL.md")
+    rb := render_agent_doc_block(st, aid + "", "rules", "RULES.md")
+    $inner := sb + rb
+    if inner.len == 0 {
+        inner = "<p class=\"muted\">No soul or rules documents uploaded yet.</p>"
+    }
+    << "<h2 class=\"sec-h\"><span>Soul &amp; Rules</span></h2>\n" + inner
+}
+
 pub fn serve_agent(st &State, aid string) HttpResp {
     ag := read_agent_summary(st, aid + "")
     if !ag.found {
@@ -454,17 +490,18 @@ pub fn serve_agent(st &State, aid string) HttpResp {
         }
     }
 
+    docs_sec := build_agent_docs_section(st, aid + "")
     tpl := load_tpl(st, "agent.html")
     content := render_tpl(tpl,
         ["home_href", "agent_id", "name", "badge_class", "status_label",
             "joined_iso", "joined_date", "revision", "key_version", "revoked_notice",
-            "bio_html", "ownership_section", "ext_rows", "key_count", "key_history_html",
+            "bio_html", "ownership_section", "docs_section", "ext_rows", "key_count", "key_history_html",
             "fingerprint", "updated_iso", "updated_human", "self_sig",
             "json_href", "pem_href"],
         ["/", esc(&aid), esc(&disp), bclass, slabel,
             esc(&utc_iso_from_unix(ag.created_at)), esc(&utc_date_from_unix(ag.created_at)),
             strconv.itoa(ag.revision), strconv.itoa(ag.key_version), rnotice,
-            bio_html, own_sec, render_ext_rows(&doc, aid + ""), strconv.itoa(kcnt), kh_html,
+            bio_html, own_sec, docs_sec, render_ext_rows(&doc, aid + ""), strconv.itoa(kcnt), kh_html,
             esc(&fp), esc(&utc_iso_from_unix(ag.updated_at)), esc(&utc_human_from_unix(ag.updated_at)),
             esc(&ssig), "/k/" + esc(&aid) + ".json", "/k/" + esc(&aid) + ".pem"])
     alt := "<link rel=\"alternate\" type=\"application/json\" href=\"/k/" + esc(&aid) + ".json\">"
@@ -509,6 +546,7 @@ pub fn serve_human(st &State, hid string) HttpResp {
                 el := doc.at(arr, i)
                 if !doc.is_dict(el) { -> }
                 aid := json_str_or(&doc, doc.get(el, "agent_id"), "")
+                ag_row := read_agent_summary(st, aid + "")
                 cid := json_str_or(&doc, doc.get(el, "cred_id"), "")
                 lbl := json_str_or(&doc, doc.get(el, "label"), "")
                 ast := json_str_or(&doc, doc.get(el, "status"), "active")
@@ -522,10 +560,11 @@ pub fn serve_human(st &State, hid string) HttpResp {
                     }
                 }
                 rows = rows + "<tr><td><a href=\"/a/" + esc(&aid) + "\"><code>" + esc(&aid) + "</code></a></td><td>" +
+                    esc(&ag_row.name) + "</td><td>" +
                     esc(&lbl) + "</td><td><code>" + esc(&kind) + "</code></td><td><code>" + esc(&ast) +
                     "</code></td><td>" + chips + "</td><td><code>" + esc(&cid) + "</code></td></tr>"
             }
-            agents_blk = "<table class=\"kv\"><tbody><tr><th>Agent</th><th>Label</th><th>Kind</th><th>Status</th><th>Scopes</th><th>Credential</th></tr>" + rows + "</tbody></table>"
+            agents_blk = "<table class=\"kv\"><tbody><tr><th>Agent</th><th>Name</th><th>Label</th><th>Kind</th><th>Status</th><th>Scopes</th><th>Credential</th></tr>" + rows + "</tbody></table>"
         }
     }
 

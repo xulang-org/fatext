@@ -294,12 +294,13 @@ pub fn normalize_route(raw_path string) string {
        path == "/static/fatext.css" || path == "/static/favicon.svg" || path == "/favicon.ico" ||
        path == "/static/logo.svg" || path == "/internal/mail/ingest" ||
        path == "/v1/agents/register" || path == "/v1/agents/profile" || path == "/v1/agents/rotate-key" ||
-       path == "/v1/agents/revoke" || path == "/v1/humans/register" || path == "/v1/humans/profile" ||
+       path == "/v1/agents/revoke" || path == "/v1/agents/docs" || path == "/v1/humans/register" || path == "/v1/humans/profile" ||
        path == "/v1/humans/rotate-key" || path == "/v1/humans/revoke" || path == "/v1/humans/agents" ||
        path == "/v1/friends" || path == "/v1/friends/request" || path == "/v1/friends/accept" ||
        path == "/v1/friends/reject" || path == "/v1/blocks" || path == "/v1/mail" || path == "/v1/stream" {
         << path
     }
+    if strings.has_prefix(&path, "/v1/agents/docs/") { << "/v1/agents/docs/{kind}" }
     if strings.has_prefix(&path, "/dl/") { << "/dl/{file}" }
     if strings.has_prefix(&path, "/v1/friends/") { << "/v1/friends/{id}" }
     if strings.has_prefix(&path, "/v1/blocks/") { << "/v1/blocks/{target}" }
@@ -312,6 +313,9 @@ pub fn normalize_route(raw_path string) string {
         if parts.len == 2 {
             << "/v1/humans/agents/{id}/" + parts[1]
         }
+        if parts.len == 3 && parts[1] == "docs" {
+            << "/v1/humans/agents/{id}/docs/{kind}"
+        }
         << "/v1/humans/agents/{other}"
     }
     if strings.has_prefix(&path, "/v1/channels/") {
@@ -323,6 +327,14 @@ pub fn normalize_route(raw_path string) string {
         << "/v1/threads/{id}/replies"
     }
     if strings.has_prefix(&path, "/k/") {
+        rest := path[3:path.len]
+        if strings.contains(&rest, "/") {
+            if strings.has_suffix(&rest, "/docs.json") { << "/k/{id}/docs.json" }
+            if strings.has_suffix(&rest, "/soul.json") { << "/k/{id}/soul.json" }
+            if strings.has_suffix(&rest, "/soul.md") { << "/k/{id}/soul.md" }
+            if strings.has_suffix(&rest, "/rules.json") { << "/k/{id}/rules.json" }
+            if strings.has_suffix(&rest, "/rules.md") { << "/k/{id}/rules.md" }
+        }
         if strings.has_suffix(&path, ".json") { << "/k/{id}.json" }
         if strings.has_suffix(&path, ".pem") { << "/k/{id}.pem" }
     }

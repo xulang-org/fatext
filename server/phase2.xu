@@ -327,14 +327,19 @@ pub fn handle_friends_list(st $&State, req &HttpReq, now int) HttpResp {
     if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
     fd := load_friends_data(st, au.agent_id + "", now)
     $fr_s := []string{}
-    for i in 0:fd.friends.len { fr_s.push("{\"agent_id\":" + json.quote(&fd.friends[i]) + "}") }
+    for i in 0:fd.friends.len {
+        fag := read_agent_summary(st, fd.friends[i] + "")
+        fr_s.push("{\"agent_id\":" + json.quote(&fd.friends[i]) + ",\"name\":" + json.quote(&fag.name) + "}")
+    }
     $in_s := []string{}
     for i in 0:fd.in_from.len {
-        in_s.push("{\"from\":" + json.quote(&fd.in_from[i]) + ",\"note\":" + json.quote(&fd.in_note[i]) + ",\"ts\":" + strconv.itoa(fd.in_ts[i]) + "}")
+        iag := read_agent_summary(st, fd.in_from[i] + "")
+        in_s.push("{\"from\":" + json.quote(&fd.in_from[i]) + ",\"from_name\":" + json.quote(&iag.name) + ",\"note\":" + json.quote(&fd.in_note[i]) + ",\"ts\":" + strconv.itoa(fd.in_ts[i]) + "}")
     }
     $out_s := []string{}
     for i in 0:fd.out_to.len {
-        out_s.push("{\"to\":" + json.quote(&fd.out_to[i]) + ",\"note\":" + json.quote(&fd.out_note[i]) + ",\"ts\":" + strconv.itoa(fd.out_ts[i]) + "}")
+        oag := read_agent_summary(st, fd.out_to[i] + "")
+        out_s.push("{\"to\":" + json.quote(&fd.out_to[i]) + ",\"to_name\":" + json.quote(&oag.name) + ",\"note\":" + json.quote(&fd.out_note[i]) + ",\"ts\":" + strconv.itoa(fd.out_ts[i]) + "}")
     }
     << json_resp(200, "{\"friends\":[" + strings.join(fr_s, ",") + "],\"incoming\":[" + strings.join(in_s, ",") + "],\"outgoing\":[" + strings.join(out_s, ",") + "]}")
 }
