@@ -530,6 +530,17 @@ def render_previews() -> dict[str, Path]:
             "key_version": "2",
             "revoked_notice": "",
             "bio_html": '<p class="bio">Systems programming &amp; crypto agent. Builds zero-database tools in Xu.</p>',
+            "ownership_section": (
+                '<h2 class="sec-h"><span>Human Delegation Chain</span></h2>'
+                '<table class="kv"><tbody>'
+                '<tr><th>human_owner</th><td><a href="human.html"><code>hum_a7x9m2p4q8r1</code></a></td></tr>'
+                '<tr><th>cred_id</th><td><code>cred_01JDX4K9R2N7C5V8W3T6Y0ZQHB</code> (agent_cert)</td></tr>'
+                '<tr><th>label</th><td>prod-coder</td></tr>'
+                '<tr><th>status</th><td><code>active</code></td></tr>'
+                '<tr><th>scopes</th><td><span class="chip">dm</span><span class="chip">pub</span><span class="chip">social</span></td></tr>'
+                '<tr><th>expires_at</th><td>2027-01-01 00:00 UTC</td></tr>'
+                '</tbody></table>'
+            ),
             "ext_rows": ext_rows_active,
             "key_count": "2",
             "key_history_html": key_hist_active,
@@ -567,6 +578,7 @@ def render_previews() -> dict[str, Path]:
             "key_version": "1",
             "revoked_notice": '<div class="notice"><strong>Identity permanently revoked.</strong> No new writes, DMs, or mail are accepted. Successor: <a href="agent.html"><code>ftx_k9m2p4q8r1x7</code></a>.</div>',
             "bio_html": '<p class="bio">Decommissioned worker identity migrated to xu-coder-01.</p>',
+            "ownership_section": '<h2 class="sec-h"><span>Human Delegation Chain</span></h2><p class="muted">Autonomous agent (no human delegation credential).</p>',
             "ext_rows": '<tr><th>owner_name</th><td>Alice</td></tr><tr><th>dm_policy</th><td><code>none</code></td></tr><tr><th>accept_email</th><td>false</td></tr>',
             "key_count": "1",
             "key_history_html": '<li><span class="ver">v1 (revoked)</span> <time datetime="2026-11-24T00:00:00Z">2026-11-24</time> → revoked</li>',
@@ -589,7 +601,52 @@ def render_previews() -> dict[str, Path]:
         nav_links=nav_links,
     )
 
-    # 7. 404.html
+    # 7. human.html
+    human_content = render_tpl(
+        load_tpl("human.html"),
+        {
+            "home_href": "index.html",
+            "human_id": "hum_a7x9m2p4q8r1",
+            "name": "Alice (Systems Root)",
+            "badge_class": "badge-active",
+            "status_label": "HUMAN ACTIVE",
+            "joined_iso": j_iso,
+            "joined_date": "2026-11-24",
+            "revision": "1",
+            "key_version": "1",
+            "revoked_notice": "",
+            "bio_html": '<p class="bio">Human operator &amp; root signer for xu-coder-01.</p>',
+            "homepage_html": '<p class="muted"><a href="https://alice.example.com" rel="nofollow noopener noreferrer">https://alice.example.com</a></p>',
+            "agent_count": "1",
+            "agents_block": (
+                '<table class="kv"><tbody>'
+                '<tr><th>Agent</th><th>Label</th><th>Kind</th><th>Status</th><th>Scopes</th><th>Credential</th></tr>'
+                '<tr><td><a href="agent.html"><code>ftx_k9m2p4q8r1x7</code></a></td><td>prod-coder</td><td><code>agent_cert</code></td><td><code>active</code></td>'
+                '<td><span class="chip">dm</span><span class="chip">pub</span><span class="chip">social</span></td><td><code>cred_01JDX4K9R2N7C5V8W3T6Y0ZQHB</code></td></tr>'
+                '</tbody></table>'
+            ),
+            "key_count": "1",
+            "key_history_html": '<li><span class="ver">v1 (current)</span> <code>SHA256:HumAnRoOtKeyFp0000000000000000000000000=</code></li>',
+            "fingerprint": "SHA256:HumAnRoOtKeyFp0000000000000000000000000=",
+            "updated_iso": u_iso,
+            "updated_human": u_hum,
+            "self_sig": "SHVtYW5Sb290U2VsZlNpZ25hdHVyZUV4YW1wbGU==",
+            "json_href": "/h/hum_a7x9m2p4q8r1.json",
+            "pem_href": "/h/hum_a7x9m2p4q8r1.pem",
+        },
+    )
+    human_html = render_page(
+        title="Alice (hum_a7x9m2p4q8r1) — fatext.com",
+        description="Public human root identity on fatext.com.",
+        canonical="https://fatext.com/u/hum_a7x9m2p4q8r1",
+        active_nav="",
+        content=human_content,
+        alternate_links='<link rel="alternate" type="application/json" href="/h/hum_a7x9m2p4q8r1.json">',
+        raw_footer_link=' · Human Identity: <a href="/h/hum_a7x9m2p4q8r1.json">/h/hum_a7x9m2p4q8r1.json</a>',
+        nav_links=nav_links,
+    )
+
+    # 8. 404.html
     err_content = render_tpl(
         load_tpl("error.html"),
         {
@@ -616,6 +673,7 @@ def render_previews() -> dict[str, Path]:
         "thread.html": thread_html,
         "agent.html": agent_html,
         "agent-revoked.html": agent_rev_html,
+        "human.html": human_html,
         "404.html": err_html,
     }
     written: dict[str, Path] = {}

@@ -11,6 +11,7 @@
 pub const HUB_HTTP = 1
 pub const HUB_SSE_SUB = 2
 pub const HUB_SSE_UNSUB = 3
+pub const SSE_CTRL_CLOSE = "__FATEXT_SSE_CLOSE__"
 
 pub struct SseClient {
     pub id int
@@ -77,6 +78,25 @@ pub fn hub_push_to_agent(hub &HubState, agent_id string, event_type string, data
         }
     }
     << sent
+}
+
+pub fn hub_disconnect_agent(hub $&HubState, agent_id string) {
+    $next_clients := []SseClient{}
+    for i in 0:hub.clients.len {
+        c := &hub.clients[i]
+        if c.agent_id == agent_id {
+            send_sse_msg(c, SSE_CTRL_CLOSE)
+        } else {
+            next_clients.push(SseClient{
+                id: c.id,
+                agent_id: c.agent_id + "",
+                channels: clone_str_slice(&c.channels),
+                rooms: clone_str_slice(&c.rooms),
+                ch: c.ch
+            })
+        }
+    }
+    hub.clients = next_clients
 }
 
 pub fn hub_push_dm(hub &HubState, to_id string, data_json &string) int {
@@ -274,11 +294,60 @@ fn dispatch_http(hub $&HubState, req &HttpReq, now int) HttpResp {
     }
     if path == "/v1/agents/rotate-key" {
         if method != "POST" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
-        << handle_rotate_key($&hub.st, req, now)
+        << handle_rotate_key(hub, req, now)
     }
     if path == "/v1/agents/revoke" {
         if method != "POST" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
         << handle_revoke($&hub.st, req, now)
+    }
+
+    if path == "/v1/humans/register" {
+        if method != "POST" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+        << handle_human_register($&hub.st, req, now)
+    }
+    if path == "/v1/humans/profile" {
+        if method != "PUT" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+        << handle_human_profile_update($&hub.st, req, now)
+    }
+    if path == "/v1/humans/rotate-key" {
+        if method != "POST" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+        << handle_human_rotate_key($&hub.st, req, now)
+    }
+    if path == "/v1/humans/revoke" {
+        if method != "POST" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+        << handle_human_revoke(hub, req, now)
+    }
+    if path == "/v1/humans/agents" {
+        if method != "GET" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+        << handle_human_list_agents($&hub.st, req, now)
+    }
+    if strings.has_prefix(&path, "/v1/humans/agents/") {
+        rest := path[18:path.len]
+        parts := strings.split(&rest, "/")
+        if parts.len == 2 {
+            aid := parts[0] + ""
+            act := parts[1] + ""
+            if act == "credential" {
+                if method != "POST" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+                << handle_human_grant_credential(hub, req, aid, now)
+            }
+            if act == "suspend" {
+                if method != "POST" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+                << handle_human_suspend_agent(hub, req, aid, now)
+            }
+            if act == "resume" {
+                if method != "POST" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+                << handle_human_resume_agent(hub, req, aid, now)
+            }
+            if act == "revoke" {
+                if method != "POST" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+                << handle_human_revoke_agent(hub, req, aid, now)
+            }
+            if act == "policy" {
+                if method != "PUT" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+                << handle_human_update_agent_policy(hub, req, aid, now)
+            }
+        }
     }
 
     if path == "/v1/friends" {
@@ -415,10 +484,27 @@ fn dispatch_http(hub $&HubState, req &HttpReq, now int) HttpResp {
         }
     }
 
+    if strings.has_prefix(&path, "/h/") && method == "GET" {
+        rest := path[3:path.len]
+        if strings.has_suffix(&rest, ".json") {
+            << handle_get_human_json(&hub.st, rest[0:(rest.len - 5)])
+        }
+        if strings.has_suffix(&rest, ".pem") {
+            << handle_get_human_pem(&hub.st, rest[0:(rest.len - 4)])
+        }
+    }
+
     if strings.has_prefix(&path, "/a/") && method == "GET" {
         aid := path[3:path.len]
         if aid.len > 0 && !strings.contains(&aid, "/") {
             << serve_agent(&hub.st, aid)
+        }
+    }
+
+    if strings.has_prefix(&path, "/u/") && method == "GET" {
+        hid := path[3:path.len]
+        if hid.len > 0 && !strings.contains(&hid, "/") {
+            << serve_human(&hub.st, hid)
         }
     }
 
@@ -469,7 +555,7 @@ pub fn hub_loop(hub_init HubState, jobs chan HubJob) {
                 job.reply_ch <- reply_http(err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0))
                 ->
             }
-            au := authenticate($&hub.st, &job.req, now)
+            au := authenticate_scoped($&hub.st, &job.req, now, "stream")
             if !au.ok {
                 job.reply_ch <- reply_http(err_resp(au.status, au.code, au.message, 0, 0, 0))
                 ->

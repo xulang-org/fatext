@@ -50,6 +50,33 @@ pub struct AgentSummary {
     pub name string
     pub bio string
     pub updated_at int
+    pub owner_human_id string
+    pub ownership_status string
+    pub ownership_kind string
+    pub ownership_label string
+    pub ownership_suspend_reason string
+    pub ownership_revoked_by string
+    pub ownership_sig string
+    pub cred_id string
+    pub cred_issued_at int
+    pub cred_expires_at int
+    pub cred_scopes []string
+    pub ownership_raw string
+    pub raw_json string
+}
+
+pub struct HumanSummary {
+    pub found bool
+    pub human_id string
+    pub status string
+    pub created_at int
+    pub revision int
+    pub key_version int
+    pub pub_pem string
+    pub name string
+    pub bio string
+    pub homepage string
+    pub updated_at int
     pub raw_json string
 }
 
@@ -69,6 +96,7 @@ pub struct State {
     pub pins_hash string
     pub banned_hash string
     pub revoked_hash string
+    pub humans_revoked_hash string
     pub banned_emails []string
     pub banned_emails_hash string
     pub last_reload int
@@ -76,6 +104,8 @@ pub struct State {
     pub last_anchor_date string
 
     pub revoked maps.StrInt
+    pub revoked_humans maps.StrInt
+    pub used_creds maps.StrInt
     pub banned maps.StrInt
     pub replay_cache maps.StrInt
     pub last_replay_sweep int
@@ -104,12 +134,15 @@ pub fn new_state(addr string, data_dir string, www_dir string, templates_dir str
         pins_hash: "",
         banned_hash: "",
         revoked_hash: "",
+        humans_revoked_hash: "",
         banned_emails: []string{},
         banned_emails_hash: "",
         last_reload: 0,
         last_gc: 0,
         last_anchor_date: "",
         revoked: maps.new_str_int(),
+        revoked_humans: maps.new_str_int(),
+        used_creds: maps.new_str_int(),
         banned: maps.new_str_int(),
         replay_cache: maps.new_str_int(),
         last_replay_sweep: 0,
@@ -142,6 +175,21 @@ pub fn agent_json_path(st &State, agent_id string) string {
 
 pub fn agent_pem_path(st &State, agent_id string) string {
     << st.data_dir + "/keys/" + agent_bucket(agent_id + "") + "/" + agent_id + ".pem"
+}
+
+pub fn human_bucket(human_id string) string {
+    if human_id.len >= 6 {
+        << human_id[4:6]
+    }
+    << "00"
+}
+
+pub fn human_json_path(st &State, human_id string) string {
+    << st.data_dir + "/humans/" + human_bucket(human_id + "") + "/" + human_id + ".json"
+}
+
+pub fn human_pem_path(st &State, human_id string) string {
+    << st.data_dir + "/humans/" + human_bucket(human_id + "") + "/" + human_id + ".pem"
 }
 
 pub fn channel_dir(st &State, ch string, date string) string {
@@ -394,6 +442,25 @@ pub fn reload_configs(st $&State, now int) {
         st.revoked_hash = rh
     }
 
+    hrev_path := st.data_dir + "/humans/revoked.jsonl"
+    hrev_raw := read_file_or_empty(hrev_path)
+    hrh := sha256.sum256(hrev_raw + "")
+    if hrh != st.humans_revoked_hash {
+        dst_h := $&st.revoked_humans
+        dst_h.clear()
+        hlines := strings.split(&hrev_raw, "\n")
+        for i in 0:hlines.len {
+            ln := strings.trim_space(&hlines[i])
+            if ln.len == 0 { -> }
+            doc := json.parse(&ln)
+            if doc.ok() && doc.is_dict(doc.root()) && doc.has(doc.root(), "human_id") {
+                hid := json_str_or(&doc, doc.get(doc.root(), "human_id"), "")
+                if is_valid_human_id(hid + "") { dst_h.set(hid + "", 1) }
+            }
+        }
+        st.humans_revoked_hash = hrh
+    }
+
     be_path := st.data_dir + "/blacklist/banned_emails.txt"
     be_raw := read_file_or_empty(be_path)
     beh := sha256.sum256(be_raw + "")
@@ -448,6 +515,7 @@ fn file_exists(path string) bool {
 
 pub fn init_state(st $&State) {
     mkdir_all_quiet(st.data_dir + "/keys")
+    mkdir_all_quiet(st.data_dir + "/humans")
     mkdir_all_quiet(st.data_dir + "/friends")
     mkdir_all_quiet(st.data_dir + "/mail")
     mkdir_all_quiet(st.data_dir + "/blacklist")
@@ -480,6 +548,35 @@ pub fn init_state(st $&State) {
         d := ""
         write_atomic_quiet(rev_path, &d)
     }
+    hreg_path := st.data_dir + "/humans/registry.jsonl"
+    if !file_exists(hreg_path + "") {
+        d := ""
+        write_atomic_quiet(hreg_path, &d)
+    }
+    hrev_path := st.data_dir + "/humans/revoked.jsonl"
+    if !file_exists(hrev_path + "") {
+        d := ""
+        write_atomic_quiet(hrev_path, &d)
+    }
+    hcred_path := st.data_dir + "/humans/credentials.jsonl"
+    if !file_exists(hcred_path + "") {
+        d := ""
+        write_atomic_quiet(hcred_path, &d)
+    } else {
+        craw := read_file_or_empty(hcred_path)
+        clines := strings.split(&craw, "\n")
+        for i in 0:clines.len {
+            ln := strings.trim_space(&clines[i])
+            if ln.len == 0 { -> }
+            cdoc := json.parse(&ln)
+            if cdoc.ok() && cdoc.is_dict(cdoc.root()) && cdoc.has(cdoc.root(), "cred_id") {
+                cid := json_str_or(&cdoc, cdoc.get(cdoc.root(), "cred_id"), "")
+                if is_valid_cred_id(cid + "") {
+                    map_set($&st.used_creds, cid + "", 1)
+                }
+            }
+        }
+    }
 
     now := time.now_time().unix()
     reload_configs(st, now)
@@ -498,7 +595,11 @@ pub fn read_agent_summary(st &State, agent_id string) AgentSummary {
     $out := AgentSummary{
         found: false, agent_id: agent_id + "", status: "", successor_id: "",
         created_at: 0, revision: 0, key_version: 0, pub_pem: "",
-        name: "", bio: "", updated_at: 0, raw_json: ""
+        name: "", bio: "", updated_at: 0,
+        owner_human_id: "", ownership_status: "", ownership_kind: "",
+        ownership_label: "", ownership_suspend_reason: "", ownership_revoked_by: "",
+        ownership_sig: "", cred_id: "", cred_issued_at: 0, cred_expires_at: 0,
+        cred_scopes: []string{}, ownership_raw: "null", raw_json: ""
     }
     if !is_valid_agent_id(agent_id + "") { << out }
     raw := os.read(agent_json_path(st, agent_id + "")) or (err) { << out }
@@ -527,7 +628,83 @@ pub fn read_agent_summary(st &State, agent_id string) AgentSummary {
             if doc.has(pn, "updated_at") { out.updated_at = json_int_or(&doc, doc.get(pn, "updated_at"), 0) }
         }
     }
+    if doc.has(r, "ownership") {
+        on := doc.get(r, "ownership")
+        if !doc.is_null(on) && doc.is_dict(on) {
+            out.ownership_raw = json_encode_or(&doc, on, "null")
+            if doc.has(on, "human_id") { out.owner_human_id = json_str_or(&doc, doc.get(on, "human_id"), "") }
+            if doc.has(on, "status") { out.ownership_status = json_str_or(&doc, doc.get(on, "status"), "active") }
+            if doc.has(on, "kind") { out.ownership_kind = json_str_or(&doc, doc.get(on, "kind"), "") }
+            if doc.has(on, "label") { out.ownership_label = json_str_or(&doc, doc.get(on, "label"), "") }
+            if doc.has(on, "suspend_reason") { out.ownership_suspend_reason = json_str_or(&doc, doc.get(on, "suspend_reason"), "") }
+            if doc.has(on, "revoked_by") { out.ownership_revoked_by = json_str_or(&doc, doc.get(on, "revoked_by"), "") }
+            if doc.has(on, "human_sig") { out.ownership_sig = json_str_or(&doc, doc.get(on, "human_sig"), "") }
+            if doc.has(on, "cred_id") { out.cred_id = json_str_or(&doc, doc.get(on, "cred_id"), "") }
+            if doc.has(on, "issued_at") { out.cred_issued_at = json_int_or(&doc, doc.get(on, "issued_at"), 0) }
+            if doc.has(on, "expires_at") { out.cred_expires_at = json_int_or(&doc, doc.get(on, "expires_at"), 0) }
+            if doc.has(on, "scopes") && doc.is_list(doc.get(on, "scopes")) {
+                sa := doc.get(on, "scopes")
+                for si in 0:doc.count(sa) {
+                    sv := json_str_or(&doc, doc.at(sa, si), "")
+                    if sv.len > 0 { out.cred_scopes.push(sv) }
+                }
+            }
+        }
+    }
     << out
+}
+
+pub fn read_human_summary(st &State, human_id string) HumanSummary {
+    $out := HumanSummary{
+        found: false, human_id: human_id + "", status: "", created_at: 0,
+        revision: 0, key_version: 0, pub_pem: "", name: "", bio: "",
+        homepage: "", updated_at: 0, raw_json: ""
+    }
+    if !is_valid_human_id(human_id + "") { << out }
+    raw := os.read(human_json_path(st, human_id + "")) or (err) { << out }
+    doc := json.parse(&raw)
+    if !doc.ok() { << out }
+    r := doc.root()
+    if !doc.is_dict(r) { << out }
+    out.found = true
+    out.raw_json = raw
+    if doc.has(r, "status") { out.status = json_str_or(&doc, doc.get(r, "status"), "active") }
+    if doc.has(r, "created_at") { out.created_at = json_int_or(&doc, doc.get(r, "created_at"), 0) }
+    if doc.has(r, "revision") { out.revision = json_int_or(&doc, doc.get(r, "revision"), 0) }
+    if doc.has(r, "key_version") { out.key_version = json_int_or(&doc, doc.get(r, "key_version"), 1) }
+    if doc.has(r, "current_public_key_pem") {
+        out.pub_pem = json_str_or(&doc, doc.get(r, "current_public_key_pem"), "")
+    }
+    if doc.has(r, "profile") {
+        pn := doc.get(r, "profile")
+        if doc.is_dict(pn) {
+            if doc.has(pn, "name") { out.name = json_str_or(&doc, doc.get(pn, "name"), "") }
+            if doc.has(pn, "bio") { out.bio = json_str_or(&doc, doc.get(pn, "bio"), "") }
+            if doc.has(pn, "homepage") { out.homepage = json_str_or(&doc, doc.get(pn, "homepage"), "") }
+            if doc.has(pn, "updated_at") { out.updated_at = json_int_or(&doc, doc.get(pn, "updated_at"), 0) }
+        }
+    }
+    << out
+}
+
+pub fn find_human_pubkey_for_version(hu &HumanSummary, want_ver int) string {
+    if want_ver == hu.key_version {
+        << hu.pub_pem + ""
+    }
+    doc := json.parse(&hu.raw_json)
+    if !doc.ok() || !doc.has(doc.root(), "key_history") { << "" }
+    kh := doc.get(doc.root(), "key_history")
+    if !doc.is_list(kh) { << "" }
+    for i in 0:doc.count(kh) {
+        el := doc.at(kh, i)
+        if doc.is_dict(el) {
+            v := json_int_or(&doc, doc.get(el, "version"), 0)
+            if v == want_ver {
+                << json_str_or(&doc, doc.get(el, "public_key_pem"), "")
+            }
+        }
+    }
+    << ""
 }
 
 pub fn parse_post_line(raw_line &string) PostRecord {

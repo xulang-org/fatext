@@ -202,8 +202,8 @@ fn extract_raw_json_object(body &string, key string) string {
 // Dual-signature key rotation: POST /v1/agents/rotate-key
 // =========================================================================
 
-pub fn handle_rotate_key(st $&State, req &HttpReq, now int) HttpResp {
-    au := authenticate(st, req, now)
+pub fn handle_rotate_key(hub $&HubState, req &HttpReq, now int) HttpResp {
+    au := authenticate_scoped($&hub.st, req, now, "rotate")
     if !au.ok {
         << err_resp(au.status, au.code, au.message, 0, 0, 0)
     }
@@ -280,12 +280,15 @@ pub fn handle_rotate_key(st $&State, req &HttpReq, now int) HttpResp {
     retired_entry := "{\"version\":" + strconv.itoa(au.key_version) +
         ",\"public_key_pem\":" + json.quote(&au.agent.pub_pem) +
         ",\"valid_from\":" + strconv.itoa(au.agent.created_at) +
-        ",\"valid_until\":" + strconv.itoa(now) + "}"
+        ",\"valid_until\":" + strconv.itoa(now) +
+        ",\"rotated_by_old_sig\":" + json.quote(&old_sig) +
+        ",\"rotated_by_new_sig\":" + json.quote(&new_sig) + "}"
     hist_items.push(retired_entry)
     $ext_json := "{\"accept_email\":false,\"dm_policy\":\"friends\"}"
     if orig_doc.ok() && orig_doc.has(orig_doc.root(), "extensions") {
         ext_json = json_encode_or(&orig_doc, orig_doc.get(orig_doc.root(), "extensions"), ext_json + "")
     }
+    own_json := preserve_ownership_json(&orig_doc)
 
     new_rev := au.agent.revision + 1
     aid := au.agent_id + ""
@@ -300,15 +303,17 @@ pub fn handle_rotate_key(st $&State, req &HttpReq, now int) HttpResp {
         "\"key_history\":[" + strings.join(hist_items, ",") + "]," +
         "\"profile\":{\"name\":" + json.quote(&au.agent.name) + ",\"bio\":" + json.quote(&au.agent.bio) + ",\"updated_at\":" + strconv.itoa(now) + "}," +
         "\"extensions\":" + ext_json + "," +
+        "\"ownership\":" + own_json + "," +
         "\"signature\":" + json.quote(&new_sig) +
         "}\n"
 
-    write_atomic(agent_json_path(st, aid + ""), &updated_doc) or (err) {
+    write_atomic(agent_json_path(&hub.st, aid + ""), &updated_doc) or (err) {
         << err_resp(500, "ERR_INTERNAL", "failed saving rotated identity doc", 0, 0, 0)
     }
-    write_atomic(agent_pem_path(st, aid + ""), &norm_new_pem) or (err) {
+    write_atomic(agent_pem_path(&hub.st, aid + ""), &norm_new_pem) or (err) {
         << err_resp(500, "ERR_INTERNAL", "failed saving rotated public pem", 0, 0, 0)
     }
+    hub_disconnect_agent(hub, aid + "")
     fp := pubkey_fingerprint(&norm_new_pem)
     << json_resp(200, "{\"ok\":true,\"agent_id\":" + json.quote(&aid) + ",\"key_version\":" + strconv.itoa(pl_kv) + ",\"fingerprint\":" + json.quote(&fp) + "}")
 }
@@ -318,7 +323,7 @@ pub fn handle_rotate_key(st $&State, req &HttpReq, now int) HttpResp {
 // =========================================================================
 
 pub fn handle_friends_list(st $&State, req &HttpReq, now int) HttpResp {
-    au := authenticate(st, req, now)
+    au := authenticate_scoped(st, req, now, "social")
     if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
     fd := load_friends_data(st, au.agent_id + "", now)
     $fr_s := []string{}
@@ -335,7 +340,7 @@ pub fn handle_friends_list(st $&State, req &HttpReq, now int) HttpResp {
 }
 
 pub fn handle_friend_request(st $&State, req &HttpReq, now int) HttpResp {
-    au := authenticate(st, req, now)
+    au := authenticate_scoped(st, req, now, "social")
     if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
     doc := json.parse(&req.body())
     if !doc.ok() { << err_resp(400, "ERR_BAD_REQUEST", "invalid JSON", 0, 0, 0) }
@@ -349,6 +354,12 @@ pub fn handle_friend_request(st $&State, req &HttpReq, now int) HttpResp {
     tag := read_agent_summary(st, tid + "")
     if !tag.found { << err_resp(404, "ERR_NOT_FOUND", "target agent not found", 0, 0, 0) }
     if tag.status == "revoked" { << err_resp(403, "ERR_REVOKED", "target agent is revoked", 0, 0, 0) }
+    if tag.owner_human_id.len > 0 && st.revoked_humans.has(tag.owner_human_id + "") {
+        << err_resp(403, "ERR_HUMAN_REVOKED", "target agent's owning human is revoked", 0, 0, 0)
+    }
+    if tag.ownership_status == "suspended" {
+        << err_resp(403, "ERR_AGENT_SUSPENDED", "target agent is suspended", 0, 0, 0)
+    }
 
     $my_fd := load_friends_data(st, au.agent_id + "", now)
     $t_fd := load_friends_data(st, tid + "", now)
@@ -374,7 +385,7 @@ pub fn handle_friend_request(st $&State, req &HttpReq, now int) HttpResp {
 }
 
 pub fn handle_friend_accept(st $&State, req &HttpReq, now int) HttpResp {
-    au := authenticate(st, req, now)
+    au := authenticate_scoped(st, req, now, "social")
     if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
     doc := json.parse(&req.body())
     if !doc.ok() { << err_resp(400, "ERR_BAD_REQUEST", "invalid JSON", 0, 0, 0) }
@@ -396,7 +407,7 @@ pub fn handle_friend_accept(st $&State, req &HttpReq, now int) HttpResp {
 }
 
 pub fn handle_friend_reject(st $&State, req &HttpReq, now int) HttpResp {
-    au := authenticate(st, req, now)
+    au := authenticate_scoped(st, req, now, "social")
     if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
     doc := json.parse(&req.body())
     if !doc.ok() { << err_resp(400, "ERR_BAD_REQUEST", "invalid JSON", 0, 0, 0) }
@@ -412,7 +423,7 @@ pub fn handle_friend_reject(st $&State, req &HttpReq, now int) HttpResp {
 }
 
 pub fn handle_friend_rm(st $&State, req &HttpReq, tid string, now int) HttpResp {
-    au := authenticate(st, req, now)
+    au := authenticate_scoped(st, req, now, "social")
     if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
     if !is_valid_agent_id(tid + "") { << err_resp(400, "ERR_BAD_REQUEST", "invalid agent_id", 0, 0, 0) }
     $my_fd := load_friends_data(st, au.agent_id + "", now)
@@ -425,7 +436,7 @@ pub fn handle_friend_rm(st $&State, req &HttpReq, tid string, now int) HttpResp 
 }
 
 pub fn handle_blocks_list(st $&State, req &HttpReq, now int) HttpResp {
-    au := authenticate(st, req, now)
+    au := authenticate_scoped(st, req, now, "social")
     if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
     fd := load_friends_data(st, au.agent_id + "", now)
     $bl := []string{}
@@ -434,7 +445,7 @@ pub fn handle_blocks_list(st $&State, req &HttpReq, now int) HttpResp {
 }
 
 pub fn handle_block_add(st $&State, req &HttpReq, now int) HttpResp {
-    au := authenticate(st, req, now)
+    au := authenticate_scoped(st, req, now, "social")
     if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
     doc := json.parse(&req.body())
     if !doc.ok() { << err_resp(400, "ERR_BAD_REQUEST", "invalid JSON", 0, 0, 0) }
@@ -447,7 +458,7 @@ pub fn handle_block_add(st $&State, req &HttpReq, now int) HttpResp {
 }
 
 pub fn handle_block_rm(st $&State, req &HttpReq, tgt string, now int) HttpResp {
-    au := authenticate(st, req, now)
+    au := authenticate_scoped(st, req, now, "social")
     if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
     $fd := load_friends_data(st, au.agent_id + "", now)
     fd.blocks = remove_str_from(&fd.blocks, tgt + "")
@@ -484,7 +495,7 @@ fn agent_ext_bool(ag &AgentSummary, key string, def bool) bool {
 
 pub fn handle_dm_send(hub $&HubState, req &HttpReq, to_id string, now int) HttpResp {
     if !is_valid_agent_id(to_id + "") { << err_resp(404, "ERR_NOT_FOUND", "recipient not found", 0, 0, 0) }
-    au := authenticate($&hub.st, req, now)
+    au := authenticate_scoped($&hub.st, req, now, "dm")
     if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
 
     body := req.body()
@@ -499,6 +510,15 @@ pub fn handle_dm_send(hub $&HubState, req &HttpReq, to_id string, now int) HttpR
     tag := read_agent_summary(&hub.st, to_id + "")
     if !tag.found { << err_resp(404, "ERR_NOT_FOUND", "recipient not found", 0, 0, 0) }
     if tag.status == "revoked" { << err_resp(403, "ERR_REVOKED", "recipient revoked", 0, 0, 0) }
+    if tag.owner_human_id.len > 0 && hub.st.revoked_humans.has(tag.owner_human_id + "") {
+        << err_resp(403, "ERR_HUMAN_REVOKED", "recipient owning human revoked", 0, 0, 0)
+    }
+    if tag.owner_human_id.len > 0 && hub.st.revoked_humans.has(tag.owner_human_id + "") {
+        << err_resp(403, "ERR_HUMAN_REVOKED", "recipient owning human revoked", 0, 0, 0)
+    }
+    if tag.ownership_status == "suspended" {
+        << err_resp(403, "ERR_AGENT_SUSPENDED", "recipient suspended by owning human", 0, 0, 0)
+    }
 
     t_fd := load_friends_data(&hub.st, to_id + "", now)
     if str_list_contains(&t_fd.blocks, au.agent_id + "") {
@@ -528,7 +548,7 @@ pub fn handle_dm_send(hub $&HubState, req &HttpReq, to_id string, now int) HttpR
 
 pub fn handle_room_send(hub $&HubState, req &HttpReq, room_id string, now int) HttpResp {
     if !is_valid_room_id(room_id + "") { << err_resp(400, "ERR_BAD_REQUEST", "invalid room_id", 0, 0, 0) }
-    au := authenticate($&hub.st, req, now)
+    au := authenticate_scoped($&hub.st, req, now, "room")
     if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
 
     body := req.body()
@@ -573,6 +593,9 @@ pub fn handle_mail_ingest(hub $&HubState, req &HttpReq, now int) HttpResp {
     tag := read_agent_summary(&hub.st, to_id + "")
     if !tag.found { << err_resp(404, "ERR_NOT_FOUND", "recipient not found", 0, 0, 0) }
     if tag.status == "revoked" { << err_resp(403, "ERR_REVOKED", "recipient revoked", 0, 0, 0) }
+    if tag.owner_human_id.len > 0 && hub.st.revoked_humans.has(tag.owner_human_id + "") {
+        << err_resp(403, "ERR_HUMAN_REVOKED", "recipient owning human revoked", 0, 0, 0)
+    }
     if !agent_ext_bool(&tag, "accept_email", false) {
         << err_resp(403, "ERR_FORBIDDEN", "recipient accept_email is false", 0, 0, 0)
     }
@@ -631,7 +654,7 @@ pub fn handle_mail_ingest(hub $&HubState, req &HttpReq, now int) HttpResp {
 }
 
 pub fn handle_mail_list(st $&State, req &HttpReq, now int) HttpResp {
-    au := authenticate(st, req, now)
+    au := authenticate_scoped(st, req, now, "mail")
     if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
     mdir := mail_dir(st, au.agent_id + "")
     raw_names := os.read_dir(mdir + "") or (err) {
@@ -697,7 +720,7 @@ pub fn handle_mail_list(st $&State, req &HttpReq, now int) HttpResp {
 }
 
 pub fn handle_mail_delete(st $&State, req &HttpReq, mail_id string, now int) HttpResp {
-    au := authenticate(st, req, now)
+    au := authenticate_scoped(st, req, now, "mail")
     if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
     if !is_valid_mail_id(mail_id + "") {
         << err_resp(404, "ERR_NOT_FOUND", "mail not found", 0, 0, 0)

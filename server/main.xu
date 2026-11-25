@@ -75,7 +75,11 @@ fn handle_connection(fd int, tls_on bool, cert_pem string, key_pem string, jobs 
         while alive {
             select {
                 msg := <-rep.sse_ch {
-                    if cc_peer_closed(&cc) || cc_write($&cc, &msg) < 0 {
+                    if msg == SSE_CTRL_CLOSE {
+                        disc := "event: system\ndata: {\"kind\":\"disconnected\"}\n\n"
+                        _ := cc_write($&cc, &disc)
+                        alive = false
+                    } else if cc_peer_closed(&cc) || cc_write($&cc, &msg) < 0 {
                         alive = false
                     }
                 }

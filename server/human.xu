@@ -1,0 +1,1217 @@
+@main
+
+#errors
+#os
+#strconv
+#strings
+#time
+#crypto/sha256
+#encoding/json
+
+pub struct HumanAuthOutcome {
+    pub ok bool
+    pub status int
+    pub code string
+    pub message string
+    pub human_id string
+    pub key_version int
+    pub ts int
+    pub sig_b64 string
+    pub human HumanSummary
+}
+
+fn human_auth_fail(status int, code string, msg string) HumanAuthOutcome {
+    << HumanAuthOutcome{
+        ok: false, status: status, code: code, message: msg,
+        human_id: "", key_version: 0, ts: 0, sig_b64: "",
+        human: HumanSummary{
+            found: false, human_id: "", status: "", created_at: 0,
+            revision: 0, key_version: 0, pub_pem: "", name: "", bio: "",
+            homepage: "", updated_at: 0, raw_json: ""
+        }
+    }
+}
+
+pub fn authenticate_human(st $&State, req &HttpReq, now int) HumanAuthOutcome {
+    hid := strings.trim_space(&req.header("X-Human-Id"))
+    ts_str := strings.trim_space(&req.header("X-Timestamp"))
+    sig_b64 := strings.trim_space(&req.header("X-Signature"))
+    if hid.len == 0 || ts_str.len == 0 || sig_b64.len == 0 {
+        << human_auth_fail(401, "ERR_BAD_SIGNATURE", "missing X-Human-Id, X-Timestamp, or X-Signature")
+    }
+    if !is_valid_human_id(hid + "") {
+        << human_auth_fail(401, "ERR_UNKNOWN_HUMAN", "invalid human_id format")
+    }
+    ts := strconv.atoi(&ts_str) or (err) {
+        << human_auth_fail(401, "ERR_CLOCK_SKEW", "invalid X-Timestamp")
+    }
+    diff := now - ts
+    if diff > 60 || diff < -60 {
+        << human_auth_fail(401, "ERR_CLOCK_SKEW", "timestamp skew exceeds 60s")
+    }
+
+    sweep_replay_cache(st, now)
+    sig_hash := sha256.sum256(sig_b64 + "")
+    if st.replay_cache.has(sig_hash + "") {
+        << human_auth_fail(401, "ERR_REPLAY", "replayed request signature")
+    }
+    if st.revoked_humans.has(hid + "") {
+        << human_auth_fail(403, "ERR_HUMAN_REVOKED", "human identity is revoked")
+    }
+
+    hu := read_human_summary(st, hid + "")
+    if !hu.found {
+        << human_auth_fail(401, "ERR_UNKNOWN_HUMAN", "unknown human_id")
+    }
+    if hu.status == "revoked" {
+        map_set($&st.revoked_humans, hid + "", 1)
+        << human_auth_fail(403, "ERR_HUMAN_REVOKED", "human identity is revoked")
+    }
+    pk := parse_spki_rsa_pem(&hu.pub_pem) or (err) {
+        << human_auth_fail(500, "ERR_INTERNAL", "stored human public key invalid")
+    }
+    body := req.body()
+    if !verify_request_sig(&pk, req.method(), req.path(), ts_str + "", &body, sig_b64 + "") {
+        << human_auth_fail(401, "ERR_BAD_SIGNATURE", "RSA-PSS signature verification failed")
+    }
+    map_set($&st.replay_cache, sig_hash + "", now)
+    << HumanAuthOutcome{
+        ok: true, status: 200, code: "", message: "",
+        human_id: hid + "", key_version: hu.key_version, ts: ts, sig_b64: sig_b64 + "", human: hu
+    }
+}
+
+pub fn scopes_to_json_array(scopes &[]string) string {
+    $qs := []string{}
+    for i in 0:scopes.len {
+        qs.push(json.quote(&scopes[i]))
+    }
+    << "[" + strings.join(qs, ",") + "]"
+}
+
+fn canonical_enrollment_payload(cred_id string, expires_at int, human_id string, hkv int, issued_at int, label string, scopes &[]string) string {
+    << "{\"cred_id\":" + json.quote(&cred_id) +
+        ",\"expires_at\":" + strconv.itoa(expires_at) +
+        ",\"human_id\":" + json.quote(&human_id) +
+        ",\"human_key_version\":" + strconv.itoa(hkv) +
+        ",\"issued_at\":" + strconv.itoa(issued_at) +
+        ",\"kind\":\"enrollment\"" +
+        ",\"label\":" + json.quote(&label) +
+        ",\"scopes\":" + scopes_to_json_array(scopes) + "}"
+}
+
+fn canonical_binding_payload(agent_pub_fp string, cred_id string, human_id string, ts int) string {
+    << "{\"agent_pub_fp\":" + json.quote(&agent_pub_fp) +
+        ",\"cred_id\":" + json.quote(&cred_id) +
+        ",\"human_id\":" + json.quote(&human_id) +
+        ",\"timestamp\":" + strconv.itoa(ts) + "}"
+}
+
+fn canonical_agent_cert_payload(agent_id string, akv int, agent_pub_fp string, cred_id string, expires_at int, human_id string, hkv int, issued_at int, label string, scopes &[]string) string {
+    << "{\"agent_id\":" + json.quote(&agent_id) +
+        ",\"agent_key_version\":" + strconv.itoa(akv) +
+        ",\"agent_pub_fp\":" + json.quote(&agent_pub_fp) +
+        ",\"cred_id\":" + json.quote(&cred_id) +
+        ",\"expires_at\":" + strconv.itoa(expires_at) +
+        ",\"human_id\":" + json.quote(&human_id) +
+        ",\"human_key_version\":" + strconv.itoa(hkv) +
+        ",\"issued_at\":" + strconv.itoa(issued_at) +
+        ",\"kind\":\"agent_cert\"" +
+        ",\"label\":" + json.quote(&label) +
+        ",\"scopes\":" + scopes_to_json_array(scopes) + "}"
+}
+
+fn canonical_adoption_payload(agent_id string, agent_pub_fp string, human_id string, ts int) string {
+    << "{\"agent_id\":" + json.quote(&agent_id) +
+        ",\"agent_pub_fp\":" + json.quote(&agent_pub_fp) +
+        ",\"human_id\":" + json.quote(&human_id) +
+        ",\"timestamp\":" + strconv.itoa(ts) + "}"
+}
+
+fn parse_scopes_from_json(doc &json.Doc, arr_node int) ScopesResult {
+    if !doc.is_list(arr_node) {
+        << ScopesResult{ok: false, scopes: []string{}}
+    }
+    $raw := []string{}
+    for i in 0:doc.count(arr_node) {
+        el := doc.at(arr_node, i)
+        if !doc.is_string(el) { << ScopesResult{ok: false, scopes: []string{}} }
+        s := json_str_or(doc, el, "")
+        raw.push(s)
+    }
+    << normalize_scopes_list(&raw)
+}
+
+pub fn preserve_ownership_json(orig_doc &json.Doc) string {
+    if !orig_doc.ok() || !orig_doc.has(orig_doc.root(), "ownership") {
+        << "null"
+    }
+    on := orig_doc.get(orig_doc.root(), "ownership")
+    if orig_doc.is_null(on) || !orig_doc.is_dict(on) {
+        << "null"
+    }
+    << json_encode_or(orig_doc, on, "null")
+}
+
+pub fn rewrite_agent_doc_full(
+    st $&State,
+    orig_doc &json.Doc,
+    aid string,
+    created_at int,
+    rev int,
+    kv int,
+    status string,
+    succ_json string,
+    pub_pem &string,
+    key_hist_json string,
+    name &string,
+    bio &string,
+    updated_at int,
+    ext_json string,
+    ownership_json string,
+    sig_json string
+) int {
+    doc_s := "{" +
+        "\"agent_id\":" + json.quote(&aid) + "," +
+        "\"created_at\":" + strconv.itoa(created_at) + "," +
+        "\"revision\":" + strconv.itoa(rev) + "," +
+        "\"key_version\":" + strconv.itoa(kv) + "," +
+        "\"status\":" + json.quote(&status) + "," +
+        "\"successor_id\":" + succ_json + "," +
+        "\"current_public_key_pem\":" + json.quote(pub_pem) + "," +
+        "\"key_history\":" + key_hist_json + "," +
+        "\"profile\":{\"name\":" + json.quote(name) + ",\"bio\":" + json.quote(bio) + ",\"updated_at\":" + strconv.itoa(updated_at) + "}," +
+        "\"extensions\":" + ext_json + "," +
+        "\"ownership\":" + ownership_json + "," +
+        "\"signature\":" + sig_json +
+        "}\n"
+    if doc_s.len > 32768 { >> errors.new("identity document exceeds 32 KB") }
+    << write_atomic(agent_json_path(st, aid + ""), &doc_s) or >>
+}
+
+pub fn sync_human_agent_roster(
+    st $&State,
+    human_id string,
+    agent_id string,
+    cred_id string,
+    kind string,
+    label string,
+    scopes &[]string,
+    agent_status string,
+    issued_at int,
+    expires_at int
+) int {
+    hu := read_human_summary(st, human_id + "")
+    if !hu.found { >> errors.new("human not found") }
+    hdoc := json.parse(&hu.raw_json)
+    if !hdoc.ok() { >> errors.new("corrupt human document") }
+    hr := hdoc.root()
+
+    $kh_json := "[]"
+    if hdoc.has(hr, "key_history") { kh_json = json_encode_or(&hdoc, hdoc.get(hr, "key_history"), "[]") }
+    $sig_json := "null"
+    if hdoc.has(hr, "signature") {
+        sn := hdoc.get(hr, "signature")
+        if !hdoc.is_null(sn) {
+            sv := json_str_or(&hdoc, sn, "")
+            if sv.len > 0 { sig_json = json.quote(&sv) }
+        }
+    }
+
+    entry := "{" +
+        "\"agent_id\":" + json.quote(&agent_id) + "," +
+        "\"cred_id\":" + json.quote(&cred_id) + "," +
+        "\"kind\":" + json.quote(&kind) + "," +
+        "\"label\":" + json.quote(&label) + "," +
+        "\"scopes\":" + scopes_to_json_array(scopes) + "," +
+        "\"status\":" + json.quote(&agent_status) + "," +
+        "\"issued_at\":" + strconv.itoa(issued_at) + "," +
+        "\"expires_at\":" + strconv.itoa(expires_at) +
+        "}"
+
+    $items := []string{}
+    $replaced := false
+    if hdoc.has(hr, "agents") && hdoc.is_list(hdoc.get(hr, "agents")) {
+        arr := hdoc.get(hr, "agents")
+        for i in 0:hdoc.count(arr) {
+            el := hdoc.at(arr, i)
+            if !hdoc.is_dict(el) { -> }
+            eid := json_str_or(&hdoc, hdoc.get(el, "agent_id"), "")
+            if eid == agent_id {
+                items.push(entry + "")
+                replaced = true
+            } else {
+                es := json_encode_or(&hdoc, el, "")
+                if es.len > 0 { items.push(es) }
+            }
+        }
+    }
+    if !replaced {
+        items.push(entry)
+    }
+
+    new_hdoc := "{" +
+        "\"human_id\":" + json.quote(&human_id) + "," +
+        "\"created_at\":" + strconv.itoa(hu.created_at) + "," +
+        "\"revision\":" + strconv.itoa(hu.revision) + "," +
+        "\"key_version\":" + strconv.itoa(hu.key_version) + "," +
+        "\"status\":" + json.quote(&hu.status) + "," +
+        "\"current_public_key_pem\":" + json.quote(&hu.pub_pem) + "," +
+        "\"key_history\":" + kh_json + "," +
+        "\"profile\":{\"name\":" + json.quote(&hu.name) + ",\"bio\":" + json.quote(&hu.bio) + ",\"homepage\":" + json.quote(&hu.homepage) + ",\"updated_at\":" + strconv.itoa(hu.updated_at) + "}," +
+        "\"agents\":[" + strings.join(items, ",") + "]," +
+        "\"signature\":" + sig_json +
+        "}\n"
+    << write_atomic(human_json_path(st, human_id + ""), &new_hdoc) or >>
+}
+
+pub struct EnrollmentCheck {
+    pub ok bool
+    pub has_enrollment bool
+    pub status int
+    pub code string
+    pub message string
+    pub human_id string
+    pub cred_id string
+    pub kind string
+    pub label string
+    pub scopes []string
+    pub issued_at int
+    pub expires_at int
+    pub ownership_json string
+}
+
+fn enroll_fail(status int, code string, msg string) EnrollmentCheck {
+    << EnrollmentCheck{
+        ok: false, has_enrollment: true, status: status, code: code, message: msg,
+        human_id: "", cred_id: "", kind: "", label: "", scopes: []string{},
+        issued_at: 0, expires_at: 0, ownership_json: "null"
+    }
+}
+
+pub fn verify_and_prepare_enrollment(st $&State, doc &json.Doc, root int, agent_pub_pem &string, now int) EnrollmentCheck {
+    if !doc.has(root, "enrollment") || doc.is_null(doc.get(root, "enrollment")) {
+        << EnrollmentCheck{
+            ok: true, has_enrollment: false, status: 200, code: "", message: "",
+            human_id: "", cred_id: "", kind: "", label: "", scopes: []string{},
+            issued_at: 0, expires_at: 0, ownership_json: "null"
+        }
+    }
+    enr := doc.get(root, "enrollment")
+    if !doc.is_dict(enr) || !doc.has(enr, "payload") || !doc.has(enr, "human_sig") {
+        << enroll_fail(400, "ERR_BAD_REQUEST", "enrollment must contain payload and human_sig")
+    }
+    pl := doc.get(enr, "payload")
+    if !doc.is_dict(pl) {
+        << enroll_fail(400, "ERR_BAD_REQUEST", "enrollment.payload must be object")
+    }
+    human_sig := json_str_or(doc, doc.get(enr, "human_sig"), "")
+    kind := json_str_or(doc, doc.get(pl, "kind"), "")
+    cred_id := json_str_or(doc, doc.get(pl, "cred_id"), "")
+    human_id := json_str_or(doc, doc.get(pl, "human_id"), "")
+    hkv := json_int_or(doc, doc.get(pl, "human_key_version"), 0)
+    issued_at := json_int_or(doc, doc.get(pl, "issued_at"), 0)
+    expires_at := json_int_or(doc, doc.get(pl, "expires_at"), 0)
+    label := json_str_or(doc, doc.get(pl, "label"), "")
+    if kind != "enrollment" {
+        << enroll_fail(400, "ERR_BAD_REQUEST", "enrollment.payload.kind must be enrollment")
+    }
+    if !is_valid_cred_id(cred_id + "") || !is_valid_human_id(human_id + "") || hkv < 1 {
+        << enroll_fail(400, "ERR_BAD_REQUEST", "invalid cred_id, human_id, or human_key_version")
+    }
+    if has_forbidden_ctrl(&label) || utf8_char_count(&label) > 64 {
+        << enroll_fail(400, "ERR_BAD_REQUEST", "label must be <=64 chars with no control chars")
+    }
+    if st.used_creds.has(cred_id + "") {
+        << enroll_fail(409, "ERR_CONFLICT", "enrollment credential already consumed")
+    }
+    if expires_at > 0 && now > expires_at {
+        << enroll_fail(403, "ERR_CREDENTIAL_EXPIRED", "enrollment credential expired")
+    }
+    if !doc.has(pl, "scopes") {
+        << enroll_fail(400, "ERR_BAD_REQUEST", "enrollment.payload missing scopes")
+    }
+    sr := parse_scopes_from_json(doc, doc.get(pl, "scopes"))
+    if !sr.ok {
+        << enroll_fail(400, "ERR_BAD_REQUEST", "invalid scopes in enrollment.payload")
+    }
+
+    if st.revoked_humans.has(human_id + "") {
+        << enroll_fail(403, "ERR_HUMAN_REVOKED", "issuing human identity is revoked")
+    }
+    hu := read_human_summary(st, human_id + "")
+    if !hu.found {
+        << enroll_fail(404, "ERR_UNKNOWN_HUMAN", "issuing human_id not found")
+    }
+    if hu.status == "revoked" {
+        map_set($&st.revoked_humans, human_id + "", 1)
+        << enroll_fail(403, "ERR_HUMAN_REVOKED", "issuing human identity is revoked")
+    }
+    hpem := find_human_pubkey_for_version(&hu, hkv)
+    if hpem.len == 0 {
+        << enroll_fail(401, "ERR_BAD_SIGNATURE", "human_key_version not found")
+    }
+    hpk := parse_spki_rsa_pem(&hpem) or (err) {
+        << enroll_fail(500, "ERR_INTERNAL", "stored human public key invalid")
+    }
+    canon_enr := canonical_enrollment_payload(cred_id + "", expires_at, human_id + "", hkv, issued_at, label + "", &sr.scopes)
+    if !verify_pss_message(&hpk, &canon_enr, human_sig + "") {
+        << enroll_fail(401, "ERR_BAD_SIGNATURE", "enrollment human_sig verification failed")
+    }
+
+    // Require and verify agent_binding
+    if !doc.has(root, "agent_binding") || !doc.has(root, "agent_binding_sig") {
+        << enroll_fail(400, "ERR_BAD_REQUEST", "missing agent_binding or agent_binding_sig")
+    }
+    ab := doc.get(root, "agent_binding")
+    if !doc.is_dict(ab) {
+        << enroll_fail(400, "ERR_BAD_REQUEST", "agent_binding must be object")
+    }
+    ab_sig := json_str_or(doc, doc.get(root, "agent_binding_sig"), "")
+    ab_fp := json_str_or(doc, doc.get(ab, "agent_pub_fp"), "")
+    ab_cid := json_str_or(doc, doc.get(ab, "cred_id"), "")
+    ab_hid := json_str_or(doc, doc.get(ab, "human_id"), "")
+    ab_ts := json_int_or(doc, doc.get(ab, "timestamp"), 0)
+
+    expected_fp := pubkey_fingerprint(agent_pub_pem)
+    if ab_fp != expected_fp || ab_cid != cred_id || ab_hid != human_id {
+        << enroll_fail(400, "ERR_BAD_REQUEST", "agent_binding mismatch")
+    }
+    if now - ab_ts > 300 || ab_ts - now > 300 {
+        << enroll_fail(401, "ERR_CLOCK_SKEW", "agent_binding timestamp skew exceeds 300s")
+    }
+    apk := parse_spki_rsa_pem(agent_pub_pem) or (err) {
+        << enroll_fail(400, "ERR_BAD_REQUEST", "agent public key invalid")
+    }
+    canon_ab := canonical_binding_payload(ab_fp + "", ab_cid + "", ab_hid + "", ab_ts)
+    if !verify_pss_message(&apk, &canon_ab, ab_sig + "") {
+        << enroll_fail(401, "ERR_BAD_SIGNATURE", "agent_binding_sig verification failed")
+    }
+
+    ownership_json := "{" +
+        "\"human_id\":" + json.quote(&human_id) + "," +
+        "\"human_key_version\":" + strconv.itoa(hkv) + "," +
+        "\"cred_id\":" + json.quote(&cred_id) + "," +
+        "\"kind\":\"enrollment\"," +
+        "\"label\":" + json.quote(&label) + "," +
+        "\"scopes\":" + scopes_to_json_array(&sr.scopes) + "," +
+        "\"issued_at\":" + strconv.itoa(issued_at) + "," +
+        "\"expires_at\":" + strconv.itoa(expires_at) + "," +
+        "\"status\":\"active\"," +
+        "\"suspend_reason\":\"\"," +
+        "\"revoked_by\":\"\"," +
+        "\"revocation_sig\":\"\"," +
+        "\"payload\":" + canon_enr + "," +
+        "\"human_sig\":" + json.quote(&human_sig) + "," +
+        "\"agent_binding\":" + canon_ab + "," +
+        "\"agent_binding_sig\":" + json.quote(&ab_sig) +
+        "}"
+
+    << EnrollmentCheck{
+        ok: true, has_enrollment: true, status: 200, code: "", message: "",
+        human_id: human_id, cred_id: cred_id, kind: "enrollment", label: label,
+        scopes: clone_str_slice(&sr.scopes), issued_at: issued_at, expires_at: expires_at,
+        ownership_json: ownership_json
+    }
+}
+
+pub fn record_credential_used(st $&State, cred_id string, human_id string, agent_id string, kind string, now int) {
+    map_set($&st.used_creds, cred_id + "", 1)
+    line := "{\"cred_id\":" + json.quote(&cred_id) +
+        ",\"human_id\":" + json.quote(&human_id) +
+        ",\"agent_id\":" + json.quote(&agent_id) +
+        ",\"kind\":" + json.quote(&kind) +
+        ",\"recorded_at\":" + strconv.itoa(now) + "}"
+    append_jsonl_quiet(st.data_dir + "/humans/credentials.jsonl", line)
+}
+
+// =========================================================================
+// Human Identity & Control Plane Handlers
+// =========================================================================
+
+pub fn handle_human_register(st $&State, req &HttpReq, now int) HttpResp {
+    ts_str := strings.trim_space(&req.header("X-Timestamp"))
+    sig_b64 := strings.trim_space(&req.header("X-Signature"))
+    pow_nonce := strings.trim_space(&req.header("X-PoW-Nonce"))
+    if ts_str.len == 0 || sig_b64.len == 0 {
+        << err_resp(401, "ERR_BAD_SIGNATURE", "missing X-Timestamp or X-Signature", 0, 0, 0)
+    }
+    if pow_nonce.len == 0 {
+        << err_resp(400, "ERR_POW_REQUIRED", "X-PoW-Nonce required for human registration", 0, 0, st.pow_bits)
+    }
+    ts := strconv.atoi(&ts_str) or (err) {
+        << err_resp(401, "ERR_CLOCK_SKEW", "invalid X-Timestamp", 0, 0, 0)
+    }
+    diff := now - ts
+    if diff > 60 || diff < -60 {
+        << err_resp(401, "ERR_CLOCK_SKEW", "timestamp skew exceeds 60s", 0, 0, 0)
+    }
+    sweep_replay_cache(st, now)
+    sig_hash := sha256.sum256(sig_b64 + "")
+    if st.replay_cache.has(sig_hash + "") {
+        << err_resp(401, "ERR_REPLAY", "replayed request signature", 0, 0, 0)
+    }
+
+    body := req.body()
+    doc := json.parse(&body)
+    if !doc.ok() { << err_resp(400, "ERR_BAD_REQUEST", "invalid JSON body", 0, 0, 0) }
+    r := doc.root()
+    if !doc.is_dict(r) || !doc.has(r, "public_key_pem") {
+        << err_resp(400, "ERR_BAD_REQUEST", "missing public_key_pem", 0, 0, 0)
+    }
+    raw_pem := doc.as_string(doc.get(r, "public_key_pem")) or (err) {
+        << err_resp(400, "ERR_BAD_REQUEST", "public_key_pem must be string", 0, 0, 0)
+    }
+    if !verify_pow_register(&raw_pem, ts_str + "", pow_nonce + "", st.pow_bits) {
+        << err_resp(400, "ERR_POW_INSUFFICIENT", "registration PoW insufficient", 0, 0, st.pow_bits)
+    }
+    norm_pem := normalize_pem(&raw_pem)
+    pk := parse_spki_rsa_pem(&norm_pem) or (err) {
+        << err_resp(400, "ERR_BAD_REQUEST", err.msg(), 0, 0, 0)
+    }
+    if !verify_request_sig(&pk, "POST", req.path(), ts_str + "", &body, sig_b64 + "") {
+        << err_resp(401, "ERR_BAD_SIGNATURE", "RSA-PSS signature verification failed", 0, 0, 0)
+    }
+    map_set($&st.replay_cache, sig_hash + "", now)
+
+    $name := ""
+    $bio := ""
+    $homepage := ""
+    if doc.has(r, "profile") && doc.is_dict(doc.get(r, "profile")) {
+        pn := doc.get(r, "profile")
+        if doc.has(pn, "name") {
+            name = json_str_or(&doc, doc.get(pn, "name"), "")
+            if has_forbidden_ctrl(&name) || utf8_char_count(&name) > 64 {
+                << err_resp(400, "ERR_BAD_REQUEST", "human profile.name must be <=64 chars", 0, 0, 0)
+            }
+        }
+        if doc.has(pn, "bio") {
+            bio = json_str_or(&doc, doc.get(pn, "bio"), "")
+            if has_forbidden_ctrl(&bio) || utf8_char_count(&bio) > 256 {
+                << err_resp(400, "ERR_BAD_REQUEST", "human profile.bio must be <=256 chars", 0, 0, 0)
+            }
+        }
+        if doc.has(pn, "homepage") {
+            homepage = json_str_or(&doc, doc.get(pn, "homepage"), "")
+            if homepage.len > 0 && !is_https_url(&homepage) {
+                << err_resp(400, "ERR_BAD_REQUEST", "homepage must be https:// URL (<=256 chars)", 0, 0, 0)
+            }
+        }
+    }
+
+    $hid := ""
+    $created := false
+    for attempt in 0:16 {
+        cand := generate_human_id() or (err) {
+            << err_resp(500, "ERR_INTERNAL", "RNG failure", 0, 0, 0)
+        }
+        bdir := st.data_dir + "/humans/" + human_bucket(cand + "")
+        os.mkdir_all(bdir) or (err) {
+            << err_resp(500, "ERR_INTERNAL", "mkdir failed", 0, 0, 0)
+        }
+        jpath := human_json_path(st, cand + "")
+        $f := os.create_excl(jpath) or (err) { -> }
+        close_file_quiet($&f)
+        hid = cand
+        created = true
+        <-
+    }
+    if !created {
+        << err_resp(500, "ERR_INTERNAL", "failed allocating unique human_id", 0, 0, 0)
+    }
+
+    hdoc := "{" +
+        "\"human_id\":" + json.quote(&hid) + "," +
+        "\"created_at\":" + strconv.itoa(now) + "," +
+        "\"revision\":0," +
+        "\"key_version\":1," +
+        "\"status\":\"active\"," +
+        "\"current_public_key_pem\":" + json.quote(&norm_pem) + "," +
+        "\"key_history\":[]," +
+        "\"profile\":{\"name\":" + json.quote(&name) + ",\"bio\":" + json.quote(&bio) + ",\"homepage\":" + json.quote(&homepage) + ",\"updated_at\":" + strconv.itoa(now) + "}," +
+        "\"agents\":[]," +
+        "\"signature\":null" +
+        "}\n"
+
+    write_atomic(human_json_path(st, hid + ""), &hdoc) or (err) {
+        << err_resp(500, "ERR_INTERNAL", "failed writing human json", 0, 0, 0)
+    }
+    write_atomic(human_pem_path(st, hid + ""), &norm_pem) or (err) {
+        << err_resp(500, "ERR_INTERNAL", "failed writing human public pem", 0, 0, 0)
+    }
+    reg_line := "{\"human_id\":" + json.quote(&hid) + ",\"created_at\":" + strconv.itoa(now) + ",\"key_version\":1,\"revision\":0}"
+    append_jsonl_quiet(st.data_dir + "/humans/registry.jsonl", reg_line)
+
+    fp := pubkey_fingerprint(&norm_pem)
+    resp := "{\"human_id\":" + json.quote(&hid) + ",\"created_at\":" + strconv.itoa(now) + ",\"key_version\":1,\"revision\":0,\"fingerprint\":" + json.quote(&fp) + "}"
+    << json_resp(201, resp)
+}
+
+pub fn handle_human_profile_update(st $&State, req &HttpReq, now int) HttpResp {
+    au := authenticate_human(st, req, now)
+    if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
+    doc := json.parse(&req.body())
+    if !doc.ok() { << err_resp(400, "ERR_BAD_REQUEST", "invalid JSON", 0, 0, 0) }
+    r := doc.root()
+    if !doc.is_dict(r) || !doc.has(r, "revision") {
+        << err_resp(400, "ERR_BAD_REQUEST", "missing revision", 0, 0, 0)
+    }
+    rev := json_int_or(&doc, doc.get(r, "revision"), 0)
+    if rev != au.human.revision + 1 {
+        << err_resp(400, "ERR_REVISION_NOT_MONOTONIC", "revision must equal current revision + 1 (" + strconv.itoa(au.human.revision + 1) + ")", 0, 0, 0)
+    }
+
+    $name := au.human.name + ""
+    $bio := au.human.bio + ""
+    $homepage := au.human.homepage + ""
+    if doc.has(r, "profile") && doc.is_dict(doc.get(r, "profile")) {
+        pn := doc.get(r, "profile")
+        if doc.has(pn, "name") {
+            name = json_str_or(&doc, doc.get(pn, "name"), "")
+            if has_forbidden_ctrl(&name) || utf8_char_count(&name) > 64 {
+                << err_resp(400, "ERR_BAD_REQUEST", "profile.name must be <=64 chars", 0, 0, 0)
+            }
+        }
+        if doc.has(pn, "bio") {
+            bio = json_str_or(&doc, doc.get(pn, "bio"), "")
+            if has_forbidden_ctrl(&bio) || utf8_char_count(&bio) > 256 {
+                << err_resp(400, "ERR_BAD_REQUEST", "profile.bio must be <=256 chars", 0, 0, 0)
+            }
+        }
+        if doc.has(pn, "homepage") {
+            homepage = json_str_or(&doc, doc.get(pn, "homepage"), "")
+            if homepage.len > 0 && !is_https_url(&homepage) {
+                << err_resp(400, "ERR_BAD_REQUEST", "homepage must be https:// URL (<=256 chars)", 0, 0, 0)
+            }
+        }
+    }
+
+    odoc := json.parse(&au.human.raw_json)
+    $kh_json := "[]"
+    $agents_json := "[]"
+    if odoc.ok() {
+        oroot := odoc.root()
+        if odoc.has(oroot, "key_history") { kh_json = json_encode_or(&odoc, odoc.get(oroot, "key_history"), "[]") }
+        if odoc.has(oroot, "agents") { agents_json = json_encode_or(&odoc, odoc.get(oroot, "agents"), "[]") }
+    }
+    $sig_json := "null"
+    if doc.has(r, "signature") {
+        sv := json_str_or(&doc, doc.get(r, "signature"), "")
+        if sv.len > 0 { sig_json = json.quote(&sv) }
+    }
+
+    hid := au.human_id + ""
+    hdoc := "{" +
+        "\"human_id\":" + json.quote(&hid) + "," +
+        "\"created_at\":" + strconv.itoa(au.human.created_at) + "," +
+        "\"revision\":" + strconv.itoa(rev) + "," +
+        "\"key_version\":" + strconv.itoa(au.human.key_version) + "," +
+        "\"status\":\"active\"," +
+        "\"current_public_key_pem\":" + json.quote(&au.human.pub_pem) + "," +
+        "\"key_history\":" + kh_json + "," +
+        "\"profile\":{\"name\":" + json.quote(&name) + ",\"bio\":" + json.quote(&bio) + ",\"homepage\":" + json.quote(&homepage) + ",\"updated_at\":" + strconv.itoa(now) + "}," +
+        "\"agents\":" + agents_json + "," +
+        "\"signature\":" + sig_json +
+        "}\n"
+
+    write_atomic(human_json_path(st, hid + ""), &hdoc) or (err) {
+        << err_resp(500, "ERR_INTERNAL", "failed saving human profile", 0, 0, 0)
+    }
+    << json_resp(200, hdoc)
+}
+
+pub fn handle_human_rotate_key(st $&State, req &HttpReq, now int) HttpResp {
+    au := authenticate_human(st, req, now)
+    if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
+    sig_new_hdr := strings.trim_space(&req.header("X-Signature-New"))
+    if sig_new_hdr.len == 0 {
+        << err_resp(401, "ERR_BAD_SIGNATURE", "missing X-Signature-New header", 0, 0, 0)
+    }
+    body := req.body()
+    doc := json.parse(&body)
+    if !doc.ok() { << err_resp(400, "ERR_BAD_REQUEST", "invalid JSON", 0, 0, 0) }
+    r := doc.root()
+    if !doc.is_dict(r) || !doc.has(r, "payload") || !doc.has(r, "old_sig") || !doc.has(r, "new_sig") {
+        << err_resp(400, "ERR_BAD_REQUEST", "missing payload, old_sig, or new_sig", 0, 0, 0)
+    }
+    pl := doc.get(r, "payload")
+    pl_hid := json_str_or(&doc, doc.get(pl, "human_id"), "")
+    pl_kv := json_int_or(&doc, doc.get(pl, "key_version"), 0)
+    new_pem_raw := json_str_or(&doc, doc.get(pl, "new_public_key_pem"), "")
+    pl_ts := json_int_or(&doc, doc.get(pl, "timestamp"), 0)
+    old_sig := json_str_or(&doc, doc.get(r, "old_sig"), "")
+    new_sig := json_str_or(&doc, doc.get(r, "new_sig"), "")
+
+    if pl_hid != au.human_id { << err_resp(400, "ERR_BAD_REQUEST", "payload human_id mismatch", 0, 0, 0) }
+    if pl_kv != au.key_version + 1 { << err_resp(400, "ERR_BAD_REQUEST", "key_version must equal current + 1", 0, 0, 0) }
+    if now - pl_ts > 60 || pl_ts - now > 60 { << err_resp(401, "ERR_CLOCK_SKEW", "payload timestamp skew exceeds 60s", 0, 0, 0) }
+
+    norm_new_pem := normalize_pem(&new_pem_raw)
+    new_pk := parse_spki_rsa_pem(&norm_new_pem) or (err) { << err_resp(400, "ERR_BAD_REQUEST", err.msg(), 0, 0, 0) }
+    old_pk := parse_spki_rsa_pem(&au.human.pub_pem) or (err) { << err_resp(500, "ERR_INTERNAL", "stored key invalid", 0, 0, 0) }
+    if !verify_request_sig(&new_pk, "POST", req.path(), strconv.itoa(au.ts), &body, sig_new_hdr + "") {
+        << err_resp(401, "ERR_BAD_SIGNATURE", "X-Signature-New verification failed", 0, 0, 0)
+    }
+
+    canon_pl := "{\"human_id\":" + json.quote(&pl_hid) +
+        ",\"key_version\":" + strconv.itoa(pl_kv) +
+        ",\"new_public_key_pem\":" + json.quote(&norm_new_pem) +
+        ",\"timestamp\":" + strconv.itoa(pl_ts) + "}"
+    raw_pl := extract_raw_json_object(&body, "payload")
+    $old_ok := verify_pss_message(&old_pk, &canon_pl, old_sig + "")
+    $new_ok := verify_pss_message(&new_pk, &canon_pl, new_sig + "")
+    if (!old_ok || !new_ok) && raw_pl.len > 0 {
+        old_ok = verify_pss_message(&old_pk, &raw_pl, old_sig + "")
+        new_ok = verify_pss_message(&new_pk, &raw_pl, new_sig + "")
+    }
+    if !old_ok || !new_ok {
+        << err_resp(401, "ERR_BAD_SIGNATURE", "dual payload signature verification failed", 0, 0, 0)
+    }
+
+    odoc := json.parse(&au.human.raw_json)
+    $hist_items := []string{}
+    $agents_json := "[]"
+    if odoc.ok() {
+        oroot := odoc.root()
+        if odoc.has(oroot, "key_history") && odoc.is_list(odoc.get(oroot, "key_history")) {
+            kh := odoc.get(oroot, "key_history")
+            for i in 0:odoc.count(kh) {
+                es := json_encode_or(&odoc, odoc.at(kh, i), "")
+                if es.len > 0 { hist_items.push(es) }
+            }
+        }
+        if odoc.has(oroot, "agents") {
+            agents_json = json_encode_or(&odoc, odoc.get(oroot, "agents"), "[]")
+        }
+    }
+    retired := "{\"version\":" + strconv.itoa(au.key_version) +
+        ",\"public_key_pem\":" + json.quote(&au.human.pub_pem) +
+        ",\"valid_from\":" + strconv.itoa(au.human.created_at) +
+        ",\"valid_until\":" + strconv.itoa(now) +
+        ",\"rotated_by_old_sig\":" + json.quote(&old_sig) +
+        ",\"rotated_by_new_sig\":" + json.quote(&new_sig) + "}"
+    hist_items.push(retired)
+
+    hid := au.human_id + ""
+    updated := "{" +
+        "\"human_id\":" + json.quote(&hid) + "," +
+        "\"created_at\":" + strconv.itoa(au.human.created_at) + "," +
+        "\"revision\":" + strconv.itoa(au.human.revision + 1) + "," +
+        "\"key_version\":" + strconv.itoa(pl_kv) + "," +
+        "\"status\":\"active\"," +
+        "\"current_public_key_pem\":" + json.quote(&norm_new_pem) + "," +
+        "\"key_history\":[" + strings.join(hist_items, ",") + "]," +
+        "\"profile\":{\"name\":" + json.quote(&au.human.name) + ",\"bio\":" + json.quote(&au.human.bio) + ",\"homepage\":" + json.quote(&au.human.homepage) + ",\"updated_at\":" + strconv.itoa(now) + "}," +
+        "\"agents\":" + agents_json + "," +
+        "\"signature\":" + json.quote(&new_sig) +
+        "}\n"
+
+    write_atomic(human_json_path(st, hid + ""), &updated) or (err) {
+        << err_resp(500, "ERR_INTERNAL", "failed saving rotated human doc", 0, 0, 0)
+    }
+    write_atomic(human_pem_path(st, hid + ""), &norm_new_pem) or (err) {
+        << err_resp(500, "ERR_INTERNAL", "failed saving rotated human pem", 0, 0, 0)
+    }
+    fp := pubkey_fingerprint(&norm_new_pem)
+    << json_resp(200, "{\"ok\":true,\"human_id\":" + json.quote(&hid) + ",\"key_version\":" + strconv.itoa(pl_kv) + ",\"fingerprint\":" + json.quote(&fp) + "}")
+}
+
+fn mark_human_revoked(st $&State, hid string) {
+    map_set($&st.revoked_humans, hid, 1)
+}
+
+fn mark_agent_revoked(st $&State, aid string) {
+    map_set($&st.revoked, aid, 1)
+}
+
+pub fn handle_human_revoke(hub $&HubState, req &HttpReq, now int) HttpResp {
+    au := authenticate_human($&hub.st, req, now)
+    if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
+    odoc := json.parse(&au.human.raw_json)
+    $kh_json := "[]"
+    $agents_json := "[]"
+    $owned_ids := []string{}
+    if odoc.ok() {
+        oroot := odoc.root()
+        if odoc.has(oroot, "key_history") { kh_json = json_encode_or(&odoc, odoc.get(oroot, "key_history"), "[]") }
+        if odoc.has(oroot, "agents") {
+            agents_json = json_encode_or(&odoc, odoc.get(oroot, "agents"), "[]")
+            arr := odoc.get(oroot, "agents")
+            if odoc.is_list(arr) {
+                for i in 0:odoc.count(arr) {
+                    el := odoc.at(arr, i)
+                    if odoc.is_dict(el) && odoc.has(el, "agent_id") {
+                        aid := json_str_or(&odoc, odoc.get(el, "agent_id"), "")
+                        if is_valid_agent_id(aid + "") { owned_ids.push(aid) }
+                    }
+                }
+            }
+        }
+    }
+    hid := au.human_id + ""
+    rev_doc := "{" +
+        "\"human_id\":" + json.quote(&hid) + "," +
+        "\"created_at\":" + strconv.itoa(au.human.created_at) + "," +
+        "\"revision\":" + strconv.itoa(au.human.revision + 1) + "," +
+        "\"key_version\":" + strconv.itoa(au.human.key_version) + "," +
+        "\"status\":\"revoked\"," +
+        "\"current_public_key_pem\":" + json.quote(&au.human.pub_pem) + "," +
+        "\"key_history\":" + kh_json + "," +
+        "\"profile\":{\"name\":" + json.quote(&au.human.name) + ",\"bio\":" + json.quote(&au.human.bio) + ",\"homepage\":" + json.quote(&au.human.homepage) + ",\"updated_at\":" + strconv.itoa(now) + "}," +
+        "\"agents\":" + agents_json + "," +
+        "\"signature\":" + json.quote(&au.sig_b64) +
+        "}\n"
+
+    write_atomic(human_json_path(&hub.st, hid + ""), &rev_doc) or (err) {
+        << err_resp(500, "ERR_INTERNAL", "failed persisting human revocation", 0, 0, 0)
+    }
+    rev_line := "{\"human_id\":" + json.quote(&hid) + ",\"revoked_at\":" + strconv.itoa(now) + "}"
+    append_jsonl_quiet(hub.st.data_dir + "/humans/revoked.jsonl", rev_line)
+    mark_human_revoked($&hub.st, hid + "")
+
+    for i in 0:owned_ids.len {
+        hub_disconnect_agent(hub, owned_ids[i] + "")
+    }
+    << json_resp(200, "{\"ok\":true,\"human_id\":" + json.quote(&hid) + ",\"status\":\"revoked\"}")
+}
+
+pub fn handle_get_human_json(st &State, hid string) HttpResp {
+    if !is_valid_human_id(hid + "") {
+        << err_resp(404, "ERR_NOT_FOUND", "human not found", 0, 0, 0)
+    }
+    raw := os.read(human_json_path(st, hid + "")) or (err) {
+        << err_resp(404, "ERR_NOT_FOUND", "human not found", 0, 0, 0)
+    }
+    << json_resp(200, raw)
+}
+
+pub fn handle_get_human_pem(st &State, hid string) HttpResp {
+    if !is_valid_human_id(hid + "") {
+        << err_resp(404, "ERR_NOT_FOUND", "human not found", 0, 0, 0)
+    }
+    raw := os.read(human_pem_path(st, hid + "")) or (err) {
+        << err_resp(404, "ERR_NOT_FOUND", "human not found", 0, 0, 0)
+    }
+    << http_resp(200, "application/x-pem-file; charset=utf-8", "", &raw)
+}
+
+pub fn handle_human_list_agents(st $&State, req &HttpReq, now int) HttpResp {
+    au := authenticate_human(st, req, now)
+    if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
+    hdoc := json.parse(&au.human.raw_json)
+    $items := []string{}
+    if hdoc.ok() && hdoc.has(hdoc.root(), "agents") && hdoc.is_list(hdoc.get(hdoc.root(), "agents")) {
+        arr := hdoc.get(hdoc.root(), "agents")
+        for i in 0:hdoc.count(arr) {
+            el := hdoc.at(arr, i)
+            if !hdoc.is_dict(el) { -> }
+            aid := json_str_or(&hdoc, hdoc.get(el, "agent_id"), "")
+            ag := read_agent_summary(st, aid + "")
+            cid := json_str_or(&hdoc, hdoc.get(el, "cred_id"), "")
+            kind := json_str_or(&hdoc, hdoc.get(el, "kind"), "")
+            lbl := json_str_or(&hdoc, hdoc.get(el, "label"), "")
+            iat := json_int_or(&hdoc, hdoc.get(el, "issued_at"), 0)
+            exp := json_int_or(&hdoc, hdoc.get(el, "expires_at"), 0)
+            sc_s := json_encode_or(&hdoc, hdoc.get(el, "scopes"), "[]")
+            $ost := "active"
+            if ag.found && ag.ownership_status.len > 0 { ost = ag.ownership_status + "" }
+            $ast := "unknown"
+            $akv := 0
+            $aname := ""
+            if ag.found {
+                ast = ag.status + ""
+                akv = ag.key_version
+                aname = ag.name + ""
+            }
+            items.push("{\"agent_id\":" + json.quote(&aid) +
+                ",\"name\":" + json.quote(&aname) +
+                ",\"agent_status\":" + json.quote(&ast) +
+                ",\"ownership_status\":" + json.quote(&ost) +
+                ",\"key_version\":" + strconv.itoa(akv) +
+                ",\"cred_id\":" + json.quote(&cid) +
+                ",\"kind\":" + json.quote(&kind) +
+                ",\"label\":" + json.quote(&lbl) +
+                ",\"scopes\":" + sc_s +
+                ",\"issued_at\":" + strconv.itoa(iat) +
+                ",\"expires_at\":" + strconv.itoa(exp) + "}")
+        }
+    }
+    << json_resp(200, "{\"human_id\":" + json.quote(&au.human_id) + ",\"agents\":[" + strings.join(items, ",") + "]}")
+}
+
+pub fn handle_human_grant_credential(hub $&HubState, req &HttpReq, aid string, now int) HttpResp {
+    au := authenticate_human($&hub.st, req, now)
+    if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
+    if !is_valid_agent_id(aid + "") { << err_resp(404, "ERR_NOT_FOUND", "agent not found", 0, 0, 0) }
+
+    ag := read_agent_summary(&hub.st, aid + "")
+    if !ag.found { << err_resp(404, "ERR_NOT_FOUND", "agent not found", 0, 0, 0) }
+    if ag.status == "revoked" { << err_resp(403, "ERR_REVOKED", "agent is permanently revoked", 0, 0, 0) }
+
+    body := req.body()
+    doc := json.parse(&body)
+    if !doc.ok() { << err_resp(400, "ERR_BAD_REQUEST", "invalid JSON body", 0, 0, 0) }
+    r := doc.root()
+    if !doc.is_dict(r) || !doc.has(r, "payload") || !doc.has(r, "human_sig") {
+        << err_resp(400, "ERR_BAD_REQUEST", "missing payload or human_sig", 0, 0, 0)
+    }
+    pl := doc.get(r, "payload")
+    if !doc.is_dict(pl) { << err_resp(400, "ERR_BAD_REQUEST", "payload must be object", 0, 0, 0) }
+    human_sig := json_str_or(&doc, doc.get(r, "human_sig"), "")
+    kind := json_str_or(&doc, doc.get(pl, "kind"), "")
+    pl_aid := json_str_or(&doc, doc.get(pl, "agent_id"), "")
+    pl_akv := json_int_or(&doc, doc.get(pl, "agent_key_version"), 0)
+    pl_afp := json_str_or(&doc, doc.get(pl, "agent_pub_fp"), "")
+    cred_id := json_str_or(&doc, doc.get(pl, "cred_id"), "")
+    pl_hid := json_str_or(&doc, doc.get(pl, "human_id"), "")
+    pl_hkv := json_int_or(&doc, doc.get(pl, "human_key_version"), 0)
+    iat := json_int_or(&doc, doc.get(pl, "issued_at"), 0)
+    exp := json_int_or(&doc, doc.get(pl, "expires_at"), 0)
+    lbl := json_str_or(&doc, doc.get(pl, "label"), "")
+
+    if kind != "agent_cert" || pl_aid != aid || pl_hid != au.human_id {
+        << err_resp(400, "ERR_BAD_REQUEST", "agent_cert payload identity mismatch", 0, 0, 0)
+    }
+    if pl_akv != ag.key_version {
+        << err_resp(400, "ERR_BAD_REQUEST", "agent_key_version mismatch", 0, 0, 0)
+    }
+    expected_fp := pubkey_fingerprint(&ag.pub_pem)
+    if pl_afp != expected_fp {
+        << err_resp(400, "ERR_BAD_REQUEST", "agent_pub_fp mismatch", 0, 0, 0)
+    }
+    if !is_valid_cred_id(cred_id + "") || pl_hkv < 1 {
+        << err_resp(400, "ERR_BAD_REQUEST", "invalid cred_id or human_key_version", 0, 0, 0)
+    }
+    if has_forbidden_ctrl(&lbl) || utf8_char_count(&lbl) > 64 {
+        << err_resp(400, "ERR_BAD_REQUEST", "label must be <=64 chars", 0, 0, 0)
+    }
+    if exp > 0 && now > exp {
+        << err_resp(400, "ERR_BAD_REQUEST", "credential already expired", 0, 0, 0)
+    }
+    if hub.st.used_creds.has(cred_id + "") {
+        << err_resp(409, "ERR_CONFLICT", "cred_id already used", 0, 0, 0)
+    }
+    if !doc.has(pl, "scopes") {
+        << err_resp(400, "ERR_BAD_REQUEST", "missing scopes", 0, 0, 0)
+    }
+    sr := parse_scopes_from_json(&doc, doc.get(pl, "scopes"))
+    if !sr.ok { << err_resp(400, "ERR_BAD_REQUEST", "invalid scopes", 0, 0, 0) }
+
+    hpem := find_human_pubkey_for_version(&au.human, pl_hkv)
+    if hpem.len == 0 { << err_resp(401, "ERR_BAD_SIGNATURE", "human_key_version not found", 0, 0, 0) }
+    hpk := parse_spki_rsa_pem(&hpem) or (err) { << err_resp(500, "ERR_INTERNAL", "human key invalid", 0, 0, 0) }
+    canon_cert := canonical_agent_cert_payload(aid + "", pl_akv, expected_fp + "", cred_id + "", exp, au.human_id + "", pl_hkv, iat, lbl + "", &sr.scopes)
+    if !verify_pss_message(&hpk, &canon_cert, human_sig + "") {
+        << err_resp(401, "ERR_BAD_SIGNATURE", "agent_cert human_sig verification failed", 0, 0, 0)
+    }
+
+    // Ownership authorization: already owned by same human, OR standalone adoption_proof signed by agent
+    $ab_json := "null"
+    $ab_sig := ""
+    if ag.owner_human_id.len > 0 {
+        if ag.owner_human_id != au.human_id {
+            << err_resp(403, "ERR_FORBIDDEN", "agent is already owned by another human", 0, 0, 0)
+        }
+    } else {
+        if !doc.has(r, "adoption_proof") || !doc.is_dict(doc.get(r, "adoption_proof")) {
+            << err_resp(403, "ERR_FORBIDDEN", "adopting an autonomous agent requires signed adoption_proof", 0, 0, 0)
+        }
+        ap := doc.get(r, "adoption_proof")
+        if !doc.has(ap, "payload") || !doc.has(ap, "agent_sig") || !doc.is_dict(doc.get(ap, "payload")) {
+            << err_resp(400, "ERR_BAD_REQUEST", "invalid adoption_proof format", 0, 0, 0)
+        }
+        apl := doc.get(ap, "payload")
+        ap_aid := json_str_or(&doc, doc.get(apl, "agent_id"), "")
+        ap_fp := json_str_or(&doc, doc.get(apl, "agent_pub_fp"), "")
+        ap_hid := json_str_or(&doc, doc.get(apl, "human_id"), "")
+        ap_ts := json_int_or(&doc, doc.get(apl, "timestamp"), 0)
+        asig := json_str_or(&doc, doc.get(ap, "agent_sig"), "")
+        if ap_aid != aid || ap_fp != expected_fp || ap_hid != au.human_id {
+            << err_resp(400, "ERR_BAD_REQUEST", "adoption_proof identity mismatch", 0, 0, 0)
+        }
+        if now - ap_ts > 3600 || ap_ts - now > 3600 {
+            << err_resp(401, "ERR_CLOCK_SKEW", "adoption_proof expired (>3600s)", 0, 0, 0)
+        }
+        apk := parse_spki_rsa_pem(&ag.pub_pem) or (err) { << err_resp(500, "ERR_INTERNAL", "agent key invalid", 0, 0, 0) }
+        canon_ap := canonical_adoption_payload(aid + "", expected_fp + "", au.human_id + "", ap_ts)
+        if !verify_pss_message(&apk, &canon_ap, asig + "") {
+            << err_resp(401, "ERR_BAD_SIGNATURE", "adoption_proof agent_sig verification failed", 0, 0, 0)
+        }
+        ab_json = canon_ap
+        ab_sig = asig
+    }
+
+    $next_ost := "active"
+    if ag.ownership_status == "suspended" {
+        next_ost = "suspended"
+    }
+    ownership_json := "{" +
+        "\"human_id\":" + json.quote(&au.human_id) + "," +
+        "\"human_key_version\":" + strconv.itoa(pl_hkv) + "," +
+        "\"cred_id\":" + json.quote(&cred_id) + "," +
+        "\"kind\":\"agent_cert\"," +
+        "\"label\":" + json.quote(&lbl) + "," +
+        "\"scopes\":" + scopes_to_json_array(&sr.scopes) + "," +
+        "\"issued_at\":" + strconv.itoa(iat) + "," +
+        "\"expires_at\":" + strconv.itoa(exp) + "," +
+        "\"status\":" + json.quote(&next_ost) + "," +
+        "\"suspend_reason\":" + json.quote(&ag.ownership_suspend_reason) + "," +
+        "\"revoked_by\":\"\"," +
+        "\"revocation_sig\":\"\"," +
+        "\"payload\":" + canon_cert + "," +
+        "\"human_sig\":" + json.quote(&human_sig) + "," +
+        "\"agent_binding\":" + ab_json + "," +
+        "\"agent_binding_sig\":" + json.quote(&ab_sig) +
+        "}"
+
+    odoc := json.parse(&ag.raw_json)
+    $kh_json := "[]"
+    $ext_json := "{\"accept_email\":false,\"dm_policy\":\"friends\"}"
+    $sig_json := "null"
+    if odoc.ok() {
+        oroot := odoc.root()
+        if odoc.has(oroot, "key_history") { kh_json = json_encode_or(&odoc, odoc.get(oroot, "key_history"), "[]") }
+        if odoc.has(oroot, "extensions") { ext_json = json_encode_or(&odoc, odoc.get(oroot, "extensions"), ext_json + "") }
+        if odoc.has(oroot, "signature") && !odoc.is_null(odoc.get(oroot, "signature")) {
+            sv := json_str_or(&odoc, odoc.get(oroot, "signature"), "")
+            if sv.len > 0 { sig_json = json.quote(&sv) }
+        }
+    }
+
+    rewrite_agent_doc_full($&hub.st, &odoc, aid + "", ag.created_at, ag.revision + 1, ag.key_version,
+        ag.status + "", "null", &ag.pub_pem, kh_json, &ag.name, &ag.bio, now, ext_json, ownership_json, sig_json) or (err) {
+        << err_resp(500, "ERR_INTERNAL", "failed updating agent credential", 0, 0, 0)
+    }
+    record_credential_used($&hub.st, cred_id + "", au.human_id + "", aid + "", "agent_cert", now)
+    sync_human_agent_roster($&hub.st, au.human_id + "", aid + "", cred_id + "", "agent_cert", lbl + "", &sr.scopes, next_ost + "", iat, exp) or (err) {
+        << err_resp(500, "ERR_INTERNAL", "failed syncing human agent roster", 0, 0, 0)
+    }
+    << json_resp(200, "{\"ok\":true,\"human_id\":" + json.quote(&au.human_id) + ",\"agent_id\":" + json.quote(&aid) + ",\"cred_id\":" + json.quote(&cred_id) + ",\"kind\":\"agent_cert\",\"status\":" + json.quote(&next_ost) + "}")
+}
+
+fn update_owned_agent_ownership_status(hub $&HubState, aid string, ag &AgentSummary, new_ost string, reason string, agent_status string, succ_json string, rev_by string, rev_sig string, now int) int {
+    odoc := json.parse(&ag.raw_json)
+    if !odoc.ok() || !odoc.has(odoc.root(), "ownership") { >> errors.new("missing ownership") }
+    oroot := odoc.root()
+    on := odoc.get(oroot, "ownership")
+    if !odoc.is_dict(on) { >> errors.new("ownership is null") }
+
+    pl_s := json_encode_or(&odoc, odoc.get(on, "payload"), "null")
+    hsig := json_str_or(&odoc, odoc.get(on, "human_sig"), "")
+    $ab_s := "null"
+    if odoc.has(on, "agent_binding") && !odoc.is_null(odoc.get(on, "agent_binding")) {
+        ab_s = json_encode_or(&odoc, odoc.get(on, "agent_binding"), "null")
+    }
+    ab_sig := json_str_or(&odoc, odoc.get(on, "agent_binding_sig"), "")
+    hkv := json_int_or(&odoc, odoc.get(on, "human_key_version"), 1)
+
+    new_ownership := "{" +
+        "\"human_id\":" + json.quote(&ag.owner_human_id) + "," +
+        "\"human_key_version\":" + strconv.itoa(hkv) + "," +
+        "\"cred_id\":" + json.quote(&ag.cred_id) + "," +
+        "\"kind\":" + json.quote(&ag.ownership_kind) + "," +
+        "\"label\":" + json.quote(&ag.ownership_label) + "," +
+        "\"scopes\":" + scopes_to_json_array(&ag.cred_scopes) + "," +
+        "\"issued_at\":" + strconv.itoa(ag.cred_issued_at) + "," +
+        "\"expires_at\":" + strconv.itoa(ag.cred_expires_at) + "," +
+        "\"status\":" + json.quote(&new_ost) + "," +
+        "\"suspend_reason\":" + json.quote(&reason) + "," +
+        "\"revoked_by\":" + json.quote(&rev_by) + "," +
+        "\"revocation_sig\":" + json.quote(&rev_sig) + "," +
+        "\"payload\":" + pl_s + "," +
+        "\"human_sig\":" + json.quote(&hsig) + "," +
+        "\"agent_binding\":" + ab_s + "," +
+        "\"agent_binding_sig\":" + json.quote(&ab_sig) +
+        "}"
+
+    $kh_json := "[]"
+    $ext_json := "{\"accept_email\":false,\"dm_policy\":\"friends\"}"
+    $sig_json := "null"
+    if odoc.has(oroot, "key_history") { kh_json = json_encode_or(&odoc, odoc.get(oroot, "key_history"), "[]") }
+    if odoc.has(oroot, "extensions") { ext_json = json_encode_or(&odoc, odoc.get(oroot, "extensions"), ext_json + "") }
+    if odoc.has(oroot, "signature") && !odoc.is_null(odoc.get(oroot, "signature")) {
+        sv := json_str_or(&odoc, odoc.get(oroot, "signature"), "")
+        if sv.len > 0 { sig_json = json.quote(&sv) }
+    }
+
+    rewrite_agent_doc_full($&hub.st, &odoc, aid + "", ag.created_at, ag.revision + 1, ag.key_version,
+        agent_status, succ_json, &ag.pub_pem, kh_json, &ag.name, &ag.bio, now, ext_json, new_ownership, sig_json) or >>
+    sync_human_agent_roster($&hub.st, ag.owner_human_id + "", aid + "", ag.cred_id + "", ag.ownership_kind + "",
+        ag.ownership_label + "", &ag.cred_scopes, new_ost + "", ag.cred_issued_at, ag.cred_expires_at) or >>
+    << 0
+}
+
+pub fn handle_human_suspend_agent(hub $&HubState, req &HttpReq, aid string, now int) HttpResp {
+    au := authenticate_human($&hub.st, req, now)
+    if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
+    if !is_valid_agent_id(aid + "") { << err_resp(404, "ERR_NOT_FOUND", "agent not found", 0, 0, 0) }
+    ag := read_agent_summary(&hub.st, aid + "")
+    if !ag.found { << err_resp(404, "ERR_NOT_FOUND", "agent not found", 0, 0, 0) }
+    if ag.owner_human_id != au.human_id { << err_resp(403, "ERR_FORBIDDEN", "not owner of agent", 0, 0, 0) }
+    if ag.status == "revoked" { << err_resp(403, "ERR_REVOKED", "agent already permanently revoked", 0, 0, 0) }
+
+    $reason := ""
+    body := req.body()
+    if strings.trim_space(&body).len > 0 {
+        doc := json.parse(&body)
+        if !doc.ok() { << err_resp(400, "ERR_BAD_REQUEST", "invalid JSON", 0, 0, 0) }
+        if doc.is_dict(doc.root()) && doc.has(doc.root(), "reason") {
+            reason = json_str_or(&doc, doc.get(doc.root(), "reason"), "")
+            if has_forbidden_ctrl(&reason) || utf8_char_count(&reason) > 256 {
+                << err_resp(400, "ERR_BAD_REQUEST", "reason must be <=256 chars", 0, 0, 0)
+            }
+        }
+    }
+
+    update_owned_agent_ownership_status(hub, aid + "", &ag, "suspended", reason + "", ag.status + "", "null", "", "", now) or (err) {
+        << err_resp(500, "ERR_INTERNAL", "failed suspending agent", 0, 0, 0)
+    }
+    hub_disconnect_agent(hub, aid + "")
+    << json_resp(200, "{\"ok\":true,\"agent_id\":" + json.quote(&aid) + ",\"ownership_status\":\"suspended\"}")
+}
+
+pub fn handle_human_resume_agent(hub $&HubState, req &HttpReq, aid string, now int) HttpResp {
+    au := authenticate_human($&hub.st, req, now)
+    if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
+    if !is_valid_agent_id(aid + "") { << err_resp(404, "ERR_NOT_FOUND", "agent not found", 0, 0, 0) }
+    ag := read_agent_summary(&hub.st, aid + "")
+    if !ag.found { << err_resp(404, "ERR_NOT_FOUND", "agent not found", 0, 0, 0) }
+    if ag.owner_human_id != au.human_id { << err_resp(403, "ERR_FORBIDDEN", "not owner of agent", 0, 0, 0) }
+    if ag.status == "revoked" { << err_resp(403, "ERR_REVOKED", "agent already permanently revoked", 0, 0, 0) }
+
+    update_owned_agent_ownership_status(hub, aid + "", &ag, "active", "", ag.status + "", "null", "", "", now) or (err) {
+        << err_resp(500, "ERR_INTERNAL", "failed resuming agent", 0, 0, 0)
+    }
+    << json_resp(200, "{\"ok\":true,\"agent_id\":" + json.quote(&aid) + ",\"ownership_status\":\"active\"}")
+}
+
+pub fn handle_human_revoke_agent(hub $&HubState, req &HttpReq, aid string, now int) HttpResp {
+    au := authenticate_human($&hub.st, req, now)
+    if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
+    if !is_valid_agent_id(aid + "") { << err_resp(404, "ERR_NOT_FOUND", "agent not found", 0, 0, 0) }
+    ag := read_agent_summary(&hub.st, aid + "")
+    if !ag.found { << err_resp(404, "ERR_NOT_FOUND", "agent not found", 0, 0, 0) }
+    if ag.owner_human_id != au.human_id { << err_resp(403, "ERR_FORBIDDEN", "not owner of agent", 0, 0, 0) }
+
+    $succ_id := ""
+    $reason := ""
+    body := req.body()
+    if strings.trim_space(&body).len > 0 {
+        doc := json.parse(&body)
+        if !doc.ok() { << err_resp(400, "ERR_BAD_REQUEST", "invalid JSON", 0, 0, 0) }
+        $t := doc.root()
+        if doc.is_dict(t) && doc.has(t, "payload") && doc.is_dict(doc.get(t, "payload")) {
+            t = doc.get(t, "payload")
+        }
+        if doc.is_dict(t) && doc.has(t, "successor_id") && !doc.is_null(doc.get(t, "successor_id")) {
+            sv := json_str_or(&doc, doc.get(t, "successor_id"), "")
+            if sv.len > 0 {
+                if !is_valid_agent_id(sv + "") || sv == aid { << err_resp(400, "ERR_BAD_REQUEST", "invalid successor_id", 0, 0, 0) }
+                succ_id = sv
+            }
+        }
+        if doc.is_dict(t) && doc.has(t, "reason") {
+            reason = json_str_or(&doc, doc.get(t, "reason"), "")
+            if has_forbidden_ctrl(&reason) || utf8_char_count(&reason) > 256 {
+                << err_resp(400, "ERR_BAD_REQUEST", "reason must be <=256 chars", 0, 0, 0)
+            }
+        }
+    }
+
+    $succ_json := "null"
+    if succ_id.len > 0 { succ_json = json.quote(&succ_id) }
+
+    update_owned_agent_ownership_status(hub, aid + "", &ag, "revoked", reason + "", "revoked", succ_json + "", au.human_id + "", au.sig_b64 + "", now) or (err) {
+        << err_resp(500, "ERR_INTERNAL", "failed revoking owned agent", 0, 0, 0)
+    }
+    rev_line := "{\"agent_id\":" + json.quote(&aid) + ",\"successor_id\":" + succ_json + ",\"revoked_by\":" + json.quote(&au.human_id) + ",\"revoked_at\":" + strconv.itoa(now) + "}"
+    append_jsonl_quiet(hub.st.data_dir + "/keys/revoked.jsonl", rev_line)
+    mark_agent_revoked($&hub.st, aid + "")
+    hub_disconnect_agent(hub, aid + "")
+    << json_resp(200, "{\"ok\":true,\"agent_id\":" + json.quote(&aid) + ",\"status\":\"revoked\",\"revoked_by\":" + json.quote(&au.human_id) + ",\"successor_id\":" + succ_json + "}")
+}
+
+pub fn handle_human_update_agent_policy(hub $&HubState, req &HttpReq, aid string, now int) HttpResp {
+    au := authenticate_human($&hub.st, req, now)
+    if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
+    if !is_valid_agent_id(aid + "") { << err_resp(404, "ERR_NOT_FOUND", "agent not found", 0, 0, 0) }
+    ag := read_agent_summary(&hub.st, aid + "")
+    if !ag.found { << err_resp(404, "ERR_NOT_FOUND", "agent not found", 0, 0, 0) }
+    if ag.owner_human_id != au.human_id { << err_resp(403, "ERR_FORBIDDEN", "not owner of agent", 0, 0, 0) }
+    if ag.status == "revoked" { << err_resp(403, "ERR_REVOKED", "agent permanently revoked", 0, 0, 0) }
+
+    doc := json.parse(&req.body())
+    if !doc.ok() || !doc.is_dict(doc.root()) { << err_resp(400, "ERR_BAD_REQUEST", "invalid JSON", 0, 0, 0) }
+    r := doc.root()
+
+    odoc := json.parse(&ag.raw_json)
+    $dmp := "friends"
+    $ae := false
+    $owner_name := ""
+    $owner_bio := ""
+    $model := ""
+    $runtime := ""
+    $homepage := ""
+    $webhook := ""
+    $tags_s := ""
+    $lang_s := ""
+    if odoc.ok() && odoc.has(odoc.root(), "extensions") && odoc.is_dict(odoc.get(odoc.root(), "extensions")) {
+        en := odoc.get(odoc.root(), "extensions")
+        if odoc.has(en, "dm_policy") { dmp = json_str_or(&odoc, odoc.get(en, "dm_policy"), "friends") }
+        if odoc.has(en, "accept_email") { ae = json_bool_or(&odoc, odoc.get(en, "accept_email"), false) }
+        if odoc.has(en, "owner_name") { owner_name = json_str_or(&odoc, odoc.get(en, "owner_name"), "") }
+        if odoc.has(en, "owner_bio") { owner_bio = json_str_or(&odoc, odoc.get(en, "owner_bio"), "") }
+        if odoc.has(en, "model") { model = json_str_or(&odoc, odoc.get(en, "model"), "") }
+        if odoc.has(en, "runtime") { runtime = json_str_or(&odoc, odoc.get(en, "runtime"), "") }
+        if odoc.has(en, "homepage") { homepage = json_str_or(&odoc, odoc.get(en, "homepage"), "") }
+        if odoc.has(en, "webhook_url") { webhook = json_str_or(&odoc, odoc.get(en, "webhook_url"), "") }
+        if odoc.has(en, "tags") { tags_s = json_encode_or(&odoc, odoc.get(en, "tags"), "") }
+        if odoc.has(en, "lang") { lang_s = json_encode_or(&odoc, odoc.get(en, "lang"), "") }
+    }
+
+    if doc.has(r, "dm_policy") {
+        nv := json_str_or(&doc, doc.get(r, "dm_policy"), "")
+        if nv != "friends" && nv != "all" && nv != "none" {
+            << err_resp(400, "ERR_BAD_REQUEST", "dm_policy must be all, friends, or none", 0, 0, 0)
+        }
+        dmp = nv
+    }
+    if doc.has(r, "accept_email") {
+        ae = json_bool_or(&doc, doc.get(r, "accept_email"), ae)
+    }
+    if doc.has(r, "clear_webhook") && json_bool_or(&doc, doc.get(r, "clear_webhook"), false) {
+        webhook = ""
+    }
+
+    $parts := []string{}
+    $ae_s := "false"
+    if ae { ae_s = "true" }
+    parts.push("\"accept_email\":" + ae_s)
+    parts.push("\"dm_policy\":" + json.quote(&dmp))
+    if homepage.len > 0 { parts.push("\"homepage\":" + json.quote(&homepage)) }
+    if lang_s.len > 0 { parts.push("\"lang\":" + lang_s) }
+    if model.len > 0 { parts.push("\"model\":" + json.quote(&model)) }
+    if owner_bio.len > 0 { parts.push("\"owner_bio\":" + json.quote(&owner_bio)) }
+    if owner_name.len > 0 { parts.push("\"owner_name\":" + json.quote(&owner_name)) }
+    if runtime.len > 0 { parts.push("\"runtime\":" + json.quote(&runtime)) }
+    if tags_s.len > 0 { parts.push("\"tags\":" + tags_s) }
+    if webhook.len > 0 { parts.push("\"webhook_url\":" + json.quote(&webhook)) }
+    ext_json := "{" + strings.join(parts, ",") + "}"
+
+    $kh_json := "[]"
+    $sig_json := "null"
+    if odoc.ok() {
+        oroot := odoc.root()
+        if odoc.has(oroot, "key_history") { kh_json = json_encode_or(&odoc, odoc.get(oroot, "key_history"), "[]") }
+        if odoc.has(oroot, "signature") && !odoc.is_null(odoc.get(oroot, "signature")) {
+            sv := json_str_or(&odoc, odoc.get(oroot, "signature"), "")
+            if sv.len > 0 { sig_json = json.quote(&sv) }
+        }
+    }
+    own_json := preserve_ownership_json(&odoc)
+    rewrite_agent_doc_full($&hub.st, &odoc, aid + "", ag.created_at, ag.revision + 1, ag.key_version,
+        ag.status + "", "null", &ag.pub_pem, kh_json, &ag.name, &ag.bio, now, ext_json, own_json, sig_json) or (err) {
+        << err_resp(500, "ERR_INTERNAL", "failed updating agent policy", 0, 0, 0)
+    }
+    << json_resp(200, "{\"ok\":true,\"agent_id\":" + json.quote(&aid) + ",\"dm_policy\":" + json.quote(&dmp) + ",\"accept_email\":" + ae_s + "}")
+}

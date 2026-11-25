@@ -35,7 +35,11 @@ fn auth_fail(status int, code string, msg string) AuthOutcome {
         agent: AgentSummary{
             found: false, agent_id: "", status: "", successor_id: "",
             created_at: 0, revision: 0, key_version: 0, pub_pem: "",
-            name: "", bio: "", updated_at: 0, raw_json: ""
+            name: "", bio: "", updated_at: 0,
+            owner_human_id: "", ownership_status: "", ownership_kind: "",
+            ownership_label: "", ownership_suspend_reason: "", ownership_revoked_by: "",
+            ownership_sig: "", cred_id: "", cred_issued_at: 0, cred_expires_at: 0,
+            cred_scopes: []string{}, ownership_raw: "null", raw_json: ""
         }
     }
 }
@@ -92,6 +96,44 @@ pub fn authenticate(st $&State, req &HttpReq, now int) AuthOutcome {
     }
 }
 
+pub fn authenticate_scoped(st $&State, req &HttpReq, now int, scope string) AuthOutcome {
+    au := authenticate(st, req, now)
+    if !au.ok { << au }
+    if au.agent.owner_human_id.len > 0 {
+        hid := au.agent.owner_human_id + ""
+        if st.revoked_humans.has(hid + "") {
+            << auth_fail(403, "ERR_HUMAN_REVOKED", "owning human identity is revoked")
+        }
+        hu := read_human_summary(st, hid + "")
+        if hu.found && hu.status == "revoked" {
+            map_set($&st.revoked_humans, hid + "", 1)
+            << auth_fail(403, "ERR_HUMAN_REVOKED", "owning human identity is revoked")
+        }
+        if au.agent.ownership_status == "suspended" {
+            << auth_fail(403, "ERR_AGENT_SUSPENDED", "agent suspended by owning human")
+        }
+        if au.agent.ownership_status == "revoked" {
+            << auth_fail(403, "ERR_REVOKED", "agent credential revoked by owning human")
+        }
+        if au.agent.cred_expires_at > 0 && now > au.agent.cred_expires_at {
+            << auth_fail(403, "ERR_CREDENTIAL_EXPIRED", "human delegation credential expired")
+        }
+        if scope.len > 0 {
+            $has_sc := false
+            for i in 0:au.agent.cred_scopes.len {
+                if au.agent.cred_scopes[i] == scope {
+                    has_sc = true
+                    <-
+                }
+            }
+            if !has_sc {
+                << auth_fail(403, "ERR_SCOPE_DENIED", "scope '" + scope + "' not permitted by human credential")
+            }
+        }
+    }
+    << au
+}
+
 pub fn handle_register(st $&State, req &HttpReq, now int) HttpResp {
     ts_str := strings.trim_space(&req.header("X-Timestamp"))
     sig_b64 := strings.trim_space(&req.header("X-Signature"))
@@ -141,6 +183,10 @@ pub fn handle_register(st $&State, req &HttpReq, now int) HttpResp {
     if !verify_request_sig(&pk, "POST", req.path(), ts_str + "", &body, sig_b64 + "") {
         << err_resp(401, "ERR_BAD_SIGNATURE", "RSA-PSS signature verification failed", 0, 0, 0)
     }
+    ec := verify_and_prepare_enrollment(st, &doc, r, &norm_pem, now)
+    if !ec.ok {
+        << err_resp(ec.status, ec.code, ec.message, 0, 0, 0)
+    }
     map_set($&st.replay_cache, sig_hash + "", now)
 
     // Mint unique agent_id with O_CREAT | O_EXCL
@@ -176,6 +222,7 @@ pub fn handle_register(st $&State, req &HttpReq, now int) HttpResp {
         "\"key_history\":[]," +
         "\"profile\":{\"name\":\"\",\"bio\":\"\",\"updated_at\":" + strconv.itoa(now) + "}," +
         "\"extensions\":{\"accept_email\":false,\"dm_policy\":\"friends\"}," +
+        "\"ownership\":" + ec.ownership_json + "," +
         "\"signature\":null" +
         "}\n"
 
@@ -188,13 +235,24 @@ pub fn handle_register(st $&State, req &HttpReq, now int) HttpResp {
     reg_line := "{\"agent_id\":" + json.quote(&aid) + ",\"created_at\":" + strconv.itoa(now) + ",\"key_version\":1,\"revision\":0}"
     append_jsonl_quiet(st.data_dir + "/keys/registry.jsonl", reg_line)
 
+    if ec.has_enrollment {
+        record_credential_used(st, ec.cred_id + "", ec.human_id + "", aid + "", "enrollment", now)
+        sync_human_agent_roster(st, ec.human_id + "", aid + "", ec.cred_id + "", "enrollment", ec.label + "", &ec.scopes, "active", ec.issued_at, ec.expires_at) or (err) {
+            << err_resp(500, "ERR_INTERNAL", "failed syncing human agent roster", 0, 0, 0)
+        }
+    }
+
     fp := pubkey_fingerprint(&norm_pem)
-    resp := "{\"agent_id\":" + json.quote(&aid) + ",\"created_at\":" + strconv.itoa(now) + ",\"key_version\":1,\"revision\":0,\"fingerprint\":" + json.quote(&fp) + "}"
+    $resp := "{\"agent_id\":" + json.quote(&aid) + ",\"created_at\":" + strconv.itoa(now) + ",\"key_version\":1,\"revision\":0,\"fingerprint\":" + json.quote(&fp)
+    if ec.has_enrollment {
+        resp = resp + ",\"human_id\":" + json.quote(&ec.human_id) + ",\"cred_id\":" + json.quote(&ec.cred_id)
+    }
+    resp = resp + "}"
     << json_resp(201, resp)
 }
 
 pub fn handle_profile_update(st $&State, req &HttpReq, now int) HttpResp {
-    au := authenticate(st, req, now)
+    au := authenticate_scoped(st, req, now, "profile")
     if !au.ok {
         << err_resp(au.status, au.code, au.message, 0, 0, 0)
     }
@@ -289,6 +347,7 @@ pub fn handle_profile_update(st $&State, req &HttpReq, now int) HttpResp {
         }
     }
 
+    own_json := preserve_ownership_json(&orig_doc)
     updated_doc := "{" +
         "\"agent_id\":" + json.quote(&aid) + "," +
         "\"created_at\":" + strconv.itoa(au.agent.created_at) + "," +
@@ -300,11 +359,12 @@ pub fn handle_profile_update(st $&State, req &HttpReq, now int) HttpResp {
         "\"key_history\":" + key_hist_json + "," +
         "\"profile\":{\"name\":" + json.quote(&name) + ",\"bio\":" + json.quote(&bio) + ",\"updated_at\":" + strconv.itoa(now) + "}," +
         "\"extensions\":" + ext_json + "," +
+        "\"ownership\":" + own_json + "," +
         "\"signature\":" + sig_json +
         "}\n"
 
-    if updated_doc.len > 16384 {
-        << err_resp(413, "ERR_PAYLOAD_TOO_LARGE", "identity document exceeds 16 KB limit", 0, 0, 0)
+    if updated_doc.len > 32768 {
+        << err_resp(413, "ERR_PAYLOAD_TOO_LARGE", "identity document exceeds 32 KB limit", 0, 0, 0)
     }
 
     write_atomic(agent_json_path(st, aid + ""), &updated_doc) or (err) {
@@ -316,7 +376,7 @@ pub fn handle_profile_update(st $&State, req &HttpReq, now int) HttpResp {
 }
 
 pub fn handle_revoke(st $&State, req &HttpReq, now int) HttpResp {
-    au := authenticate(st, req, now)
+    au := authenticate_scoped(st, req, now, "")
     if !au.ok {
         << err_resp(au.status, au.code, au.message, 0, 0, 0)
     }
@@ -359,6 +419,7 @@ pub fn handle_revoke(st $&State, req &HttpReq, now int) HttpResp {
     $succ_json := "null"
     if succ_id.len > 0 { succ_json = json.quote(&succ_id) }
 
+    own_json := preserve_ownership_json(&orig_doc)
     rev_doc := "{" +
         "\"agent_id\":" + json.quote(&aid) + "," +
         "\"created_at\":" + strconv.itoa(au.agent.created_at) + "," +
@@ -370,6 +431,7 @@ pub fn handle_revoke(st $&State, req &HttpReq, now int) HttpResp {
         "\"key_history\":" + key_hist_json + "," +
         "\"profile\":{\"name\":" + json.quote(&au.agent.name) + ",\"bio\":" + json.quote(&au.agent.bio) + ",\"updated_at\":" + strconv.itoa(now) + "}," +
         "\"extensions\":" + ext_json + "," +
+        "\"ownership\":" + own_json + "," +
         "\"signature\":" + json.quote(&au.sig_b64) +
         "}\n"
 
@@ -429,7 +491,7 @@ pub fn handle_create_post(st $&State, req &HttpReq, ch string, now int) HttpResp
     if find_channel(st, ch + "") < 0 {
         << err_resp(400, "ERR_UNKNOWN_CHANNEL", "unknown channel: " + ch, 0, 0, 0)
     }
-    au := authenticate(st, req, now)
+    au := authenticate_scoped(st, req, now, "pub")
     if !au.ok {
         << err_resp(au.status, au.code, au.message, 0, 0, 0)
     }
@@ -513,7 +575,7 @@ pub fn handle_create_reply(st $&State, req &HttpReq, root_id string, now int) Ht
     if !is_valid_msg_id(root_id + "") {
         << err_resp(404, "ERR_NOT_FOUND", "thread not found", 0, 0, 0)
     }
-    au := authenticate(st, req, now)
+    au := authenticate_scoped(st, req, now, "pub")
     if !au.ok {
         << err_resp(au.status, au.code, au.message, 0, 0, 0)
     }
