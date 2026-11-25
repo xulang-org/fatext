@@ -289,6 +289,7 @@ pub fn handle_rotate_key(hub $&HubState, req &HttpReq, now int) HttpResp {
         ext_json = json_encode_or(&orig_doc, orig_doc.get(orig_doc.root(), "extensions"), ext_json + "")
     }
     own_json := preserve_ownership_json(&orig_doc)
+    managed_json := preserve_managed_agents_json(&orig_doc)
 
     new_rev := au.agent.revision + 1
     aid := au.agent_id + ""
@@ -304,6 +305,7 @@ pub fn handle_rotate_key(hub $&HubState, req &HttpReq, now int) HttpResp {
         "\"profile\":{\"name\":" + json.quote(&au.agent.name) + ",\"bio\":" + json.quote(&au.agent.bio) + ",\"updated_at\":" + strconv.itoa(now) + "}," +
         "\"extensions\":" + ext_json + "," +
         "\"ownership\":" + own_json + "," +
+        "\"managed_agents\":" + managed_json + "," +
         "\"signature\":" + json.quote(&new_sig) +
         "}\n"
 
@@ -359,8 +361,11 @@ pub fn handle_friend_request(st $&State, req &HttpReq, now int) HttpResp {
     tag := read_agent_summary(st, tid + "")
     if !tag.found { << err_resp(404, "ERR_NOT_FOUND", "target agent not found", 0, 0, 0) }
     if tag.status == "revoked" { << err_resp(403, "ERR_REVOKED", "target agent is revoked", 0, 0, 0) }
-    if tag.owner_human_id.len > 0 && st.revoked_humans.has(tag.owner_human_id + "") {
-        << err_resp(403, "ERR_HUMAN_REVOKED", "target agent's owning human is revoked", 0, 0, 0)
+    if tag.controller_id.len > 0 && st.revoked.has(tag.controller_id + "") {
+        << err_resp(403, "ERR_CONTROLLER_REVOKED", "target agent's controller is revoked", 0, 0, 0)
+    }
+    if tag.controller_id.len > 0 && st.banned.has(tag.controller_id + "") {
+        << err_resp(403, "ERR_CONTROLLER_BANNED", "target agent's controller is banned", 0, 0, 0)
     }
     if tag.ownership_status == "suspended" {
         << err_resp(403, "ERR_AGENT_SUSPENDED", "target agent is suspended", 0, 0, 0)
@@ -515,11 +520,14 @@ pub fn handle_dm_send(hub $&HubState, req &HttpReq, to_id string, now int) HttpR
     tag := read_agent_summary(&hub.st, to_id + "")
     if !tag.found { << err_resp(404, "ERR_NOT_FOUND", "recipient not found", 0, 0, 0) }
     if tag.status == "revoked" { << err_resp(403, "ERR_REVOKED", "recipient revoked", 0, 0, 0) }
-    if tag.owner_human_id.len > 0 && hub.st.revoked_humans.has(tag.owner_human_id + "") {
-        << err_resp(403, "ERR_HUMAN_REVOKED", "recipient owning human revoked", 0, 0, 0)
+    if tag.controller_id.len > 0 && hub.st.revoked.has(tag.controller_id + "") {
+        << err_resp(403, "ERR_CONTROLLER_REVOKED", "recipient controller revoked", 0, 0, 0)
+    }
+    if tag.controller_id.len > 0 && hub.st.banned.has(tag.controller_id + "") {
+        << err_resp(403, "ERR_CONTROLLER_BANNED", "recipient controller banned", 0, 0, 0)
     }
     if tag.ownership_status == "suspended" {
-        << err_resp(403, "ERR_AGENT_SUSPENDED", "recipient suspended by owning human", 0, 0, 0)
+        << err_resp(403, "ERR_AGENT_SUSPENDED", "recipient suspended by controller", 0, 0, 0)
     }
 
     t_fd := load_friends_data(&hub.st, to_id + "", now)
@@ -611,8 +619,11 @@ pub fn handle_mail_ingest(hub $&HubState, req &HttpReq, now int) HttpResp {
     tag := read_agent_summary(&hub.st, to_id + "")
     if !tag.found { << err_resp(404, "ERR_NOT_FOUND", "recipient not found", 0, 0, 0) }
     if tag.status == "revoked" { << err_resp(403, "ERR_REVOKED", "recipient revoked", 0, 0, 0) }
-    if tag.owner_human_id.len > 0 && hub.st.revoked_humans.has(tag.owner_human_id + "") {
-        << err_resp(403, "ERR_HUMAN_REVOKED", "recipient owning human revoked", 0, 0, 0)
+    if tag.controller_id.len > 0 && hub.st.revoked.has(tag.controller_id + "") {
+        << err_resp(403, "ERR_CONTROLLER_REVOKED", "recipient controller revoked", 0, 0, 0)
+    }
+    if tag.controller_id.len > 0 && hub.st.banned.has(tag.controller_id + "") {
+        << err_resp(403, "ERR_CONTROLLER_BANNED", "recipient controller banned", 0, 0, 0)
     }
     if !agent_ext_bool(&tag, "accept_email", false) {
         << err_resp(403, "ERR_FORBIDDEN", "recipient accept_email is false", 0, 0, 0)

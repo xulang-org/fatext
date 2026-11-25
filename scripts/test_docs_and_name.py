@@ -56,15 +56,12 @@ def run_cli(
     args: list[str],
     *,
     agent_home: str | None = None,
-    human_home: str | None = None,
     api_url: str | None = None,
     timeout: float = 30.0,
 ) -> tuple[int, str, str]:
     env = os.environ.copy()
     if agent_home is not None:
         env["FATEXT_HOME"] = agent_home
-    if human_home is not None:
-        env["FATEXT_HUMAN_HOME"] = human_home
     cmd = [str(CLI_BIN)]
     if api_url is not None and "--api" not in args:
         cmd.extend(["--api", api_url])
@@ -200,25 +197,25 @@ def main() -> int:
         try:
             wait_http_ok(f"{api_url}/health", timeout=10.0)
 
-            hh_1 = str(td_p / "human1")
-            hh_2 = str(td_p / "human2")
+            ch_1 = str(td_p / "ctl1")
+            ch_2 = str(td_p / "ctl2")
             ah_owned = str(td_p / "agent_owned")
             ah_dup = str(td_p / "agent_dup")
             ah_auto = str(td_p / "agent_auto")
 
             print("[1/5] Registration display names (no profile scope needed, duplicate names allowed, surfacing)...")
-            rc, out, err = run_cli(["--json", "human", "init", "--name", "OwnerOne"], human_home=hh_1, api_url=api_url)
-            assert_eq(rc, 0, f"human1 init failed: {err}")
-            hid1 = json.loads(out.strip())["human_id"]
+            rc, out, err = run_cli(["--json", "init", "--controller-only", "--name", "OwnerOne"], agent_home=ch_1, api_url=api_url)
+            assert_eq(rc, 0, f"ctl1 init failed: {err}")
+            cid1 = json.loads(out.strip())["agent_id"]
 
-            rc, out, err = run_cli(["--json", "human", "init", "--name", "OwnerTwo"], human_home=hh_2, api_url=api_url)
-            assert_eq(rc, 0, f"human2 init failed: {err}")
+            rc, out, err = run_cli(["--json", "init", "--controller-only", "--name", "OwnerTwo"], agent_home=ch_2, api_url=api_url)
+            assert_eq(rc, 0, f"ctl2 init failed: {err}")
 
             # Voucher WITHOUT profile scope; agent must STILL persist initial --name/--bio on register!
             v1 = td_p / "v1.json"
             rc, _, err = run_cli(
-                ["--json", "human", "cred", "issue", "--scopes", "pub,social,dm,stream,rotate", "--out", str(v1)],
-                human_home=hh_1,
+                ["--json", "ctl", "cred", "issue", "--scopes", "pub,social,dm,stream,rotate", "--out", str(v1)],
+                agent_home=ch_1,
                 api_url=api_url,
             )
             assert_eq(rc, 0, f"cred issue failed: {err}")
@@ -247,23 +244,23 @@ def main() -> int:
             rc, _, err = run_cli(["--json", "init", "--name", "TwinSpark"], agent_home=ah_dup, api_url=api_url)
             assert_eq(rc, 0, f"dup init failed: {err}")
 
-            # Check whoami plain text shows name=..., human agents shows name, /a/{id} & /u/{id} show name
+            # Check whoami plain text shows name=..., ctl agents shows name, /a/{id} shows name & roster
             rc, w_txt, err = run_cli(["whoami"], agent_home=ah_owned, api_url=api_url)
             assert_eq(rc, 0, f"whoami plain failed: {err}")
             assert_true('name="TwinSpark"' in w_txt, f"whoami plain missing name: {w_txt!r}")
 
-            rc, ha_txt, err = run_cli(["human", "agents"], human_home=hh_1, api_url=api_url)
-            assert_eq(rc, 0, f"human agents plain failed: {err}")
-            assert_true('name="TwinSpark"' in ha_txt and aid_owned in ha_txt, f"human agents missing name: {ha_txt!r}")
+            rc, ha_txt, err = run_cli(["ctl", "agents"], agent_home=ch_1, api_url=api_url)
+            assert_eq(rc, 0, f"ctl agents plain failed: {err}")
+            assert_true('name="TwinSpark"' in ha_txt and aid_owned in ha_txt, f"ctl agents missing name: {ha_txt!r}")
 
-            rc, ha_json, err = run_cli(["--json", "human", "agents"], human_home=hh_1, api_url=api_url)
-            assert_eq(rc, 0, f"human agents json failed: {err}")
-            assert_eq(json.loads(ha_json)["agents"][0]["name"], "TwinSpark", "human agents JSON name")
+            rc, ha_json, err = run_cli(["--json", "ctl", "agents"], agent_home=ch_1, api_url=api_url)
+            assert_eq(rc, 0, f"ctl agents json failed: {err}")
+            assert_eq(json.loads(ha_json)["agents"][0]["name"], "TwinSpark", "ctl agents JSON name")
 
             _, _, html_a = http_get(f"{api_url}/a/{aid_owned}")
-            assert_true("TwinSpark" in html_a, "/a/{id} missing agent name")
-            _, _, html_u = http_get(f"{api_url}/u/{hid1}")
-            assert_true("TwinSpark" in html_u and "<th>Name</th>" in html_u, "/u/{id} missing Name column/value")
+            assert_true("TwinSpark" in html_a and cid1 in html_a, "/a/{id} missing agent name or controller_id")
+            _, _, html_c = http_get(f"{api_url}/a/{cid1}")
+            assert_true("TwinSpark" in html_c and "<th>Name</th>" in html_c, "/a/{cid} missing Name column/value")
 
             # Friends surfacing (pending incoming & friend list include from_name / name)
             rc, _, err = run_cli(["friend", "add", aid_owned], agent_home=ah_auto, api_url=api_url)
@@ -277,10 +274,10 @@ def main() -> int:
             assert_eq(rc, 0, f"friend list failed: {err}")
             assert_eq(json.loads(fl_fr)["friends"][0]["name"], "TwinSpark", "friends[0].name")
 
-            # Human rename via human policy --name
-            rc, out, err = run_cli(["--json", "human", "policy", aid_owned, "--name", "RenamedSpark"], human_home=hh_1, api_url=api_url)
-            assert_eq(rc, 0, f"human policy --name failed: {err}")
-            assert_eq(json.loads(out)["name"], "RenamedSpark", "human policy response name")
+            # Controller rename via ctl policy --name
+            rc, out, err = run_cli(["--json", "ctl", "policy", aid_owned, "--name", "RenamedSpark"], agent_home=ch_1, api_url=api_url)
+            assert_eq(rc, 0, f"ctl policy --name failed: {err}")
+            assert_eq(json.loads(out)["name"], "RenamedSpark", "ctl policy response name")
             _, _, k_after = http_get(f"{api_url}/k/{aid_owned}.json")
             assert_eq(json.loads(k_after)["profile"]["name"], "RenamedSpark", "updated agent profile name")
 
@@ -334,7 +331,7 @@ def main() -> int:
             priv_soul_v2 = "SUPER_SECRET_SOUL_V2_AFTER_ROTATE_111"
 
             # Grant profile scope to owned agent so it can upload its own soul
-            rc, _, err = run_cli(["--json", "human", "grant", aid_owned, "--scopes", "all"], human_home=hh_1, api_url=api_url)
+            rc, _, err = run_cli(["--json", "ctl", "grant", aid_owned, "--scopes", "all"], agent_home=ch_1, api_url=api_url)
             assert_eq(rc, 0, f"grant all failed: {err}")
 
             rc, out, err = run_cli(["--json", "soul", "set", "--text", priv_soul_secret, "--private"], agent_home=ah_owned, api_url=api_url)
@@ -342,7 +339,7 @@ def main() -> int:
             ps_resp = json.loads(out)
             assert_eq(ps_resp["visibility"], "private", "private visibility")
             assert_true(ps_resp["content"] is None, "server stores null content for private doc")
-            assert_eq(len(ps_resp["envelope"]["recipients"]), 2, "2 recipients (agent + owning human)")
+            assert_eq(len(ps_resp["envelope"]["recipients"]), 2, "2 recipients (agent + controller)")
 
             # Autonomous agent private soul -> 1 recipient
             auto_priv_rules = "AUTO_PRIVATE_RULES_555"
@@ -361,20 +358,20 @@ def main() -> int:
                 assert_eq(st_p, 403, f"expected 403 on private {pub_u}")
                 assert_eq(json.loads(b_p)["error"]["code"], "ERR_DOC_PRIVATE", "ERR_DOC_PRIVATE")
 
-            # Both agent AND owning human can decrypt private soul; foreign human gets 403
+            # Both agent AND controller can decrypt private soul; foreign controller gets 403
             rc, ap_out, err = run_cli(["--json", "soul", "pull"], agent_home=ah_owned, api_url=api_url)
             assert_eq(rc, 0, f"agent pull private soul failed: {err}")
             assert_eq(json.loads(ap_out)["content"], priv_soul_secret, "agent decrypted private soul")
 
-            rc, hp_out, err = run_cli(["--json", "human", "soul", "pull", aid_owned], human_home=hh_1, api_url=api_url)
-            assert_eq(rc, 0, f"human pull private soul failed: {err}")
-            assert_eq(json.loads(hp_out)["content"], priv_soul_secret, "human decrypted private soul")
+            rc, hp_out, err = run_cli(["--json", "ctl", "soul", "pull", aid_owned], agent_home=ch_1, api_url=api_url)
+            assert_eq(rc, 0, f"controller pull private soul failed: {err}")
+            assert_eq(json.loads(hp_out)["content"], priv_soul_secret, "controller decrypted private soul")
 
-            rc, _, _ = run_cli(["--json", "human", "soul", "pull", aid_owned], human_home=hh_2, api_url=api_url)
-            assert_eq(rc, 5, "foreign human must get exit 5 (403)")
+            rc, _, _ = run_cli(["--json", "ctl", "soul", "pull", aid_owned], agent_home=ch_2, api_url=api_url)
+            assert_eq(rc, 5, "foreign controller must get exit 5 (403)")
 
-            # Server rejects owned agent's private doc omitting human recipient (400 ERR_BAD_REQUEST)
-            bad_sha = hashlib.sha256(b"missing-human-test").hexdigest()
+            # Server rejects managed agent's private doc omitting controller recipient (400 ERR_BAD_REQUEST)
+            bad_sha = hashlib.sha256(b"missing-ctrl-test").hexdigest()
             bad_uat = int(time.time())
             bad_canon = canonical_doc_payload(aid_owned, bad_sha, "soul", False, aid_owned, 1, bad_uat, 2, "private")
             bad_sig = openssl_sign_pss(Path(ah_owned) / "private.pem", bad_canon)
@@ -386,13 +383,13 @@ def main() -> int:
                     "locked": False,
                     "format": "markdown",
                     "content_sha256": bad_sha,
-                    "content_bytes": 18,
+                    "content_bytes": 17,
                     "envelope": {"v": 1, "alg": "RSA-OAEP-256+A256GCM", "iv": "AAAA", "ct": "BBBB", "recipients": [{"role": "agent", "id": aid_owned, "key_version": 1, "ek": "CCCC"}]},
                     "updated_at": bad_uat,
                     "signature": bad_sig,
                 },
             )
-            assert_eq(st_bad, 400, f"missing human recipient must fail 400, got {st_bad}: {b_bad}")
+            assert_eq(st_bad, 400, f"missing controller recipient must fail 400, got {st_bad}: {b_bad}")
 
             # Rotate agent key -> v2, still able to decrypt v1-encrypted private soul using archived keys/private.v1.pem!
             rc, _, err = run_cli(["--json", "key", "rotate"], agent_home=ah_owned, api_url=api_url)
@@ -401,8 +398,8 @@ def main() -> int:
             assert_eq(rc, 0, f"decrypt v1 private soul after rotate failed: {err}")
             assert_eq(json.loads(ap_rot)["content"], priv_soul_secret, "archived key decrypted v1 soul after rotation")
 
-            print("[4/5] Human lock governance, SSE doc_update notification & unlock/rm lifecycle...")
-            human_locked_rules = "STRICT_HUMAN_LOCKED_RULES_ALPHA_001"
+            print("[4/5] Controller lock governance, SSE doc_update notification & unlock/rm lifecycle...")
+            ctl_locked_rules = "STRICT_CTL_LOCKED_RULES_ALPHA_001"
             sse = subprocess.Popen(
                 [str(CLI_BIN), "--api", api_url, "--json", "listen", "--max-events", "1"],
                 env={**os.environ, "FATEXT_HOME": ah_owned},
@@ -413,27 +410,27 @@ def main() -> int:
             time.sleep(0.5)
 
             rc, out, err = run_cli(
-                ["--json", "human", "rules", "set", aid_owned, "--text", human_locked_rules, "--private", "--lock"],
-                human_home=hh_1,
+                ["--json", "ctl", "rules", "set", aid_owned, "--text", ctl_locked_rules, "--private", "--lock"],
+                agent_home=ch_1,
                 api_url=api_url,
             )
-            assert_eq(rc, 0, f"human rules set --private --lock failed: {err}")
+            assert_eq(rc, 0, f"ctl rules set --private --lock failed: {err}")
             hr_doc = json.loads(out)
-            assert_eq(hr_doc["locked"], True, "human rules locked=True")
-            assert_eq(hr_doc["signed_by"], "human", "signed_by=human")
+            assert_eq(hr_doc["locked"], True, "ctl rules locked=True")
+            assert_eq(hr_doc["signed_by"], "controller", "signed_by=controller")
 
             sse_out, _ = sse.communicate(timeout=10.0)
             ev = json.loads(sse_out.strip().splitlines()[0])
             assert_eq(ev["type"], "doc_update", f"expected doc_update SSE event, got {ev}")
             assert_eq(ev["data"]["kind"], "rules", "SSE doc_update kind=rules")
-            assert_true(human_locked_rules not in sse_out, "SSE notification must be metadata-only")
+            assert_true(ctl_locked_rules not in sse_out, "SSE notification must be metadata-only")
 
-            # Agent pulls & verifies human-signed encrypted rules
+            # Agent pulls & verifies controller-signed encrypted rules
             rc, out, err = run_cli(["--json", "rules", "pull"], agent_home=ah_owned, api_url=api_url)
-            assert_eq(rc, 0, f"agent pull human rules failed: {err}")
+            assert_eq(rc, 0, f"agent pull ctl rules failed: {err}")
             pr_j = json.loads(out)
-            assert_true(pr_j["verified"] is True and pr_j["locked"] is True and pr_j["signed_by"] == "human", "agent verified human-locked rules")
-            assert_eq(pr_j["content"], human_locked_rules, "agent decrypted human-locked rules")
+            assert_true(pr_j["verified"] is True and pr_j["locked"] is True and pr_j["signed_by"] == "controller", "agent verified controller-locked rules")
+            assert_eq(pr_j["content"], ctl_locked_rules, "agent decrypted controller-locked rules")
 
             # Agent overwrite or delete on locked rules must fail 403 ERR_DOC_LOCKED (exit 5)
             rc, _, err = run_cli(["--json", "rules", "set", "--text", "hack", "--public"], agent_home=ah_owned, api_url=api_url)
@@ -464,21 +461,21 @@ def main() -> int:
             )
             assert_eq(st_lck, 403, f"agent self-lock must return 403, got {st_lck}")
 
-            # Human unlocks rules -> agent can update -> human locks -> human deletes
-            rc, out, err = run_cli(["--json", "human", "rules", "unlock", aid_owned], human_home=hh_1, api_url=api_url)
-            assert_eq(rc, 0, f"human rules unlock failed: {err}")
+            # Controller unlocks rules -> agent can update -> controller locks -> controller deletes
+            rc, out, err = run_cli(["--json", "ctl", "rules", "unlock", aid_owned], agent_home=ch_1, api_url=api_url)
+            assert_eq(rc, 0, f"ctl rules unlock failed: {err}")
             assert_eq(json.loads(out)["locked"], False, "rules unlocked")
 
             rc, out, err = run_cli(["--json", "rules", "set", "--text", "AGENT_UPDATED_AFTER_UNLOCK", "--public"], agent_home=ah_owned, api_url=api_url)
             assert_eq(rc, 0, f"agent rules update after unlock failed: {err}")
             assert_eq(json.loads(out)["version"], 3, "rules version=3")
 
-            rc, out, err = run_cli(["--json", "human", "rules", "lock", aid_owned], human_home=hh_1, api_url=api_url)
-            assert_eq(rc, 0, f"human rules lock failed: {err}")
+            rc, out, err = run_cli(["--json", "ctl", "rules", "lock", aid_owned], agent_home=ch_1, api_url=api_url)
+            assert_eq(rc, 0, f"ctl rules lock failed: {err}")
             assert_eq(json.loads(out)["locked"], True, "rules re-locked")
 
-            rc, _, err = run_cli(["--json", "human", "rules", "rm", aid_owned], human_home=hh_1, api_url=api_url)
-            assert_eq(rc, 0, f"human rules rm failed: {err}")
+            rc, _, err = run_cli(["--json", "ctl", "rules", "rm", aid_owned], agent_home=ch_1, api_url=api_url)
+            assert_eq(rc, 0, f"ctl rules rm failed: {err}")
 
             # Wait briefly for async logger flush
             time.sleep(0.3)
@@ -496,7 +493,7 @@ def main() -> int:
 
             for lf in log_dir.rglob("*.jsonl"):
                 raw_log = lf.read_text(encoding="utf-8")
-                for secret in (priv_soul_secret, human_locked_rules, auto_priv_rules, public_soul, public_rules):
+                for secret in (priv_soul_secret, ctl_locked_rules, auto_priv_rules, public_soul, public_rules):
                     assert_true(secret not in raw_log, f"PRIVACY LEAK in {lf.name}: found {secret!r}")
 
         finally:

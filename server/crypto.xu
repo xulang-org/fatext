@@ -136,17 +136,6 @@ pub fn generate_agent_id() string {
     << out
 }
 
-pub fn generate_human_id() string {
-    alphabet := "abcdefghijklmnopqrstuvwxyz0123456789"
-    rnd := rand.read(12) or >>
-    $out := "hum_"
-    for i in 0:12 {
-        idx := (rnd[i] & 255) % 36
-        out = out + alphabet[idx:(idx + 1)]
-    }
-    << out
-}
-
 pub fn pubkey_fingerprint(pub_pem &string) string {
     blk := pem.decode(pub_pem)
     if blk.bytes.len == 0 { << "" }

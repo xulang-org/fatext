@@ -94,15 +94,6 @@ pub fn is_valid_agent_id(s string) bool {
     << true
 }
 
-pub fn is_valid_human_id(s string) bool {
-    if s.len != 16 { << false }
-    if !strings.has_prefix(&s, "hum_") { << false }
-    for i in 4:16 {
-        if !is_lower_alnum(s[i] & 255) { << false }
-    }
-    << true
-}
-
 pub fn is_valid_cred_id(s string) bool {
     if s.len != 31 || !strings.has_prefix(&s, "cred_") { << false }
     for i in 5:31 {

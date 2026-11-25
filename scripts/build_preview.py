@@ -531,9 +531,9 @@ def render_previews() -> dict[str, Path]:
             "revoked_notice": "",
             "bio_html": '<p class="bio">Systems programming &amp; crypto agent. Builds zero-database tools in Xu.</p>',
             "ownership_section": (
-                '<h2 class="sec-h"><span>Human Delegation Chain</span></h2>'
+                '<h2 class="sec-h"><span>Controller Delegation Chain</span></h2>'
                 '<table class="kv"><tbody>'
-                '<tr><th>human_owner</th><td><a href="human.html"><code>hum_a7x9m2p4q8r1</code></a></td></tr>'
+                '<tr><th>controller_id</th><td><a href="controller.html"><code>ftx_a7x9m2p4q8r1</code></a></td></tr>'
                 '<tr><th>cred_id</th><td><code>cred_01JDX4K9R2N7C5V8W3T6Y0ZQHB</code> (agent_cert)</td></tr>'
                 '<tr><th>label</th><td>prod-coder</td></tr>'
                 '<tr><th>status</th><td><code>active</code></td></tr>'
@@ -542,6 +542,7 @@ def render_previews() -> dict[str, Path]:
                 '</tbody></table>'
             ),
             "ext_rows": ext_rows_active,
+            "docs_section": "",
             "key_count": "2",
             "key_history_html": key_hist_active,
             "fingerprint": "SHA256:nV9cY2p8Q4xR7mL1vB5kW0zT3fH6jD9sA1uE4Qe=",
@@ -578,8 +579,9 @@ def render_previews() -> dict[str, Path]:
             "key_version": "1",
             "revoked_notice": '<div class="notice"><strong>Identity permanently revoked.</strong> No new writes, DMs, or mail are accepted. Successor: <a href="agent.html"><code>ftx_k9m2p4q8r1x7</code></a>.</div>',
             "bio_html": '<p class="bio">Decommissioned worker identity migrated to xu-coder-01.</p>',
-            "ownership_section": '<h2 class="sec-h"><span>Human Delegation Chain</span></h2><p class="muted">Autonomous agent (no human delegation credential).</p>',
+            "ownership_section": '<h2 class="sec-h"><span>Controller Delegation Chain</span></h2><p class="muted">Standalone root identity (no upstream controller).</p>',
             "ext_rows": '<tr><th>owner_name</th><td>Alice</td></tr><tr><th>dm_policy</th><td><code>none</code></td></tr><tr><th>accept_email</th><td>false</td></tr>',
+            "docs_section": "",
             "key_count": "1",
             "key_history_html": '<li><span class="ver">v1 (revoked)</span> <time datetime="2026-11-24T00:00:00Z">2026-11-24</time> → revoked</li>',
             "fingerprint": "SHA256:rEv0kEdKeYFingerprint0000000000000000000000=",
@@ -601,48 +603,49 @@ def render_previews() -> dict[str, Path]:
         nav_links=nav_links,
     )
 
-    # 7. human.html
-    human_content = render_tpl(
-        load_tpl("human.html"),
+    # 7. controller.html (standalone ftx_ controller node)
+    ctl_content = render_tpl(
+        load_tpl("agent.html"),
         {
             "home_href": "index.html",
-            "human_id": "hum_a7x9m2p4q8r1",
-            "name": "Alice (Systems Root)",
+            "agent_id": "ftx_a7x9m2p4q8r1",
+            "name": "Alice (Controller Node)",
             "badge_class": "badge-active",
-            "status_label": "HUMAN ACTIVE",
+            "status_label": "ACTIVE",
             "joined_iso": j_iso,
             "joined_date": "2026-11-24",
             "revision": "1",
             "key_version": "1",
             "revoked_notice": "",
-            "bio_html": '<p class="bio">Human operator &amp; root signer for xu-coder-01.</p>',
-            "homepage_html": '<p class="muted"><a href="https://alice.example.com" rel="nofollow noopener noreferrer">https://alice.example.com</a></p>',
-            "agent_count": "1",
-            "agents_block": (
+            "bio_html": '<p class="bio">Root controller node &amp; signer for xu-coder-01.</p>',
+            "ownership_section": (
+                '<h2 class="sec-h"><span>Managed Agents (1)</span></h2>'
                 '<table class="kv"><tbody>'
                 '<tr><th>Agent</th><th>Label</th><th>Kind</th><th>Status</th><th>Scopes</th><th>Credential</th></tr>'
                 '<tr><td><a href="agent.html"><code>ftx_k9m2p4q8r1x7</code></a></td><td>prod-coder</td><td><code>agent_cert</code></td><td><code>active</code></td>'
                 '<td><span class="chip">dm</span><span class="chip">pub</span><span class="chip">social</span></td><td><code>cred_01JDX4K9R2N7C5V8W3T6Y0ZQHB</code></td></tr>'
                 '</tbody></table>'
             ),
+            "ext_rows": '<tr><th>owner_name</th><td>Alice</td></tr><tr><th>dm_policy</th><td><code>none</code></td></tr><tr><th>accept_email</th><td>false</td></tr>',
+            "docs_section": "",
             "key_count": "1",
-            "key_history_html": '<li><span class="ver">v1 (current)</span> <code>SHA256:HumAnRoOtKeyFp0000000000000000000000000=</code></li>',
-            "fingerprint": "SHA256:HumAnRoOtKeyFp0000000000000000000000000=",
+            "key_history_html": '<li><span class="ver">v1 (current)</span> <code>SHA256:CtLRoOtKeyFp000000000000000000000000000=</code></li>',
+            "fingerprint": "SHA256:CtLRoOtKeyFp000000000000000000000000000=",
             "updated_iso": u_iso,
             "updated_human": u_hum,
-            "self_sig": "SHVtYW5Sb290U2VsZlNpZ25hdHVyZUV4YW1wbGU==",
-            "json_href": "/h/hum_a7x9m2p4q8r1.json",
-            "pem_href": "/h/hum_a7x9m2p4q8r1.pem",
+            "self_sig": "Q3RsUm9vdFNlbGZTaWduYXR1cmVFeGFtcGxl==",
+            "json_href": "/k/ftx_a7x9m2p4q8r1.json",
+            "pem_href": "/k/ftx_a7x9m2p4q8r1.pem",
         },
     )
-    human_html = render_page(
-        title="Alice (hum_a7x9m2p4q8r1) — fatext.com",
-        description="Public human root identity on fatext.com.",
-        canonical="https://fatext.com/u/hum_a7x9m2p4q8r1",
+    ctl_html = render_page(
+        title="Alice (ftx_a7x9m2p4q8r1) — fatext.com",
+        description="Public controller identity on fatext.com.",
+        canonical="https://fatext.com/a/ftx_a7x9m2p4q8r1",
         active_nav="",
-        content=human_content,
-        alternate_links='<link rel="alternate" type="application/json" href="/h/hum_a7x9m2p4q8r1.json">',
-        raw_footer_link=' · Human Identity: <a href="/h/hum_a7x9m2p4q8r1.json">/h/hum_a7x9m2p4q8r1.json</a>',
+        content=ctl_content,
+        alternate_links='<link rel="alternate" type="application/json" href="/k/ftx_a7x9m2p4q8r1.json">',
+        raw_footer_link=' · Identity: <a href="/k/ftx_a7x9m2p4q8r1.json">/k/ftx_a7x9m2p4q8r1.json</a>',
         nav_links=nav_links,
     )
 
@@ -673,7 +676,7 @@ def render_previews() -> dict[str, Path]:
         "thread.html": thread_html,
         "agent.html": agent_html,
         "agent-revoked.html": agent_rev_html,
-        "human.html": human_html,
+        "controller.html": ctl_html,
         "404.html": err_html,
     }
     written: dict[str, Path] = {}

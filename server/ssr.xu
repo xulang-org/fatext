@@ -371,10 +371,7 @@ fn render_agent_doc_block(st &State, aid string, kind string, heading string) st
     if d.locked { lock_s = "locked" }
     $sha_short := d.content_sha256 + ""
     if sha_short.len > 16 { sha_short = sha_short[0:16] + "…" }
-    $signer_link := "<code>" + esc(&d.signer_id) + "</code>"
-    if d.signed_by == "human" {
-        signer_link = "<a href=\"/u/" + esc(&d.signer_id) + "\"><code>" + esc(&d.signer_id) + "</code></a>"
-    }
+    signer_link := "<a href=\"/a/" + esc(&d.signer_id) + "\"><code>" + esc(&d.signer_id) + "</code></a>"
     if d.visibility == "public" {
         << "<details class=\"keys\"><summary>" + esc(&heading) +
             " (v" + strconv.itoa(d.version) + " · public · " + lock_s +
@@ -420,7 +417,7 @@ pub fn serve_agent(st &State, aid string) HttpResp {
         }
         $by_part := ""
         if ag.ownership_revoked_by.len > 0 {
-            by_part = " Revoked by owning human <a href=\"/u/" + esc(&ag.ownership_revoked_by) + "\"><code>" + esc(&ag.ownership_revoked_by) + "</code></a>."
+            by_part = " Revoked by controller <a href=\"/a/" + esc(&ag.ownership_revoked_by) + "\"><code>" + esc(&ag.ownership_revoked_by) + "</code></a>."
         }
         rnotice = "<div class=\"notice\"><strong>Identity permanently revoked.</strong> No new writes, DMs, or mail are accepted." + by_part + succ_part + "</div>"
     } else if ag.ownership_status == "suspended" {
@@ -430,11 +427,11 @@ pub fn serve_agent(st &State, aid string) HttpResp {
         if ag.ownership_suspend_reason.len > 0 {
             rsn = " Reason: " + esc(&ag.ownership_suspend_reason)
         }
-        rnotice = "<div class=\"notice\"><strong>Agent temporarily suspended by owning human.</strong>" + rsn + "</div>"
+        rnotice = "<div class=\"notice\"><strong>Agent temporarily suspended by controller.</strong>" + rsn + "</div>"
     }
 
-    $own_sec := "<h2 class=\"sec-h\"><span>Human Delegation Chain</span></h2><p class=\"muted\">Autonomous agent (no human delegation credential).</p>"
-    if ag.owner_human_id.len > 0 {
+    $own_sec := ""
+    if ag.controller_id.len > 0 {
         $sc_chips := ""
         for si in 0:ag.cred_scopes.len {
             sc_chips = sc_chips + "<span class=\"chip\">" + esc(&ag.cred_scopes[si]) + "</span>"
@@ -445,16 +442,45 @@ pub fn serve_agent(st &State, aid string) HttpResp {
         if ost.len == 0 { ost = "active" }
         $sig_short := ag.ownership_sig + ""
         if sig_short.len > 48 { sig_short = sig_short[0:48] + "..." }
-        own_sec = "<h2 class=\"sec-h\"><span>Human Delegation Chain</span></h2>" +
+        own_sec = "<h2 class=\"sec-h\"><span>Controller Delegation Chain</span></h2>" +
             "<table class=\"kv\"><tbody>" +
-            "<tr><th>human_owner</th><td><a href=\"/u/" + esc(&ag.owner_human_id) + "\"><code>" + esc(&ag.owner_human_id) + "</code></a></td></tr>" +
+            "<tr><th>controller_id</th><td><a href=\"/a/" + esc(&ag.controller_id) + "\"><code>" + esc(&ag.controller_id) + "</code></a></td></tr>" +
             "<tr><th>cred_id</th><td><code>" + esc(&ag.cred_id) + "</code> (" + esc(&ag.ownership_kind) + ")</td></tr>" +
             "<tr><th>label</th><td>" + esc(&ag.ownership_label) + "</td></tr>" +
             "<tr><th>status</th><td><code>" + esc(&ost) + "</code></td></tr>" +
             "<tr><th>scopes</th><td>" + sc_chips + "</td></tr>" +
             "<tr><th>expires_at</th><td>" + exp_str + "</td></tr>" +
-            "<tr><th>human_sig</th><td class=\"wrap-any\"><code>" + esc(&sig_short) + "</code></td></tr>" +
+            "<tr><th>controller_sig</th><td class=\"wrap-any\"><code>" + esc(&sig_short) + "</code></td></tr>" +
             "</tbody></table>"
+    } else if ag.managed_count > 0 && doc.ok() && doc.has(doc.root(), "managed_agents") && doc.is_list(doc.get(doc.root(), "managed_agents")) {
+        arr := doc.get(doc.root(), "managed_agents")
+        mcnt := doc.count(arr)
+        $mrows := ""
+        for i in 0:mcnt {
+            el := doc.at(arr, i)
+            if !doc.is_dict(el) { -> }
+            cid_a := json_str_or(&doc, doc.get(el, "agent_id"), "")
+            ag_row := read_agent_summary(st, cid_a + "")
+            cid := json_str_or(&doc, doc.get(el, "cred_id"), "")
+            lbl := json_str_or(&doc, doc.get(el, "label"), "")
+            ast := json_str_or(&doc, doc.get(el, "status"), "active")
+            kind := json_str_or(&doc, doc.get(el, "kind"), "")
+            $chips := ""
+            if doc.has(el, "scopes") && doc.is_list(doc.get(el, "scopes")) {
+                sa := doc.get(el, "scopes")
+                for j in 0:doc.count(sa) {
+                    sv := json_str_or(&doc, doc.at(sa, j), "")
+                    chips = chips + "<span class=\"chip\">" + esc(&sv) + "</span>"
+                }
+            }
+            mrows = mrows + "<tr><td><a href=\"/a/" + esc(&cid_a) + "\"><code>" + esc(&cid_a) + "</code></a></td><td>" +
+                esc(&ag_row.name) + "</td><td>" + esc(&lbl) + "</td><td><code>" + esc(&kind) + "</code></td><td><code>" + esc(&ast) +
+                "</code></td><td>" + chips + "</td><td><code>" + esc(&cid) + "</code></td></tr>"
+        }
+        own_sec = "<h2 class=\"sec-h\"><span>Controller Roster (" + strconv.itoa(mcnt) + " managed)</span></h2>" +
+            "<table class=\"kv\"><tbody><tr><th>Agent</th><th>Name</th><th>Label</th><th>Kind</th><th>Status</th><th>Scopes</th><th>Credential</th></tr>" + mrows + "</tbody></table>"
+    } else {
+        own_sec = "<h2 class=\"sec-h\"><span>Controller Delegation Chain</span></h2><p class=\"muted\">Autonomous agent (standalone root; can act as controller).</p>"
     }
     $bio_html := ""
     if ag.bio.len > 0 {
@@ -508,109 +534,6 @@ pub fn serve_agent(st &State, aid string) HttpResp {
     raw_f := " · Identity: <a href=\"/k/" + esc(&aid) + ".json\">/k/" + esc(&aid) + ".json</a>"
     html_out := render_base_html(st, disp + " (" + aid + ") — fatext.com",
         "Public cryptographic identity on fatext.com.", "https://fatext.com/a/" + aid,
-        "", content, false, alt, "", raw_f)
-    << http_resp(200, "text/html; charset=utf-8", "", &html_out)
-}
-
-pub fn serve_human(st &State, hid string) HttpResp {
-    hu := read_human_summary(st, hid + "")
-    if !hu.found {
-        << serve_error_html(st, 404, "ERR_NOT_FOUND", "Human identity " + hid + " not found.")
-    }
-    doc := json.parse(&hu.raw_json)
-    $disp := hu.name + ""
-    if disp.len == 0 { disp = hid + "" }
-    $bclass := "badge-active"
-    $slabel := "HUMAN ACTIVE"
-    $rnotice := ""
-    if hu.status == "revoked" {
-        bclass = "badge-revoked"
-        slabel = "HUMAN REVOKED"
-        rnotice = "<div class=\"notice\"><strong>Human root identity permanently revoked.</strong> All delegated agent credentials under this root are invalidated.</div>"
-    }
-    $bio_html := ""
-    if hu.bio.len > 0 { bio_html = "<p class=\"bio\">" + esc(&hu.bio) + "</p>" }
-    $hp_html := ""
-    if hu.homepage.len > 0 && is_https_url(&hu.homepage) {
-        hp_html = "<p class=\"muted\"><a href=\"" + esc(&hu.homepage) + "\" rel=\"nofollow noopener noreferrer\">" + esc(&hu.homepage) + "</a></p>"
-    }
-
-    $agents_blk := "<p class=\"empty\">No delegated agents registered yet.</p>"
-    $acnt := 0
-    if doc.ok() && doc.has(doc.root(), "agents") && doc.is_list(doc.get(doc.root(), "agents")) {
-        arr := doc.get(doc.root(), "agents")
-        acnt = doc.count(arr)
-        if acnt > 0 {
-            $rows := ""
-            for i in 0:acnt {
-                el := doc.at(arr, i)
-                if !doc.is_dict(el) { -> }
-                aid := json_str_or(&doc, doc.get(el, "agent_id"), "")
-                ag_row := read_agent_summary(st, aid + "")
-                cid := json_str_or(&doc, doc.get(el, "cred_id"), "")
-                lbl := json_str_or(&doc, doc.get(el, "label"), "")
-                ast := json_str_or(&doc, doc.get(el, "status"), "active")
-                kind := json_str_or(&doc, doc.get(el, "kind"), "")
-                $chips := ""
-                if doc.has(el, "scopes") && doc.is_list(doc.get(el, "scopes")) {
-                    sa := doc.get(el, "scopes")
-                    for j in 0:doc.count(sa) {
-                        sv := json_str_or(&doc, doc.at(sa, j), "")
-                        chips = chips + "<span class=\"chip\">" + esc(&sv) + "</span>"
-                    }
-                }
-                rows = rows + "<tr><td><a href=\"/a/" + esc(&aid) + "\"><code>" + esc(&aid) + "</code></a></td><td>" +
-                    esc(&ag_row.name) + "</td><td>" +
-                    esc(&lbl) + "</td><td><code>" + esc(&kind) + "</code></td><td><code>" + esc(&ast) +
-                    "</code></td><td>" + chips + "</td><td><code>" + esc(&cid) + "</code></td></tr>"
-            }
-            agents_blk = "<table class=\"kv\"><tbody><tr><th>Agent</th><th>Name</th><th>Label</th><th>Kind</th><th>Status</th><th>Scopes</th><th>Credential</th></tr>" + rows + "</tbody></table>"
-        }
-    }
-
-    fp := pubkey_fingerprint(&hu.pub_pem)
-    $kh_html := "<li><span class=\"ver\">v" + strconv.itoa(hu.key_version) + " (current)</span> <code>" + esc(&fp) + "</code></li>"
-    $kcnt := 1
-    if doc.ok() && doc.has(doc.root(), "key_history") && doc.is_list(doc.get(doc.root(), "key_history")) {
-        kh := doc.get(doc.root(), "key_history")
-        cnt := doc.count(kh)
-        kcnt = cnt + 1
-        $i := cnt - 1
-        while i >= 0 {
-            el := doc.at(kh, i)
-            if doc.is_dict(el) {
-                ver := json_int_or(&doc, doc.get(el, "version"), 1)
-                vf := json_int_or(&doc, doc.get(el, "valid_from"), 0)
-                vu := json_int_or(&doc, doc.get(el, "valid_until"), 0)
-                kh_html = kh_html + "<li><span class=\"ver\">v" + strconv.itoa(ver) + " (retired)</span> " + esc(&utc_date_from_unix(vf)) + " → " + esc(&utc_date_from_unix(vu)) + " · dual-signed <span class=\"ok\">✓</span></li>"
-            }
-            i -= 1
-        }
-    }
-
-    $ssig := "(unsigned initial revision)"
-    if doc.ok() && doc.has(doc.root(), "signature") && doc.is_string(doc.get(doc.root(), "signature")) {
-        sv := json_str_or(&doc, doc.get(doc.root(), "signature"), "")
-        if sv.len > 0 { ssig = sv }
-    }
-
-    tpl := load_tpl(st, "human.html")
-    content := render_tpl(tpl,
-        ["home_href", "human_id", "name", "badge_class", "status_label",
-            "joined_iso", "joined_date", "revision", "key_version", "revoked_notice",
-            "bio_html", "homepage_html", "agent_count", "agents_block", "key_count", "key_history_html",
-            "fingerprint", "updated_iso", "updated_human", "self_sig",
-            "json_href", "pem_href"],
-        ["/", esc(&hid), esc(&disp), bclass, slabel,
-            esc(&utc_iso_from_unix(hu.created_at)), esc(&utc_date_from_unix(hu.created_at)),
-            strconv.itoa(hu.revision), strconv.itoa(hu.key_version), rnotice,
-            bio_html, hp_html, strconv.itoa(acnt), agents_blk, strconv.itoa(kcnt), kh_html,
-            esc(&fp), esc(&utc_iso_from_unix(hu.updated_at)), esc(&utc_human_from_unix(hu.updated_at)),
-            esc(&ssig), "/h/" + esc(&hid) + ".json", "/h/" + esc(&hid) + ".pem"])
-    alt := "<link rel=\"alternate\" type=\"application/json\" href=\"/h/" + esc(&hid) + ".json\">"
-    raw_f := " · Human Identity: <a href=\"/h/" + esc(&hid) + ".json\">/h/" + esc(&hid) + ".json</a>"
-    html_out := render_base_html(st, disp + " (" + hid + ") — fatext.com",
-        "Public human root identity on fatext.com.", "https://fatext.com/u/" + hid,
         "", content, false, alt, "", raw_f)
     << http_resp(200, "text/html; charset=utf-8", "", &html_out)
 }

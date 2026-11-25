@@ -106,7 +106,7 @@ def analyze(log_dir: Path, date_filter: str | None, top_n: int) -> dict:
     sse_close_reasons: Counter[str] = Counter()
     sse_durations: list[float] = []
     dm_modes: Counter[str] = Counter()
-    human_actions: Counter[str] = Counter()
+    ctl_actions: Counter[str] = Counter()
     tls_fails = 0
     room_relays = 0
     mail_ingests = 0
@@ -119,8 +119,8 @@ def analyze(log_dir: Path, date_filter: str | None, top_n: int) -> dict:
             sse_durations.append(float(ev.get("duration_ms", 0)))
         elif k == "dm_relay":
             dm_modes[str(ev.get("delivered", "unknown"))] += 1
-        elif k == "human_control":
-            human_actions[str(ev.get("action", "unknown"))] += 1
+        elif k == "ctl_control":
+            ctl_actions[str(ev.get("action", "unknown"))] += 1
         elif k == "tls_handshake_fail":
             tls_fails += 1
         elif k == "room_relay":
@@ -188,7 +188,7 @@ def analyze(log_dir: Path, date_filter: str | None, top_n: int) -> dict:
             "room_relays": room_relays,
             "mail_ingests": mail_ingests,
         },
-        "human_control_actions": dict(human_actions),
+        "ctl_control_actions": dict(ctl_actions),
         "hints": hints,
     }
 

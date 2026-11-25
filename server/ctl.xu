@@ -1,0 +1,834 @@
+@main
+
+#errors
+#os
+#strconv
+#strings
+#time
+#crypto/sha256
+#encoding/json
+
+pub fn authenticate_controller(st $&State, req &HttpReq, now int) AuthOutcome {
+    au := authenticate(st, req, now)
+    if !au.ok { << au }
+    if au.agent.controller_id.len > 0 {
+        << auth_fail(403, "ERR_NESTED_DELEGATION", "managed agents cannot act as controllers (1-hop hierarchy)")
+    }
+    << au
+}
+
+pub fn scopes_to_json_array(scopes &[]string) string {
+    $qs := []string{}
+    for i in 0:scopes.len {
+        qs.push(json.quote(&scopes[i]))
+    }
+    << "[" + strings.join(qs, ",") + "]"
+}
+
+fn canonical_enrollment_payload(controller_id string, ckv int, cred_id string, expires_at int, issued_at int, label string, scopes &[]string) string {
+    << "{\"controller_id\":" + json.quote(&controller_id) +
+        ",\"controller_key_version\":" + strconv.itoa(ckv) +
+        ",\"cred_id\":" + json.quote(&cred_id) +
+        ",\"expires_at\":" + strconv.itoa(expires_at) +
+        ",\"issued_at\":" + strconv.itoa(issued_at) +
+        ",\"kind\":\"enrollment\"" +
+        ",\"label\":" + json.quote(&label) +
+        ",\"scopes\":" + scopes_to_json_array(scopes) + "}"
+}
+
+fn canonical_binding_payload(agent_pub_fp string, controller_id string, cred_id string, ts int) string {
+    << "{\"agent_pub_fp\":" + json.quote(&agent_pub_fp) +
+        ",\"controller_id\":" + json.quote(&controller_id) +
+        ",\"cred_id\":" + json.quote(&cred_id) +
+        ",\"timestamp\":" + strconv.itoa(ts) + "}"
+}
+
+fn canonical_agent_cert_payload(agent_id string, akv int, agent_pub_fp string, controller_id string, ckv int, cred_id string, expires_at int, issued_at int, label string, scopes &[]string) string {
+    << "{\"agent_id\":" + json.quote(&agent_id) +
+        ",\"agent_key_version\":" + strconv.itoa(akv) +
+        ",\"agent_pub_fp\":" + json.quote(&agent_pub_fp) +
+        ",\"controller_id\":" + json.quote(&controller_id) +
+        ",\"controller_key_version\":" + strconv.itoa(ckv) +
+        ",\"cred_id\":" + json.quote(&cred_id) +
+        ",\"expires_at\":" + strconv.itoa(expires_at) +
+        ",\"issued_at\":" + strconv.itoa(issued_at) +
+        ",\"kind\":\"agent_cert\"" +
+        ",\"label\":" + json.quote(&label) +
+        ",\"scopes\":" + scopes_to_json_array(scopes) + "}"
+}
+
+fn canonical_adoption_payload(agent_id string, agent_pub_fp string, controller_id string, ts int) string {
+    << "{\"agent_id\":" + json.quote(&agent_id) +
+        ",\"agent_pub_fp\":" + json.quote(&agent_pub_fp) +
+        ",\"controller_id\":" + json.quote(&controller_id) +
+        ",\"timestamp\":" + strconv.itoa(ts) + "}"
+}
+
+fn parse_scopes_from_json(doc &json.Doc, arr_node int) ScopesResult {
+    if !doc.is_list(arr_node) {
+        << ScopesResult{ok: false, scopes: []string{}}
+    }
+    $raw := []string{}
+    for i in 0:doc.count(arr_node) {
+        el := doc.at(arr_node, i)
+        if !doc.is_string(el) { << ScopesResult{ok: false, scopes: []string{}} }
+        s := json_str_or(doc, el, "")
+        raw.push(s)
+    }
+    << normalize_scopes_list(&raw)
+}
+
+pub fn preserve_ownership_json(orig_doc &json.Doc) string {
+    if !orig_doc.ok() || !orig_doc.has(orig_doc.root(), "ownership") {
+        << "null"
+    }
+    on := orig_doc.get(orig_doc.root(), "ownership")
+    if orig_doc.is_null(on) || !orig_doc.is_dict(on) {
+        << "null"
+    }
+    << json_encode_or(orig_doc, on, "null")
+}
+
+pub fn preserve_managed_agents_json(orig_doc &json.Doc) string {
+    if !orig_doc.ok() || !orig_doc.has(orig_doc.root(), "managed_agents") {
+        << "[]"
+    }
+    ma := orig_doc.get(orig_doc.root(), "managed_agents")
+    if !orig_doc.is_list(ma) {
+        << "[]"
+    }
+    << json_encode_or(orig_doc, ma, "[]")
+}
+
+pub fn rewrite_agent_doc_full(
+    st $&State,
+    orig_doc &json.Doc,
+    aid string,
+    created_at int,
+    rev int,
+    kv int,
+    status string,
+    succ_json string,
+    pub_pem &string,
+    key_hist_json string,
+    name &string,
+    bio &string,
+    updated_at int,
+    ext_json string,
+    ownership_json string,
+    managed_json string,
+    sig_json string
+) int {
+    if !orig_doc.ok() { >> errors.new("corrupt original identity json") }
+    doc_s := "{" +
+        "\"agent_id\":" + json.quote(&aid) + "," +
+        "\"created_at\":" + strconv.itoa(created_at) + "," +
+        "\"revision\":" + strconv.itoa(rev) + "," +
+        "\"key_version\":" + strconv.itoa(kv) + "," +
+        "\"status\":" + json.quote(&status) + "," +
+        "\"successor_id\":" + succ_json + "," +
+        "\"current_public_key_pem\":" + json.quote(pub_pem) + "," +
+        "\"key_history\":" + key_hist_json + "," +
+        "\"profile\":{\"name\":" + json.quote(name) + ",\"bio\":" + json.quote(bio) + ",\"updated_at\":" + strconv.itoa(updated_at) + "}," +
+        "\"extensions\":" + ext_json + "," +
+        "\"ownership\":" + ownership_json + "," +
+        "\"managed_agents\":" + managed_json + "," +
+        "\"signature\":" + sig_json +
+        "}\n"
+    if doc_s.len > 65536 { >> errors.new("identity document exceeds 64 KB") }
+    << write_atomic(agent_json_path(st, aid + ""), &doc_s) or >>
+}
+
+pub fn sync_controller_agent_roster(
+    st $&State,
+    controller_id string,
+    agent_id string,
+    cred_id string,
+    kind string,
+    label string,
+    scopes &[]string,
+    agent_status string,
+    issued_at int,
+    expires_at int
+) int {
+    ctrl := read_agent_summary(st, controller_id + "")
+    if !ctrl.found { >> errors.new("controller not found") }
+    cdoc := json.parse(&ctrl.raw_json)
+    if !cdoc.ok() { >> errors.new("corrupt controller document") }
+    cr := cdoc.root()
+
+    $kh_json := "[]"
+    $ext_json := "{\"accept_email\":false,\"dm_policy\":\"friends\"}"
+    $sig_json := "null"
+    if cdoc.has(cr, "key_history") { kh_json = json_encode_or(&cdoc, cdoc.get(cr, "key_history"), "[]") }
+    if cdoc.has(cr, "extensions") { ext_json = json_encode_or(&cdoc, cdoc.get(cr, "extensions"), ext_json + "") }
+    if cdoc.has(cr, "signature") {
+        sn := cdoc.get(cr, "signature")
+        if !cdoc.is_null(sn) {
+            sv := json_str_or(&cdoc, sn, "")
+            if sv.len > 0 { sig_json = json.quote(&sv) }
+        }
+    }
+    own_json := preserve_ownership_json(&cdoc)
+
+    entry := "{" +
+        "\"agent_id\":" + json.quote(&agent_id) + "," +
+        "\"cred_id\":" + json.quote(&cred_id) + "," +
+        "\"kind\":" + json.quote(&kind) + "," +
+        "\"label\":" + json.quote(&label) + "," +
+        "\"scopes\":" + scopes_to_json_array(scopes) + "," +
+        "\"status\":" + json.quote(&agent_status) + "," +
+        "\"issued_at\":" + strconv.itoa(issued_at) + "," +
+        "\"expires_at\":" + strconv.itoa(expires_at) +
+        "}"
+
+    $items := []string{}
+    $replaced := false
+    if cdoc.has(cr, "managed_agents") && cdoc.is_list(cdoc.get(cr, "managed_agents")) {
+        arr := cdoc.get(cr, "managed_agents")
+        for i in 0:cdoc.count(arr) {
+            el := cdoc.at(arr, i)
+            if !cdoc.is_dict(el) { -> }
+            eid := json_str_or(&cdoc, cdoc.get(el, "agent_id"), "")
+            if eid == agent_id {
+                items.push(entry + "")
+                replaced = true
+            } else {
+                es := json_encode_or(&cdoc, el, "")
+                if es.len > 0 { items.push(es) }
+            }
+        }
+    }
+    if !replaced {
+        items.push(entry)
+    }
+
+    $succ_json := "null"
+    if ctrl.successor_id.len > 0 { succ_json = json.quote(&ctrl.successor_id) }
+    managed_json := "[" + strings.join(items, ",") + "]"
+    << rewrite_agent_doc_full(st, &cdoc, controller_id + "", ctrl.created_at, ctrl.revision, ctrl.key_version,
+        ctrl.status + "", succ_json + "", &ctrl.pub_pem, kh_json, &ctrl.name, &ctrl.bio, ctrl.updated_at,
+        ext_json, own_json, managed_json, sig_json) or >>
+}
+
+pub struct EnrollmentCheck {
+    pub ok bool
+    pub has_enrollment bool
+    pub status int
+    pub code string
+    pub message string
+    pub controller_id string
+    pub cred_id string
+    pub kind string
+    pub label string
+    pub scopes []string
+    pub issued_at int
+    pub expires_at int
+    pub ownership_json string
+}
+
+fn enroll_fail(status int, code string, msg string) EnrollmentCheck {
+    << EnrollmentCheck{
+        ok: false, has_enrollment: true, status: status, code: code, message: msg,
+        controller_id: "", cred_id: "", kind: "", label: "", scopes: []string{},
+        issued_at: 0, expires_at: 0, ownership_json: "null"
+    }
+}
+
+pub fn verify_and_prepare_enrollment(st $&State, doc &json.Doc, root int, agent_pub_pem &string, now int) EnrollmentCheck {
+    if !doc.has(root, "enrollment") || doc.is_null(doc.get(root, "enrollment")) {
+        << EnrollmentCheck{
+            ok: true, has_enrollment: false, status: 200, code: "", message: "",
+            controller_id: "", cred_id: "", kind: "", label: "", scopes: []string{},
+            issued_at: 0, expires_at: 0, ownership_json: "null"
+        }
+    }
+    enr := doc.get(root, "enrollment")
+    if !doc.is_dict(enr) || !doc.has(enr, "payload") || !doc.has(enr, "controller_sig") {
+        << enroll_fail(400, "ERR_BAD_REQUEST", "enrollment must contain payload and controller_sig")
+    }
+    pl := doc.get(enr, "payload")
+    if !doc.is_dict(pl) {
+        << enroll_fail(400, "ERR_BAD_REQUEST", "enrollment.payload must be object")
+    }
+    ctrl_sig := json_str_or(doc, doc.get(enr, "controller_sig"), "")
+    kind := json_str_or(doc, doc.get(pl, "kind"), "")
+    cred_id := json_str_or(doc, doc.get(pl, "cred_id"), "")
+    controller_id := json_str_or(doc, doc.get(pl, "controller_id"), "")
+    ckv := json_int_or(doc, doc.get(pl, "controller_key_version"), 0)
+    issued_at := json_int_or(doc, doc.get(pl, "issued_at"), 0)
+    expires_at := json_int_or(doc, doc.get(pl, "expires_at"), 0)
+    label := json_str_or(doc, doc.get(pl, "label"), "")
+    if kind != "enrollment" {
+        << enroll_fail(400, "ERR_BAD_REQUEST", "enrollment.payload.kind must be enrollment")
+    }
+    if !is_valid_cred_id(cred_id + "") || !is_valid_agent_id(controller_id + "") || ckv < 1 {
+        << enroll_fail(400, "ERR_BAD_REQUEST", "invalid cred_id, controller_id, or controller_key_version")
+    }
+    if has_forbidden_ctrl(&label) || utf8_char_count(&label) > 64 {
+        << enroll_fail(400, "ERR_BAD_REQUEST", "label must be <=64 chars with no control chars")
+    }
+    if st.used_creds.has(cred_id + "") {
+        << enroll_fail(409, "ERR_CONFLICT", "enrollment credential already consumed")
+    }
+    if expires_at > 0 && now > expires_at {
+        << enroll_fail(403, "ERR_CREDENTIAL_EXPIRED", "enrollment credential expired")
+    }
+    if !doc.has(pl, "scopes") {
+        << enroll_fail(400, "ERR_BAD_REQUEST", "enrollment.payload missing scopes")
+    }
+    sr := parse_scopes_from_json(doc, doc.get(pl, "scopes"))
+    if !sr.ok {
+        << enroll_fail(400, "ERR_BAD_REQUEST", "invalid scopes in enrollment.payload")
+    }
+
+    if st.revoked.has(controller_id + "") {
+        << enroll_fail(403, "ERR_CONTROLLER_REVOKED", "issuing controller identity is revoked")
+    }
+    if st.banned.has(controller_id + "") {
+        << enroll_fail(403, "ERR_CONTROLLER_BANNED", "issuing controller is banned")
+    }
+    ctrl := read_agent_summary(st, controller_id + "")
+    if !ctrl.found {
+        << enroll_fail(404, "ERR_UNKNOWN_AGENT", "issuing controller_id not found")
+    }
+    if ctrl.status == "revoked" {
+        map_set($&st.revoked, controller_id + "", 1)
+        << enroll_fail(403, "ERR_CONTROLLER_REVOKED", "issuing controller identity is revoked")
+    }
+    if ctrl.controller_id.len > 0 {
+        << enroll_fail(403, "ERR_NESTED_DELEGATION", "managed agents cannot issue enrollment credentials (1-hop hierarchy)")
+    }
+    cpem := find_agent_pubkey_for_version(&ctrl, ckv)
+    if cpem.len == 0 {
+        << enroll_fail(401, "ERR_BAD_SIGNATURE", "controller_key_version not found")
+    }
+    cpk := parse_spki_rsa_pem(&cpem) or (err) {
+        << enroll_fail(500, "ERR_INTERNAL", "stored controller public key invalid")
+    }
+    canon_enr := canonical_enrollment_payload(controller_id + "", ckv, cred_id + "", expires_at, issued_at, label + "", &sr.scopes)
+    if !verify_pss_message(&cpk, &canon_enr, ctrl_sig + "") {
+        << enroll_fail(401, "ERR_BAD_SIGNATURE", "enrollment controller_sig verification failed")
+    }
+
+    // Require and verify agent_binding
+    if !doc.has(root, "agent_binding") || !doc.has(root, "agent_binding_sig") {
+        << enroll_fail(400, "ERR_BAD_REQUEST", "missing agent_binding or agent_binding_sig")
+    }
+    ab := doc.get(root, "agent_binding")
+    if !doc.is_dict(ab) {
+        << enroll_fail(400, "ERR_BAD_REQUEST", "agent_binding must be object")
+    }
+    ab_sig := json_str_or(doc, doc.get(root, "agent_binding_sig"), "")
+    ab_fp := json_str_or(doc, doc.get(ab, "agent_pub_fp"), "")
+    ab_cid := json_str_or(doc, doc.get(ab, "cred_id"), "")
+    ab_ctrl := json_str_or(doc, doc.get(ab, "controller_id"), "")
+    ab_ts := json_int_or(doc, doc.get(ab, "timestamp"), 0)
+
+    expected_fp := pubkey_fingerprint(agent_pub_pem)
+    if ab_fp != expected_fp || ab_cid != cred_id || ab_ctrl != controller_id {
+        << enroll_fail(400, "ERR_BAD_REQUEST", "agent_binding mismatch")
+    }
+    if now - ab_ts > 300 || ab_ts - now > 300 {
+        << enroll_fail(401, "ERR_CLOCK_SKEW", "agent_binding timestamp skew exceeds 300s")
+    }
+    apk := parse_spki_rsa_pem(agent_pub_pem) or (err) {
+        << enroll_fail(400, "ERR_BAD_REQUEST", "agent public key invalid")
+    }
+    canon_ab := canonical_binding_payload(ab_fp + "", ab_ctrl + "", ab_cid + "", ab_ts)
+    if !verify_pss_message(&apk, &canon_ab, ab_sig + "") {
+        << enroll_fail(401, "ERR_BAD_SIGNATURE", "agent_binding_sig verification failed")
+    }
+
+    ownership_json := "{" +
+        "\"controller_id\":" + json.quote(&controller_id) + "," +
+        "\"controller_key_version\":" + strconv.itoa(ckv) + "," +
+        "\"cred_id\":" + json.quote(&cred_id) + "," +
+        "\"kind\":\"enrollment\"," +
+        "\"label\":" + json.quote(&label) + "," +
+        "\"scopes\":" + scopes_to_json_array(&sr.scopes) + "," +
+        "\"issued_at\":" + strconv.itoa(issued_at) + "," +
+        "\"expires_at\":" + strconv.itoa(expires_at) + "," +
+        "\"status\":\"active\"," +
+        "\"suspend_reason\":\"\"," +
+        "\"revoked_by\":\"\"," +
+        "\"revocation_sig\":\"\"," +
+        "\"payload\":" + canon_enr + "," +
+        "\"controller_sig\":" + json.quote(&ctrl_sig) + "," +
+        "\"agent_binding\":" + canon_ab + "," +
+        "\"agent_binding_sig\":" + json.quote(&ab_sig) +
+        "}"
+
+    << EnrollmentCheck{
+        ok: true, has_enrollment: true, status: 200, code: "", message: "",
+        controller_id: controller_id, cred_id: cred_id, kind: "enrollment", label: label,
+        scopes: clone_str_slice(&sr.scopes), issued_at: issued_at, expires_at: expires_at,
+        ownership_json: ownership_json
+    }
+}
+
+pub fn record_credential_used(st $&State, cred_id string, controller_id string, agent_id string, kind string, now int) {
+    map_set($&st.used_creds, cred_id + "", 1)
+    line := "{\"cred_id\":" + json.quote(&cred_id) +
+        ",\"controller_id\":" + json.quote(&controller_id) +
+        ",\"agent_id\":" + json.quote(&agent_id) +
+        ",\"kind\":" + json.quote(&kind) +
+        ",\"recorded_at\":" + strconv.itoa(now) + "}"
+    append_jsonl_quiet(st.data_dir + "/keys/credentials.jsonl", line)
+}
+
+// =========================================================================
+// Unified Controller Control Plane Handlers (/v1/ctl/...)
+// =========================================================================
+
+pub fn handle_ctl_list_agents(st $&State, req &HttpReq, now int) HttpResp {
+    au := authenticate_controller(st, req, now)
+    if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
+    cdoc := json.parse(&au.agent.raw_json)
+    $items := []string{}
+    if cdoc.ok() && cdoc.has(cdoc.root(), "managed_agents") && cdoc.is_list(cdoc.get(cdoc.root(), "managed_agents")) {
+        arr := cdoc.get(cdoc.root(), "managed_agents")
+        for i in 0:cdoc.count(arr) {
+            el := cdoc.at(arr, i)
+            if !cdoc.is_dict(el) { -> }
+            aid := json_str_or(&cdoc, cdoc.get(el, "agent_id"), "")
+            ag := read_agent_summary(st, aid + "")
+            cid := json_str_or(&cdoc, cdoc.get(el, "cred_id"), "")
+            kind := json_str_or(&cdoc, cdoc.get(el, "kind"), "")
+            lbl := json_str_or(&cdoc, cdoc.get(el, "label"), "")
+            iat := json_int_or(&cdoc, cdoc.get(el, "issued_at"), 0)
+            exp := json_int_or(&cdoc, cdoc.get(el, "expires_at"), 0)
+            sc_s := json_encode_or(&cdoc, cdoc.get(el, "scopes"), "[]")
+            $ost := "active"
+            if ag.found && ag.ownership_status.len > 0 { ost = ag.ownership_status + "" }
+            $ast := "unknown"
+            $akv := 0
+            $aname := ""
+            if ag.found {
+                ast = ag.status + ""
+                akv = ag.key_version
+                aname = ag.name + ""
+            }
+            items.push("{\"agent_id\":" + json.quote(&aid) +
+                ",\"name\":" + json.quote(&aname) +
+                ",\"agent_status\":" + json.quote(&ast) +
+                ",\"ownership_status\":" + json.quote(&ost) +
+                ",\"key_version\":" + strconv.itoa(akv) +
+                ",\"cred_id\":" + json.quote(&cid) +
+                ",\"kind\":" + json.quote(&kind) +
+                ",\"label\":" + json.quote(&lbl) +
+                ",\"scopes\":" + sc_s +
+                ",\"issued_at\":" + strconv.itoa(iat) +
+                ",\"expires_at\":" + strconv.itoa(exp) + "}")
+        }
+    }
+    << json_resp(200, "{\"controller_id\":" + json.quote(&au.agent_id) + ",\"agents\":[" + strings.join(items, ",") + "]}")
+}
+
+pub fn handle_ctl_grant_credential(hub $&HubState, req &HttpReq, aid string, now int) HttpResp {
+    au := authenticate_controller($&hub.st, req, now)
+    if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
+    if !is_valid_agent_id(aid + "") { << err_resp(404, "ERR_NOT_FOUND", "agent not found", 0, 0, 0) }
+    if aid == au.agent_id {
+        << err_resp(400, "ERR_BAD_REQUEST", "controller cannot grant credential to itself", 0, 0, 0)
+    }
+
+    ag := read_agent_summary(&hub.st, aid + "")
+    if !ag.found { << err_resp(404, "ERR_NOT_FOUND", "agent not found", 0, 0, 0) }
+    if ag.status == "revoked" { << err_resp(403, "ERR_REVOKED", "agent is permanently revoked", 0, 0, 0) }
+    if ag.managed_count > 0 {
+        << err_resp(403, "ERR_NESTED_DELEGATION", "target agent already manages child agents and cannot become managed (1-hop hierarchy)", 0, 0, 0)
+    }
+
+    body := req.body()
+    doc := json.parse(&body)
+    if !doc.ok() { << err_resp(400, "ERR_BAD_REQUEST", "invalid JSON body", 0, 0, 0) }
+    r := doc.root()
+    if !doc.is_dict(r) || !doc.has(r, "payload") || !doc.has(r, "controller_sig") {
+        << err_resp(400, "ERR_BAD_REQUEST", "missing payload or controller_sig", 0, 0, 0)
+    }
+    pl := doc.get(r, "payload")
+    if !doc.is_dict(pl) { << err_resp(400, "ERR_BAD_REQUEST", "payload must be object", 0, 0, 0) }
+    ctrl_sig := json_str_or(&doc, doc.get(r, "controller_sig"), "")
+    kind := json_str_or(&doc, doc.get(pl, "kind"), "")
+    pl_aid := json_str_or(&doc, doc.get(pl, "agent_id"), "")
+    pl_akv := json_int_or(&doc, doc.get(pl, "agent_key_version"), 0)
+    pl_afp := json_str_or(&doc, doc.get(pl, "agent_pub_fp"), "")
+    cred_id := json_str_or(&doc, doc.get(pl, "cred_id"), "")
+    pl_ctrl := json_str_or(&doc, doc.get(pl, "controller_id"), "")
+    pl_ckv := json_int_or(&doc, doc.get(pl, "controller_key_version"), 0)
+    iat := json_int_or(&doc, doc.get(pl, "issued_at"), 0)
+    exp := json_int_or(&doc, doc.get(pl, "expires_at"), 0)
+    lbl := json_str_or(&doc, doc.get(pl, "label"), "")
+
+    if kind != "agent_cert" || pl_aid != aid || pl_ctrl != au.agent_id {
+        << err_resp(400, "ERR_BAD_REQUEST", "agent_cert payload identity mismatch", 0, 0, 0)
+    }
+    if pl_akv != ag.key_version {
+        << err_resp(400, "ERR_BAD_REQUEST", "agent_key_version mismatch", 0, 0, 0)
+    }
+    expected_fp := pubkey_fingerprint(&ag.pub_pem)
+    if pl_afp != expected_fp {
+        << err_resp(400, "ERR_BAD_REQUEST", "agent_pub_fp mismatch", 0, 0, 0)
+    }
+    if !is_valid_cred_id(cred_id + "") || pl_ckv < 1 {
+        << err_resp(400, "ERR_BAD_REQUEST", "invalid cred_id or controller_key_version", 0, 0, 0)
+    }
+    if has_forbidden_ctrl(&lbl) || utf8_char_count(&lbl) > 64 {
+        << err_resp(400, "ERR_BAD_REQUEST", "label must be <=64 chars", 0, 0, 0)
+    }
+    if exp > 0 && now > exp {
+        << err_resp(400, "ERR_BAD_REQUEST", "credential already expired", 0, 0, 0)
+    }
+    if hub.st.used_creds.has(cred_id + "") {
+        << err_resp(409, "ERR_CONFLICT", "cred_id already used", 0, 0, 0)
+    }
+    if !doc.has(pl, "scopes") {
+        << err_resp(400, "ERR_BAD_REQUEST", "missing scopes", 0, 0, 0)
+    }
+    sr := parse_scopes_from_json(&doc, doc.get(pl, "scopes"))
+    if !sr.ok { << err_resp(400, "ERR_BAD_REQUEST", "invalid scopes", 0, 0, 0) }
+
+    cpem := find_agent_pubkey_for_version(&au.agent, pl_ckv)
+    if cpem.len == 0 { << err_resp(401, "ERR_BAD_SIGNATURE", "controller_key_version not found", 0, 0, 0) }
+    cpk := parse_spki_rsa_pem(&cpem) or (err) { << err_resp(500, "ERR_INTERNAL", "controller key invalid", 0, 0, 0) }
+    canon_cert := canonical_agent_cert_payload(aid + "", pl_akv, expected_fp + "", au.agent_id + "", pl_ckv, cred_id + "", exp, iat, lbl + "", &sr.scopes)
+    if !verify_pss_message(&cpk, &canon_cert, ctrl_sig + "") {
+        << err_resp(401, "ERR_BAD_SIGNATURE", "agent_cert controller_sig verification failed", 0, 0, 0)
+    }
+
+    // Ownership authorization: already managed by same controller, OR standalone adoption_proof signed by target agent
+    $ab_json := "null"
+    $ab_sig := ""
+    if ag.controller_id.len > 0 {
+        if ag.controller_id != au.agent_id {
+            << err_resp(403, "ERR_FORBIDDEN", "agent is already managed by another controller", 0, 0, 0)
+        }
+    } else {
+        if !doc.has(r, "adoption_proof") || !doc.is_dict(doc.get(r, "adoption_proof")) {
+            << err_resp(403, "ERR_FORBIDDEN", "adopting an autonomous agent requires signed adoption_proof", 0, 0, 0)
+        }
+        ap := doc.get(r, "adoption_proof")
+        if !doc.has(ap, "payload") || !doc.has(ap, "agent_sig") || !doc.is_dict(doc.get(ap, "payload")) {
+            << err_resp(400, "ERR_BAD_REQUEST", "invalid adoption_proof format", 0, 0, 0)
+        }
+        apl := doc.get(ap, "payload")
+        ap_aid := json_str_or(&doc, doc.get(apl, "agent_id"), "")
+        ap_fp := json_str_or(&doc, doc.get(apl, "agent_pub_fp"), "")
+        ap_ctrl := json_str_or(&doc, doc.get(apl, "controller_id"), "")
+        ap_ts := json_int_or(&doc, doc.get(apl, "timestamp"), 0)
+        asig := json_str_or(&doc, doc.get(ap, "agent_sig"), "")
+        if ap_aid != aid || ap_fp != expected_fp || ap_ctrl != au.agent_id {
+            << err_resp(400, "ERR_BAD_REQUEST", "adoption_proof identity mismatch", 0, 0, 0)
+        }
+        if now - ap_ts > 3600 || ap_ts - now > 3600 {
+            << err_resp(401, "ERR_CLOCK_SKEW", "adoption_proof expired (>3600s)", 0, 0, 0)
+        }
+        apk := parse_spki_rsa_pem(&ag.pub_pem) or (err) { << err_resp(500, "ERR_INTERNAL", "agent key invalid", 0, 0, 0) }
+        canon_ap := canonical_adoption_payload(aid + "", expected_fp + "", au.agent_id + "", ap_ts)
+        if !verify_pss_message(&apk, &canon_ap, asig + "") {
+            << err_resp(401, "ERR_BAD_SIGNATURE", "adoption_proof agent_sig verification failed", 0, 0, 0)
+        }
+        ab_json = canon_ap
+        ab_sig = asig
+    }
+
+    $next_ost := "active"
+    if ag.ownership_status == "suspended" {
+        next_ost = "suspended"
+    }
+    ownership_json := "{" +
+        "\"controller_id\":" + json.quote(&au.agent_id) + "," +
+        "\"controller_key_version\":" + strconv.itoa(pl_ckv) + "," +
+        "\"cred_id\":" + json.quote(&cred_id) + "," +
+        "\"kind\":\"agent_cert\"," +
+        "\"label\":" + json.quote(&lbl) + "," +
+        "\"scopes\":" + scopes_to_json_array(&sr.scopes) + "," +
+        "\"issued_at\":" + strconv.itoa(iat) + "," +
+        "\"expires_at\":" + strconv.itoa(exp) + "," +
+        "\"status\":" + json.quote(&next_ost) + "," +
+        "\"suspend_reason\":" + json.quote(&ag.ownership_suspend_reason) + "," +
+        "\"revoked_by\":\"\"," +
+        "\"revocation_sig\":\"\"," +
+        "\"payload\":" + canon_cert + "," +
+        "\"controller_sig\":" + json.quote(&ctrl_sig) + "," +
+        "\"agent_binding\":" + ab_json + "," +
+        "\"agent_binding_sig\":" + json.quote(&ab_sig) +
+        "}"
+
+    odoc := json.parse(&ag.raw_json)
+    $kh_json := "[]"
+    $ext_json := "{\"accept_email\":false,\"dm_policy\":\"friends\"}"
+    $sig_json := "null"
+    if odoc.ok() {
+        oroot := odoc.root()
+        if odoc.has(oroot, "key_history") { kh_json = json_encode_or(&odoc, odoc.get(oroot, "key_history"), "[]") }
+        if odoc.has(oroot, "extensions") { ext_json = json_encode_or(&odoc, odoc.get(oroot, "extensions"), ext_json + "") }
+        if odoc.has(oroot, "signature") && !odoc.is_null(odoc.get(oroot, "signature")) {
+            sv := json_str_or(&odoc, odoc.get(oroot, "signature"), "")
+            if sv.len > 0 { sig_json = json.quote(&sv) }
+        }
+    }
+    managed_json := preserve_managed_agents_json(&odoc)
+
+    rewrite_agent_doc_full($&hub.st, &odoc, aid + "", ag.created_at, ag.revision + 1, ag.key_version,
+        ag.status + "", "null", &ag.pub_pem, kh_json, &ag.name, &ag.bio, now, ext_json, ownership_json, managed_json, sig_json) or (err) {
+        << err_resp(500, "ERR_INTERNAL", "failed updating agent credential", 0, 0, 0)
+    }
+    record_credential_used($&hub.st, cred_id + "", au.agent_id + "", aid + "", "agent_cert", now)
+    sync_controller_agent_roster($&hub.st, au.agent_id + "", aid + "", cred_id + "", "agent_cert", lbl + "", &sr.scopes, next_ost + "", iat, exp) or (err) {
+        << err_resp(500, "ERR_INTERNAL", "failed syncing controller agent roster", 0, 0, 0)
+    }
+    log_event_json(hub.log_ch, now, "ctl_control",
+        "\"action\":\"grant\",\"controller_id\":" + json.quote(&au.agent_id) + ",\"agent_id\":" + json.quote(&aid) + ",\"cred_id\":" + json.quote(&cred_id))
+    << json_resp(200, "{\"ok\":true,\"controller_id\":" + json.quote(&au.agent_id) + ",\"agent_id\":" + json.quote(&aid) + ",\"cred_id\":" + json.quote(&cred_id) + ",\"kind\":\"agent_cert\",\"status\":" + json.quote(&next_ost) + "}")
+}
+
+fn update_managed_ownership_status(hub $&HubState, aid string, ag &AgentSummary, new_ost string, reason string, agent_status string, succ_json string, rev_by string, rev_sig string, now int) int {
+    odoc := json.parse(&ag.raw_json)
+    if !odoc.ok() || !odoc.has(odoc.root(), "ownership") { >> errors.new("missing ownership") }
+    oroot := odoc.root()
+    on := odoc.get(oroot, "ownership")
+    if !odoc.is_dict(on) { >> errors.new("ownership is null") }
+
+    pl_s := json_encode_or(&odoc, odoc.get(on, "payload"), "null")
+    csig := json_str_or(&odoc, odoc.get(on, "controller_sig"), "")
+    $ab_s := "null"
+    if odoc.has(on, "agent_binding") && !odoc.is_null(odoc.get(on, "agent_binding")) {
+        ab_s = json_encode_or(&odoc, odoc.get(on, "agent_binding"), "null")
+    }
+    ab_sig := json_str_or(&odoc, odoc.get(on, "agent_binding_sig"), "")
+    ckv := json_int_or(&odoc, odoc.get(on, "controller_key_version"), 1)
+
+    new_ownership := "{" +
+        "\"controller_id\":" + json.quote(&ag.controller_id) + "," +
+        "\"controller_key_version\":" + strconv.itoa(ckv) + "," +
+        "\"cred_id\":" + json.quote(&ag.cred_id) + "," +
+        "\"kind\":" + json.quote(&ag.ownership_kind) + "," +
+        "\"label\":" + json.quote(&ag.ownership_label) + "," +
+        "\"scopes\":" + scopes_to_json_array(&ag.cred_scopes) + "," +
+        "\"issued_at\":" + strconv.itoa(ag.cred_issued_at) + "," +
+        "\"expires_at\":" + strconv.itoa(ag.cred_expires_at) + "," +
+        "\"status\":" + json.quote(&new_ost) + "," +
+        "\"suspend_reason\":" + json.quote(&reason) + "," +
+        "\"revoked_by\":" + json.quote(&rev_by) + "," +
+        "\"revocation_sig\":" + json.quote(&rev_sig) + "," +
+        "\"payload\":" + pl_s + "," +
+        "\"controller_sig\":" + json.quote(&csig) + "," +
+        "\"agent_binding\":" + ab_s + "," +
+        "\"agent_binding_sig\":" + json.quote(&ab_sig) +
+        "}"
+
+    $kh_json := "[]"
+    $ext_json := "{\"accept_email\":false,\"dm_policy\":\"friends\"}"
+    $sig_json := "null"
+    if odoc.has(oroot, "key_history") { kh_json = json_encode_or(&odoc, odoc.get(oroot, "key_history"), "[]") }
+    if odoc.has(oroot, "extensions") { ext_json = json_encode_or(&odoc, odoc.get(oroot, "extensions"), ext_json + "") }
+    if odoc.has(oroot, "signature") && !odoc.is_null(odoc.get(oroot, "signature")) {
+        sv := json_str_or(&odoc, odoc.get(oroot, "signature"), "")
+        if sv.len > 0 { sig_json = json.quote(&sv) }
+    }
+    managed_json := preserve_managed_agents_json(&odoc)
+
+    rewrite_agent_doc_full($&hub.st, &odoc, aid + "", ag.created_at, ag.revision + 1, ag.key_version,
+        agent_status, succ_json, &ag.pub_pem, kh_json, &ag.name, &ag.bio, now, ext_json, new_ownership, managed_json, sig_json) or >>
+    sync_controller_agent_roster($&hub.st, ag.controller_id + "", aid + "", ag.cred_id + "", ag.ownership_kind + "",
+        ag.ownership_label + "", &ag.cred_scopes, new_ost + "", ag.cred_issued_at, ag.cred_expires_at) or >>
+    << 0
+}
+
+pub fn handle_ctl_suspend_agent(hub $&HubState, req &HttpReq, aid string, now int) HttpResp {
+    au := authenticate_controller($&hub.st, req, now)
+    if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
+    if !is_valid_agent_id(aid + "") { << err_resp(404, "ERR_NOT_FOUND", "agent not found", 0, 0, 0) }
+    ag := read_agent_summary(&hub.st, aid + "")
+    if !ag.found { << err_resp(404, "ERR_NOT_FOUND", "agent not found", 0, 0, 0) }
+    if ag.controller_id != au.agent_id { << err_resp(403, "ERR_FORBIDDEN", "not controller of agent", 0, 0, 0) }
+    if ag.status == "revoked" { << err_resp(403, "ERR_REVOKED", "agent already permanently revoked", 0, 0, 0) }
+
+    $reason := ""
+    body := req.body()
+    if strings.trim_space(&body).len > 0 {
+        doc := json.parse(&body)
+        if !doc.ok() { << err_resp(400, "ERR_BAD_REQUEST", "invalid JSON", 0, 0, 0) }
+        if doc.is_dict(doc.root()) && doc.has(doc.root(), "reason") {
+            reason = json_str_or(&doc, doc.get(doc.root(), "reason"), "")
+            if has_forbidden_ctrl(&reason) || utf8_char_count(&reason) > 256 {
+                << err_resp(400, "ERR_BAD_REQUEST", "reason must be <=256 chars", 0, 0, 0)
+            }
+        }
+    }
+
+    update_managed_ownership_status(hub, aid + "", &ag, "suspended", reason + "", ag.status + "", "null", "", "", now) or (err) {
+        << err_resp(500, "ERR_INTERNAL", "failed suspending agent", 0, 0, 0)
+    }
+    hub_disconnect_agent(hub, aid + "")
+    log_event_json(hub.log_ch, now, "ctl_control",
+        "\"action\":\"suspend\",\"controller_id\":" + json.quote(&au.agent_id) + ",\"agent_id\":" + json.quote(&aid))
+    << json_resp(200, "{\"ok\":true,\"agent_id\":" + json.quote(&aid) + ",\"ownership_status\":\"suspended\"}")
+}
+
+pub fn handle_ctl_resume_agent(hub $&HubState, req &HttpReq, aid string, now int) HttpResp {
+    au := authenticate_controller($&hub.st, req, now)
+    if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
+    if !is_valid_agent_id(aid + "") { << err_resp(404, "ERR_NOT_FOUND", "agent not found", 0, 0, 0) }
+    ag := read_agent_summary(&hub.st, aid + "")
+    if !ag.found { << err_resp(404, "ERR_NOT_FOUND", "agent not found", 0, 0, 0) }
+    if ag.controller_id != au.agent_id { << err_resp(403, "ERR_FORBIDDEN", "not controller of agent", 0, 0, 0) }
+    if ag.status == "revoked" { << err_resp(403, "ERR_REVOKED", "agent already permanently revoked", 0, 0, 0) }
+
+    update_managed_ownership_status(hub, aid + "", &ag, "active", "", ag.status + "", "null", "", "", now) or (err) {
+        << err_resp(500, "ERR_INTERNAL", "failed resuming agent", 0, 0, 0)
+    }
+    log_event_json(hub.log_ch, now, "ctl_control",
+        "\"action\":\"resume\",\"controller_id\":" + json.quote(&au.agent_id) + ",\"agent_id\":" + json.quote(&aid))
+    << json_resp(200, "{\"ok\":true,\"agent_id\":" + json.quote(&aid) + ",\"ownership_status\":\"active\"}")
+}
+
+pub fn handle_ctl_revoke_agent(hub $&HubState, req &HttpReq, aid string, now int) HttpResp {
+    au := authenticate_controller($&hub.st, req, now)
+    if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
+    if !is_valid_agent_id(aid + "") { << err_resp(404, "ERR_NOT_FOUND", "agent not found", 0, 0, 0) }
+    ag := read_agent_summary(&hub.st, aid + "")
+    if !ag.found { << err_resp(404, "ERR_NOT_FOUND", "agent not found", 0, 0, 0) }
+    if ag.controller_id != au.agent_id { << err_resp(403, "ERR_FORBIDDEN", "not controller of agent", 0, 0, 0) }
+
+    $succ_id := ""
+    $reason := ""
+    body := req.body()
+    if strings.trim_space(&body).len > 0 {
+        doc := json.parse(&body)
+        if !doc.ok() { << err_resp(400, "ERR_BAD_REQUEST", "invalid JSON", 0, 0, 0) }
+        $t := doc.root()
+        if doc.is_dict(t) && doc.has(t, "payload") && doc.is_dict(doc.get(t, "payload")) {
+            t = doc.get(t, "payload")
+        }
+        if doc.is_dict(t) && doc.has(t, "successor_id") && !doc.is_null(doc.get(t, "successor_id")) {
+            sv := json_str_or(&doc, doc.get(t, "successor_id"), "")
+            if sv.len > 0 {
+                if !is_valid_agent_id(sv + "") || sv == aid { << err_resp(400, "ERR_BAD_REQUEST", "invalid successor_id", 0, 0, 0) }
+                succ_id = sv
+            }
+        }
+        if doc.is_dict(t) && doc.has(t, "reason") {
+            reason = json_str_or(&doc, doc.get(t, "reason"), "")
+            if has_forbidden_ctrl(&reason) || utf8_char_count(&reason) > 256 {
+                << err_resp(400, "ERR_BAD_REQUEST", "reason must be <=256 chars", 0, 0, 0)
+            }
+        }
+    }
+
+    $succ_json := "null"
+    if succ_id.len > 0 { succ_json = json.quote(&succ_id) }
+
+    update_managed_ownership_status(hub, aid + "", &ag, "revoked", reason + "", "revoked", succ_json + "", au.agent_id + "", au.sig_b64 + "", now) or (err) {
+        << err_resp(500, "ERR_INTERNAL", "failed revoking managed agent", 0, 0, 0)
+    }
+    rev_line := "{\"agent_id\":" + json.quote(&aid) + ",\"successor_id\":" + succ_json + ",\"revoked_by\":" + json.quote(&au.agent_id) + ",\"revoked_at\":" + strconv.itoa(now) + "}"
+    append_jsonl_quiet(hub.st.data_dir + "/keys/revoked.jsonl", rev_line)
+    state_mark_revoked($&hub.st, aid + "")
+    hub_disconnect_agent(hub, aid + "")
+    log_event_json(hub.log_ch, now, "ctl_control",
+        "\"action\":\"revoke_agent\",\"controller_id\":" + json.quote(&au.agent_id) + ",\"agent_id\":" + json.quote(&aid))
+    << json_resp(200, "{\"ok\":true,\"agent_id\":" + json.quote(&aid) + ",\"status\":\"revoked\",\"revoked_by\":" + json.quote(&au.agent_id) + ",\"successor_id\":" + succ_json + "}")
+}
+
+pub fn handle_ctl_update_agent_policy(hub $&HubState, req &HttpReq, aid string, now int) HttpResp {
+    au := authenticate_controller($&hub.st, req, now)
+    if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
+    if !is_valid_agent_id(aid + "") { << err_resp(404, "ERR_NOT_FOUND", "agent not found", 0, 0, 0) }
+    ag := read_agent_summary(&hub.st, aid + "")
+    if !ag.found { << err_resp(404, "ERR_NOT_FOUND", "agent not found", 0, 0, 0) }
+    if ag.controller_id != au.agent_id { << err_resp(403, "ERR_FORBIDDEN", "not controller of agent", 0, 0, 0) }
+    if ag.status == "revoked" { << err_resp(403, "ERR_REVOKED", "agent permanently revoked", 0, 0, 0) }
+
+    doc := json.parse(&req.body())
+    if !doc.ok() || !doc.is_dict(doc.root()) { << err_resp(400, "ERR_BAD_REQUEST", "invalid JSON", 0, 0, 0) }
+    r := doc.root()
+
+    odoc := json.parse(&ag.raw_json)
+    $dmp := "friends"
+    $ae := false
+    $owner_name := ""
+    $owner_bio := ""
+    $model := ""
+    $runtime := ""
+    $homepage := ""
+    $webhook := ""
+    $tags_s := ""
+    $lang_s := ""
+    if odoc.ok() && odoc.has(odoc.root(), "extensions") && odoc.is_dict(odoc.get(odoc.root(), "extensions")) {
+        en := odoc.get(odoc.root(), "extensions")
+        if odoc.has(en, "dm_policy") { dmp = json_str_or(&odoc, odoc.get(en, "dm_policy"), "friends") }
+        if odoc.has(en, "accept_email") { ae = json_bool_or(&odoc, odoc.get(en, "accept_email"), false) }
+        if odoc.has(en, "owner_name") { owner_name = json_str_or(&odoc, odoc.get(en, "owner_name"), "") }
+        if odoc.has(en, "owner_bio") { owner_bio = json_str_or(&odoc, odoc.get(en, "owner_bio"), "") }
+        if odoc.has(en, "model") { model = json_str_or(&odoc, odoc.get(en, "model"), "") }
+        if odoc.has(en, "runtime") { runtime = json_str_or(&odoc, odoc.get(en, "runtime"), "") }
+        if odoc.has(en, "homepage") { homepage = json_str_or(&odoc, odoc.get(en, "homepage"), "") }
+        if odoc.has(en, "webhook_url") { webhook = json_str_or(&odoc, odoc.get(en, "webhook_url"), "") }
+        if odoc.has(en, "tags") { tags_s = json_encode_or(&odoc, odoc.get(en, "tags"), "") }
+        if odoc.has(en, "lang") { lang_s = json_encode_or(&odoc, odoc.get(en, "lang"), "") }
+    }
+
+    $next_name := ag.name + ""
+    if doc.has(r, "name") && !doc.is_null(doc.get(r, "name")) {
+        if !doc.is_string(doc.get(r, "name")) {
+            << err_resp(400, "ERR_BAD_REQUEST", "name must be string", 0, 0, 0)
+        }
+        nn := json_str_or(&doc, doc.get(r, "name"), "")
+        if has_forbidden_ctrl(&nn) || utf8_char_count(&nn) > 32 {
+            << err_resp(400, "ERR_BAD_REQUEST", "name must be <=32 chars with no control chars", 0, 0, 0)
+        }
+        next_name = nn
+    }
+
+    if doc.has(r, "dm_policy") {
+        nv := json_str_or(&doc, doc.get(r, "dm_policy"), "")
+        if nv != "friends" && nv != "all" && nv != "none" {
+            << err_resp(400, "ERR_BAD_REQUEST", "dm_policy must be all, friends, or none", 0, 0, 0)
+        }
+        dmp = nv
+    }
+    if doc.has(r, "accept_email") {
+        ae = json_bool_or(&doc, doc.get(r, "accept_email"), ae)
+    }
+    if doc.has(r, "clear_webhook") && json_bool_or(&doc, doc.get(r, "clear_webhook"), false) {
+        webhook = ""
+    }
+
+    $parts := []string{}
+    $ae_s := "false"
+    if ae { ae_s = "true" }
+    parts.push("\"accept_email\":" + ae_s)
+    parts.push("\"dm_policy\":" + json.quote(&dmp))
+    if homepage.len > 0 { parts.push("\"homepage\":" + json.quote(&homepage)) }
+    if lang_s.len > 0 { parts.push("\"lang\":" + lang_s) }
+    if model.len > 0 { parts.push("\"model\":" + json.quote(&model)) }
+    if owner_bio.len > 0 { parts.push("\"owner_bio\":" + json.quote(&owner_bio)) }
+    if owner_name.len > 0 { parts.push("\"owner_name\":" + json.quote(&owner_name)) }
+    if runtime.len > 0 { parts.push("\"runtime\":" + json.quote(&runtime)) }
+    if tags_s.len > 0 { parts.push("\"tags\":" + tags_s) }
+    if webhook.len > 0 { parts.push("\"webhook_url\":" + json.quote(&webhook)) }
+    ext_json := "{" + strings.join(parts, ",") + "}"
+
+    $kh_json := "[]"
+    $sig_json := "null"
+    if odoc.ok() {
+        oroot := odoc.root()
+        if odoc.has(oroot, "key_history") { kh_json = json_encode_or(&odoc, odoc.get(oroot, "key_history"), "[]") }
+        if odoc.has(oroot, "signature") && !odoc.is_null(odoc.get(oroot, "signature")) {
+            sv := json_str_or(&odoc, odoc.get(oroot, "signature"), "")
+            if sv.len > 0 { sig_json = json.quote(&sv) }
+        }
+    }
+    own_json := preserve_ownership_json(&odoc)
+    managed_json := preserve_managed_agents_json(&odoc)
+    rewrite_agent_doc_full($&hub.st, &odoc, aid + "", ag.created_at, ag.revision + 1, ag.key_version,
+        ag.status + "", "null", &ag.pub_pem, kh_json, &next_name, &ag.bio, now, ext_json, own_json, managed_json, sig_json) or (err) {
+        << err_resp(500, "ERR_INTERNAL", "failed updating agent policy", 0, 0, 0)
+    }
+    log_event_json(hub.log_ch, now, "ctl_control",
+        "\"action\":\"policy\",\"controller_id\":" + json.quote(&au.agent_id) + ",\"agent_id\":" + json.quote(&aid) + ",\"dm_policy\":" + json.quote(&dmp) + ",\"accept_email\":" + ae_s)
+    << json_resp(200, "{\"ok\":true,\"agent_id\":" + json.quote(&aid) + ",\"name\":" + json.quote(&next_name) + ",\"dm_policy\":" + json.quote(&dmp) + ",\"accept_email\":" + ae_s + "}")
+}

@@ -137,7 +137,7 @@ fn env_err(status int, code string, msg string) DocEnvCheck {
     << DocEnvCheck{ok: false, status: status, code: code, message: msg, env_json: ""}
 }
 
-fn validate_doc_envelope(doc &json.Doc, env_node int, agent_id string, owner_human_id string) DocEnvCheck {
+fn validate_doc_envelope(doc &json.Doc, env_node int, agent_id string, controller_id string) DocEnvCheck {
     if env_node < 0 || !doc.is_dict(env_node) {
         << env_err(400, "ERR_BAD_REQUEST", "envelope must be a JSON object")
     }
@@ -164,7 +164,7 @@ fn validate_doc_envelope(doc &json.Doc, env_node int, agent_id string, owner_hum
     }
 
     $has_agent_rec := false
-    $has_human_rec := false
+    $has_ctrl_rec := false
     for i in 0:rcnt {
         rn := doc.at(recs, i)
         if !doc.is_dict(rn) || !doc.has(rn, "role") || !doc.has(rn, "id") || !doc.has(rn, "key_version") || !doc.has(rn, "ek") {
@@ -177,26 +177,23 @@ fn validate_doc_envelope(doc &json.Doc, env_node int, agent_id string, owner_hum
         if rkv < 1 || rek.len == 0 || rek.len > 2048 {
             << env_err(400, "ERR_BAD_REQUEST", "recipient key_version or ek invalid")
         }
+        if !is_valid_agent_id(rid + "") {
+            << env_err(400, "ERR_BAD_REQUEST", "recipient id invalid")
+        }
         if role == "agent" {
-            if !is_valid_agent_id(rid + "") {
-                << env_err(400, "ERR_BAD_REQUEST", "recipient agent id invalid")
-            }
             if rid == agent_id { has_agent_rec = true }
-        } else if role == "human" {
-            if !is_valid_human_id(rid + "") {
-                << env_err(400, "ERR_BAD_REQUEST", "recipient human id invalid")
-            }
-            if owner_human_id.len > 0 && rid == owner_human_id { has_human_rec = true }
+        } else if role == "controller" {
+            if controller_id.len > 0 && rid == controller_id { has_ctrl_rec = true }
         } else {
-            << env_err(400, "ERR_BAD_REQUEST", "recipient role must be agent or human")
+            << env_err(400, "ERR_BAD_REQUEST", "recipient role must be agent or controller")
         }
     }
 
     if !has_agent_rec {
         << env_err(400, "ERR_BAD_REQUEST", "private doc must include target agent recipient")
     }
-    if owner_human_id.len > 0 && !has_human_rec {
-        << env_err(400, "ERR_BAD_REQUEST", "private doc for human-owned agent must include owning human recipient")
+    if controller_id.len > 0 && !has_ctrl_rec {
+        << env_err(400, "ERR_BAD_REQUEST", "private doc for managed agent must include owning controller recipient")
     }
 
     env_json := json_encode_or(doc, env_node, "")
@@ -226,7 +223,7 @@ fn store_agent_doc(
 
     cur := read_agent_doc(&hub.st, aid + "", kind + "")
     if actor_type == "agent" && cur.found && cur.locked {
-        << err_resp(403, "ERR_DOC_LOCKED", "document is locked by owning human", 0, 0, 0)
+        << err_resp(403, "ERR_DOC_LOCKED", "document is locked by controller", 0, 0, 0)
     }
 
     if !doc.has(r, "version") {
@@ -267,7 +264,7 @@ fn store_agent_doc(
         locked = doc.as_bool(doc.get(r, "locked")) or (err) { << err_resp(400, "ERR_BAD_REQUEST", "invalid locked", 0, 0, 0) }
     }
     if actor_type == "agent" && locked {
-        << err_resp(403, "ERR_FORBIDDEN", "only owning human can lock documents", 0, 0, 0)
+        << err_resp(403, "ERR_FORBIDDEN", "only owning controller can lock documents", 0, 0, 0)
     }
 
     if !doc.has(r, "content_sha256") || !doc.is_string(doc.get(r, "content_sha256")) {
@@ -336,7 +333,7 @@ fn store_agent_doc(
         if !doc.has(r, "envelope") {
             << err_resp(400, "ERR_BAD_REQUEST", "private doc requires envelope", 0, 0, 0)
         }
-        ec := validate_doc_envelope(&doc, doc.get(r, "envelope"), aid + "", ag.owner_human_id + "")
+        ec := validate_doc_envelope(&doc, doc.get(r, "envelope"), aid + "", ag.controller_id + "")
         if !ec.ok {
             << err_resp(ec.status, ec.code, ec.message, 0, 0, 0)
         }
@@ -401,7 +398,7 @@ fn store_agent_doc(
         ",\"content_bytes\":" + strconv.itoa(cbytes) +
         ",\"content_sha256\":" + json.quote(&csha))
 
-    if actor_type == "human" {
+    if actor_type == "controller" {
         saved := read_agent_doc(&hub.st, aid + "", kind + "")
         meta_s := doc_meta_json(&saved)
         _ := hub_push_to_agent(hub, aid + "", "doc_update", &meta_s)
@@ -451,7 +448,7 @@ pub fn handle_agent_doc_delete(hub $&HubState, req &HttpReq, kind string, now in
         << err_resp(404, "ERR_NOT_FOUND", kind + " document not found", 0, 0, 0)
     }
     if cur.locked {
-        << err_resp(403, "ERR_DOC_LOCKED", "document is locked by owning human", 0, 0, 0)
+        << err_resp(403, "ERR_DOC_LOCKED", "document is locked by controller", 0, 0, 0)
     }
     p := agent_doc_path(&hub.st, au.agent_id + "", kind + "")
     os.remove(p + "") or (err) {
@@ -463,59 +460,59 @@ pub fn handle_agent_doc_delete(hub $&HubState, req &HttpReq, kind string, now in
     << json_resp(200, "{\"ok\":true,\"agent_id\":" + json.quote(&au.agent_id) + ",\"kind\":" + json.quote(&kind) + ",\"deleted\":true}")
 }
 
-pub fn handle_human_agent_docs_list(st $&State, req &HttpReq, aid string, now int) HttpResp {
-    au := authenticate_human(st, req, now)
+pub fn handle_ctl_agent_docs_list(st $&State, req &HttpReq, aid string, now int) HttpResp {
+    au := authenticate_controller(st, req, now)
     if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
     if !is_valid_agent_id(aid + "") { << err_resp(404, "ERR_NOT_FOUND", "agent not found", 0, 0, 0) }
     ag := read_agent_summary(st, aid + "")
     if !ag.found { << err_resp(404, "ERR_NOT_FOUND", "agent not found", 0, 0, 0) }
-    if ag.owner_human_id != au.human_id { << err_resp(403, "ERR_FORBIDDEN", "not owner of agent", 0, 0, 0) }
+    if ag.controller_id != au.agent_id { << err_resp(403, "ERR_FORBIDDEN", "not controller of agent", 0, 0, 0) }
     sd := read_agent_doc(st, aid + "", "soul")
     rd := read_agent_doc(st, aid + "", "rules")
-    << json_resp(200, "{\"agent_id\":" + json.quote(&aid) + ",\"human_id\":" + json.quote(&au.human_id) + ",\"soul\":" + doc_meta_json(&sd) + ",\"rules\":" + doc_meta_json(&rd) + "}")
+    << json_resp(200, "{\"agent_id\":" + json.quote(&aid) + ",\"controller_id\":" + json.quote(&au.agent_id) + ",\"soul\":" + doc_meta_json(&sd) + ",\"rules\":" + doc_meta_json(&rd) + "}")
 }
 
-pub fn handle_human_agent_doc_get(st $&State, req &HttpReq, aid string, kind string, now int) HttpResp {
+pub fn handle_ctl_agent_doc_get(st $&State, req &HttpReq, aid string, kind string, now int) HttpResp {
     if !is_valid_doc_kind(kind + "") {
         << err_resp(404, "ERR_NOT_FOUND", "unknown document kind", 0, 0, 0)
     }
-    au := authenticate_human(st, req, now)
+    au := authenticate_controller(st, req, now)
     if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
     if !is_valid_agent_id(aid + "") { << err_resp(404, "ERR_NOT_FOUND", "agent not found", 0, 0, 0) }
     ag := read_agent_summary(st, aid + "")
     if !ag.found { << err_resp(404, "ERR_NOT_FOUND", "agent not found", 0, 0, 0) }
-    if ag.owner_human_id != au.human_id { << err_resp(403, "ERR_FORBIDDEN", "not owner of agent", 0, 0, 0) }
+    if ag.controller_id != au.agent_id { << err_resp(403, "ERR_FORBIDDEN", "not controller of agent", 0, 0, 0) }
     raw := os.read(agent_doc_path(st, aid + "", kind + "")) or (err) {
         << err_resp(404, "ERR_NOT_FOUND", kind + " document not found", 0, 0, 0)
     }
     << json_resp(200, raw)
 }
 
-pub fn handle_human_agent_doc_put(hub $&HubState, req &HttpReq, aid string, kind string, now int) HttpResp {
+pub fn handle_ctl_agent_doc_put(hub $&HubState, req &HttpReq, aid string, kind string, now int) HttpResp {
     if !is_valid_doc_kind(kind + "") {
         << err_resp(404, "ERR_NOT_FOUND", "unknown document kind", 0, 0, 0)
     }
-    au := authenticate_human($&hub.st, req, now)
+    au := authenticate_controller($&hub.st, req, now)
     if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
     if !is_valid_agent_id(aid + "") { << err_resp(404, "ERR_NOT_FOUND", "agent not found", 0, 0, 0) }
     ag := read_agent_summary(&hub.st, aid + "")
     if !ag.found { << err_resp(404, "ERR_NOT_FOUND", "agent not found", 0, 0, 0) }
-    if ag.owner_human_id != au.human_id { << err_resp(403, "ERR_FORBIDDEN", "not owner of agent", 0, 0, 0) }
+    if ag.controller_id != au.agent_id { << err_resp(403, "ERR_FORBIDDEN", "not controller of agent", 0, 0, 0) }
     if ag.status == "revoked" { << err_resp(403, "ERR_REVOKED", "agent is permanently revoked", 0, 0, 0) }
     body := req.body()
-    << store_agent_doc(hub, aid + "", &ag, kind + "", "human", au.human_id + "", au.key_version, &au.human.pub_pem, &body, now)
+    << store_agent_doc(hub, aid + "", &ag, kind + "", "controller", au.agent_id + "", au.key_version, &au.agent.pub_pem, &body, now)
 }
 
-pub fn handle_human_agent_doc_delete(hub $&HubState, req &HttpReq, aid string, kind string, now int) HttpResp {
+pub fn handle_ctl_agent_doc_delete(hub $&HubState, req &HttpReq, aid string, kind string, now int) HttpResp {
     if !is_valid_doc_kind(kind + "") {
         << err_resp(404, "ERR_NOT_FOUND", "unknown document kind", 0, 0, 0)
     }
-    au := authenticate_human($&hub.st, req, now)
+    au := authenticate_controller($&hub.st, req, now)
     if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
     if !is_valid_agent_id(aid + "") { << err_resp(404, "ERR_NOT_FOUND", "agent not found", 0, 0, 0) }
     ag := read_agent_summary(&hub.st, aid + "")
     if !ag.found { << err_resp(404, "ERR_NOT_FOUND", "agent not found", 0, 0, 0) }
-    if ag.owner_human_id != au.human_id { << err_resp(403, "ERR_FORBIDDEN", "not owner of agent", 0, 0, 0) }
+    if ag.controller_id != au.agent_id { << err_resp(403, "ERR_FORBIDDEN", "not controller of agent", 0, 0, 0) }
     if ag.status == "revoked" { << err_resp(403, "ERR_REVOKED", "agent is permanently revoked", 0, 0, 0) }
     p := agent_doc_path(&hub.st, aid + "", kind + "")
     _ := os.stat(p + "") or (err) {
@@ -525,7 +522,7 @@ pub fn handle_human_agent_doc_delete(hub $&HubState, req &HttpReq, aid string, k
         << err_resp(500, "ERR_INTERNAL", "failed removing document", 0, 0, 0)
     }
     log_event_json(hub.log_ch, now, "doc_update",
-        "\"action\":\"delete\",\"actor_type\":\"human\",\"actor_id\":" + json.quote(&au.human_id) +
+        "\"action\":\"delete\",\"actor_type\":\"controller\",\"actor_id\":" + json.quote(&au.agent_id) +
         ",\"agent_id\":" + json.quote(&aid) + ",\"doc_kind\":" + json.quote(&kind))
     del_ev := "{\"agent_id\":" + json.quote(&aid) + ",\"kind\":" + json.quote(&kind) + ",\"deleted\":true}"
     _ := hub_push_to_agent(hub, aid + "", "doc_update", &del_ev)

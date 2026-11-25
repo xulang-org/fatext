@@ -36,10 +36,11 @@ fn auth_fail(status int, code string, msg string) AuthOutcome {
             found: false, agent_id: "", status: "", successor_id: "",
             created_at: 0, revision: 0, key_version: 0, pub_pem: "",
             name: "", bio: "", updated_at: 0,
-            owner_human_id: "", ownership_status: "", ownership_kind: "",
+            controller_id: "", ownership_status: "", ownership_kind: "",
             ownership_label: "", ownership_suspend_reason: "", ownership_revoked_by: "",
             ownership_sig: "", cred_id: "", cred_issued_at: 0, cred_expires_at: 0,
-            cred_scopes: []string{}, ownership_raw: "null", raw_json: ""
+            cred_scopes: []string{}, ownership_raw: "null",
+            managed_count: 0, managed_agents_raw: "[]", raw_json: ""
         }
     }
 }
@@ -99,24 +100,27 @@ pub fn authenticate(st $&State, req &HttpReq, now int) AuthOutcome {
 pub fn authenticate_scoped(st $&State, req &HttpReq, now int, scope string) AuthOutcome {
     au := authenticate(st, req, now)
     if !au.ok { << au }
-    if au.agent.owner_human_id.len > 0 {
-        hid := au.agent.owner_human_id + ""
-        if st.revoked_humans.has(hid + "") {
-            << auth_fail(403, "ERR_HUMAN_REVOKED", "owning human identity is revoked")
+    if au.agent.controller_id.len > 0 {
+        cid := au.agent.controller_id + ""
+        if st.revoked.has(cid + "") {
+            << auth_fail(403, "ERR_CONTROLLER_REVOKED", "controlling agent identity is revoked")
         }
-        hu := read_human_summary(st, hid + "")
-        if hu.found && hu.status == "revoked" {
-            map_set($&st.revoked_humans, hid + "", 1)
-            << auth_fail(403, "ERR_HUMAN_REVOKED", "owning human identity is revoked")
+        if st.banned.has(cid + "") {
+            << auth_fail(403, "ERR_CONTROLLER_BANNED", "controlling agent is banned")
+        }
+        ctrl := read_agent_summary(st, cid + "")
+        if ctrl.found && ctrl.status == "revoked" {
+            map_set($&st.revoked, cid + "", 1)
+            << auth_fail(403, "ERR_CONTROLLER_REVOKED", "controlling agent identity is revoked")
         }
         if au.agent.ownership_status == "suspended" {
-            << auth_fail(403, "ERR_AGENT_SUSPENDED", "agent suspended by owning human")
+            << auth_fail(403, "ERR_AGENT_SUSPENDED", "agent suspended by controller")
         }
         if au.agent.ownership_status == "revoked" {
-            << auth_fail(403, "ERR_REVOKED", "agent credential revoked by owning human")
+            << auth_fail(403, "ERR_REVOKED", "agent credential revoked by controller")
         }
         if au.agent.cred_expires_at > 0 && now > au.agent.cred_expires_at {
-            << auth_fail(403, "ERR_CREDENTIAL_EXPIRED", "human delegation credential expired")
+            << auth_fail(403, "ERR_CREDENTIAL_EXPIRED", "controller delegation credential expired")
         }
         if scope.len > 0 {
             $has_sc := false
@@ -127,7 +131,7 @@ pub fn authenticate_scoped(st $&State, req &HttpReq, now int, scope string) Auth
                 }
             }
             if !has_sc {
-                << auth_fail(403, "ERR_SCOPE_DENIED", "scope '" + scope + "' not permitted by human credential")
+                << auth_fail(403, "ERR_SCOPE_DENIED", "scope '" + scope + "' not permitted by controller credential")
             }
         }
     }
@@ -233,6 +237,16 @@ pub fn handle_register(st $&State, req &HttpReq, now int) HttpResp {
         }
     }
 
+    $ctrl_only := false
+    if doc.has(r, "controller_only") && !doc.is_null(doc.get(r, "controller_only")) {
+        if !doc.is_bool(doc.get(r, "controller_only")) {
+            << err_resp(400, "ERR_BAD_REQUEST", "controller_only must be boolean", 0, 0, 0)
+        }
+        ctrl_only = json_bool_or(&doc, doc.get(r, "controller_only"), false)
+    }
+    $dmp_init := "friends"
+    if ctrl_only { dmp_init = "none" }
+
     map_set($&st.replay_cache, sig_hash + "", now)
 
     // Mint unique agent_id with O_CREAT | O_EXCL
@@ -267,8 +281,9 @@ pub fn handle_register(st $&State, req &HttpReq, now int) HttpResp {
         "\"current_public_key_pem\":" + json.quote(&norm_pem) + "," +
         "\"key_history\":[]," +
         "\"profile\":{\"name\":" + json.quote(&init_name) + ",\"bio\":" + json.quote(&init_bio) + ",\"updated_at\":" + strconv.itoa(now) + "}," +
-        "\"extensions\":{\"accept_email\":false,\"dm_policy\":\"friends\"}," +
+        "\"extensions\":{\"accept_email\":false,\"dm_policy\":" + json.quote(&dmp_init) + "}," +
         "\"ownership\":" + ec.ownership_json + "," +
+        "\"managed_agents\":[]," +
         "\"signature\":null" +
         "}\n"
 
@@ -282,16 +297,16 @@ pub fn handle_register(st $&State, req &HttpReq, now int) HttpResp {
     append_jsonl_quiet(st.data_dir + "/keys/registry.jsonl", reg_line)
 
     if ec.has_enrollment {
-        record_credential_used(st, ec.cred_id + "", ec.human_id + "", aid + "", "enrollment", now)
-        sync_human_agent_roster(st, ec.human_id + "", aid + "", ec.cred_id + "", "enrollment", ec.label + "", &ec.scopes, "active", ec.issued_at, ec.expires_at) or (err) {
-            << err_resp(500, "ERR_INTERNAL", "failed syncing human agent roster", 0, 0, 0)
+        record_credential_used(st, ec.cred_id + "", ec.controller_id + "", aid + "", "enrollment", now)
+        sync_controller_agent_roster(st, ec.controller_id + "", aid + "", ec.cred_id + "", "enrollment", ec.label + "", &ec.scopes, "active", ec.issued_at, ec.expires_at) or (err) {
+            << err_resp(500, "ERR_INTERNAL", "failed syncing controller agent roster", 0, 0, 0)
         }
     }
 
     fp := pubkey_fingerprint(&norm_pem)
     $resp := "{\"agent_id\":" + json.quote(&aid) + ",\"name\":" + json.quote(&init_name) + ",\"created_at\":" + strconv.itoa(now) + ",\"key_version\":1,\"revision\":0,\"fingerprint\":" + json.quote(&fp)
     if ec.has_enrollment {
-        resp = resp + ",\"human_id\":" + json.quote(&ec.human_id) + ",\"cred_id\":" + json.quote(&ec.cred_id)
+        resp = resp + ",\"controller_id\":" + json.quote(&ec.controller_id) + ",\"cred_id\":" + json.quote(&ec.cred_id)
     }
     resp = resp + "}"
     << json_resp(201, resp)
@@ -394,6 +409,7 @@ pub fn handle_profile_update(st $&State, req &HttpReq, now int) HttpResp {
     }
 
     own_json := preserve_ownership_json(&orig_doc)
+    managed_json := preserve_managed_agents_json(&orig_doc)
     updated_doc := "{" +
         "\"agent_id\":" + json.quote(&aid) + "," +
         "\"created_at\":" + strconv.itoa(au.agent.created_at) + "," +
@@ -406,11 +422,12 @@ pub fn handle_profile_update(st $&State, req &HttpReq, now int) HttpResp {
         "\"profile\":{\"name\":" + json.quote(&name) + ",\"bio\":" + json.quote(&bio) + ",\"updated_at\":" + strconv.itoa(now) + "}," +
         "\"extensions\":" + ext_json + "," +
         "\"ownership\":" + own_json + "," +
+        "\"managed_agents\":" + managed_json + "," +
         "\"signature\":" + sig_json +
         "}\n"
 
-    if updated_doc.len > 32768 {
-        << err_resp(413, "ERR_PAYLOAD_TOO_LARGE", "identity document exceeds 32 KB limit", 0, 0, 0)
+    if updated_doc.len > 65536 {
+        << err_resp(413, "ERR_PAYLOAD_TOO_LARGE", "identity document exceeds 64 KB limit", 0, 0, 0)
     }
 
     write_atomic(agent_json_path(st, aid + ""), &updated_doc) or (err) {
@@ -421,8 +438,8 @@ pub fn handle_profile_update(st $&State, req &HttpReq, now int) HttpResp {
     << json_resp(200, updated_doc)
 }
 
-pub fn handle_revoke(st $&State, req &HttpReq, now int) HttpResp {
-    au := authenticate_scoped(st, req, now, "")
+pub fn handle_revoke(hub $&HubState, req &HttpReq, now int) HttpResp {
+    au := authenticate_scoped($&hub.st, req, now, "")
     if !au.ok {
         << err_resp(au.status, au.code, au.message, 0, 0, 0)
     }
@@ -456,16 +473,28 @@ pub fn handle_revoke(st $&State, req &HttpReq, now int) HttpResp {
     orig_doc := json.parse(&au.agent.raw_json)
     $key_hist_json := "[]"
     $ext_json := "{\"accept_email\":false,\"dm_policy\":\"friends\"}"
+    $managed_ids := []string{}
     if orig_doc.ok() {
         oroot := orig_doc.root()
         if orig_doc.has(oroot, "key_history") { key_hist_json = json_encode_or(&orig_doc, orig_doc.get(oroot, "key_history"), "[]") }
         if orig_doc.has(oroot, "extensions") { ext_json = json_encode_or(&orig_doc, orig_doc.get(oroot, "extensions"), ext_json + "") }
+        if orig_doc.has(oroot, "managed_agents") && orig_doc.is_list(orig_doc.get(oroot, "managed_agents")) {
+            ma := orig_doc.get(oroot, "managed_agents")
+            for i in 0:orig_doc.count(ma) {
+                el := orig_doc.at(ma, i)
+                if orig_doc.is_dict(el) && orig_doc.has(el, "agent_id") {
+                    cid := json_str_or(&orig_doc, orig_doc.get(el, "agent_id"), "")
+                    if is_valid_agent_id(cid + "") { managed_ids.push(cid) }
+                }
+            }
+        }
     }
 
     $succ_json := "null"
     if succ_id.len > 0 { succ_json = json.quote(&succ_id) }
 
     own_json := preserve_ownership_json(&orig_doc)
+    managed_json := preserve_managed_agents_json(&orig_doc)
     rev_doc := "{" +
         "\"agent_id\":" + json.quote(&aid) + "," +
         "\"created_at\":" + strconv.itoa(au.agent.created_at) + "," +
@@ -478,15 +507,25 @@ pub fn handle_revoke(st $&State, req &HttpReq, now int) HttpResp {
         "\"profile\":{\"name\":" + json.quote(&au.agent.name) + ",\"bio\":" + json.quote(&au.agent.bio) + ",\"updated_at\":" + strconv.itoa(now) + "}," +
         "\"extensions\":" + ext_json + "," +
         "\"ownership\":" + own_json + "," +
+        "\"managed_agents\":" + managed_json + "," +
         "\"signature\":" + json.quote(&au.sig_b64) +
         "}\n"
 
-    write_atomic(agent_json_path(st, aid + ""), &rev_doc) or (err) {
+    write_atomic(agent_json_path(&hub.st, aid + ""), &rev_doc) or (err) {
         << err_resp(500, "ERR_INTERNAL", "failed persisting revocation", 0, 0, 0)
     }
     rev_line := "{\"agent_id\":" + json.quote(&aid) + ",\"successor_id\":" + succ_json + ",\"revoked_at\":" + strconv.itoa(now) + "}"
-    append_jsonl_quiet(st.data_dir + "/keys/revoked.jsonl", rev_line)
-    map_set($&st.revoked, aid + "", 1)
+    append_jsonl_quiet(hub.st.data_dir + "/keys/revoked.jsonl", rev_line)
+    state_mark_revoked($&hub.st, aid + "")
+
+    hub_disconnect_agent(hub, aid + "")
+    for i in 0:managed_ids.len {
+        hub_disconnect_agent(hub, managed_ids[i] + "")
+    }
+    if managed_ids.len > 0 {
+        log_event_json(hub.log_ch, now, "ctl_control",
+            "\"action\":\"controller_revoke\",\"controller_id\":" + json.quote(&aid) + ",\"affected_agents\":" + strconv.itoa(managed_ids.len))
+    }
     << json_resp(200, "{\"ok\":true,\"agent_id\":" + json.quote(&aid) + ",\"status\":\"revoked\",\"successor_id\":" + succ_json + "}")
 }
 

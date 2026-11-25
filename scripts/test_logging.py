@@ -56,14 +56,11 @@ def run_cli(
     args: list[str],
     *,
     agent_home: str | None = None,
-    human_home: str | None = None,
     api_url: str,
 ) -> tuple[int, str, str]:
     env = os.environ.copy()
     if agent_home is not None:
         env["FATEXT_HOME"] = agent_home
-    if human_home is not None:
-        env["FATEXT_HUMAN_HOME"] = human_home
     res = subprocess.run(
         [str(CLI_BIN), "--api", api_url] + args,
         env=env,
@@ -127,7 +124,7 @@ def main() -> int:
         srv_env["FATEXT_METRICS_INTERVAL_SEC"] = "1"
         srv_env["FATEXT_TRUST_PROXY"] = "1"
 
-        hh = str(td_p / "human")
+        ch = str(td_p / "ctl")
         ah_a = str(td_p / "agent_a")
         ah_b = str(td_p / "agent_b")
 
@@ -146,7 +143,7 @@ def main() -> int:
             assert_true(not stale_events.exists(), "stale events-2020-01-01.jsonl removed")
             assert_true(keep_today.exists(), "today's log kept")
 
-            print("[2/5] Generating proxy IP, HTTP read_fail, human control, DM, mail & SSE logs...")
+            print("[2/5] Generating proxy IP, HTTP read_fail, ctl control, DM, mail & SSE logs...")
             # Proxy XFF test
             req = urllib.request.Request(
                 f"{api_url}/health",
@@ -160,12 +157,12 @@ def main() -> int:
                 bad_s.sendall(b"GARBAGE\r\n\r\n")
                 bad_s.recv(1024)
 
-            rc, out, err = run_cli(["--json", "human", "init", "--name", "LogHuman"], human_home=hh, api_url=api_url)
-            assert_eq(rc, 0, f"human init failed: {err}")
-            hid = json.loads(out.strip())["human_id"]
+            rc, out, err = run_cli(["--json", "init", "--controller-only", "--name", "LogCtl"], agent_home=ch, api_url=api_url)
+            assert_eq(rc, 0, f"ctl init failed: {err}")
+            cid = json.loads(out.strip())["agent_id"]
 
             v1 = td_p / "v1.json"
-            rc, _, err = run_cli(["--json", "human", "cred", "issue", "--scopes", "all", "--out", str(v1)], human_home=hh, api_url=api_url)
+            rc, _, err = run_cli(["--json", "ctl", "cred", "issue", "--scopes", "all", "--out", str(v1)], agent_home=ch, api_url=api_url)
             assert_eq(rc, 0, f"cred issue failed: {err}")
 
             rc, out, err = run_cli(["--json", "init", "--name", "LogBotA", "--credential", str(v1)], agent_home=ah_a, api_url=api_url)
@@ -226,9 +223,9 @@ def main() -> int:
             with urllib.request.urlopen(mreq, timeout=5.0) as mr:
                 assert_eq(mr.status, 201, "mail ingest 201")
 
-            # Human suspend control event + unauthorized 403 error code
-            rc, _, err = run_cli(["--json", "human", "suspend", aid_a, "--reason", "log-check"], human_home=hh, api_url=api_url)
-            assert_eq(rc, 0, f"human suspend failed: {err}")
+            # Controller suspend control event + unauthorized 403 error code
+            rc, _, err = run_cli(["--json", "ctl", "suspend", aid_a, "--reason", "log-check"], agent_home=ch, api_url=api_url)
+            assert_eq(rc, 0, f"ctl suspend failed: {err}")
             rc, _, _ = run_cli(["--json", "friend", "list"], agent_home=ah_a, api_url=api_url)
             assert_eq(rc, 5, "suspended 403 expected")
 
@@ -285,7 +282,7 @@ def main() -> int:
             assert_true(req_k in access_recs[0], f"missing access key {req_k}")
 
         ev_kinds = {e.get("kind") for e in event_recs}
-        for need in ("server_start", "http_read_fail", "tls_handshake_fail", "sse_open", "dm_relay", "mail_ingest", "human_control", "sse_close"):
+        for need in ("server_start", "http_read_fail", "tls_handshake_fail", "sse_open", "dm_relay", "mail_ingest", "ctl_control", "sse_close"):
             assert_true(need in ev_kinds, f"missing event kind {need!r} in {ev_kinds}")
 
         assert_true(len(metric_recs) >= 1, f"expected >= 1 metrics snapshots, got {len(metric_recs)}")
@@ -318,7 +315,7 @@ def main() -> int:
         assert_true(rep["summary"]["total_requests"] >= 8, f"analyzer summary mismatch: {rep['summary']}")
         assert_true(len(rep["routes"]) >= 3, "analyzer routes missing")
         assert_true(rep["relay_and_mail"]["mail_ingests"] >= 1, "analyzer mail_ingests missing")
-        assert_true("suspend" in rep["human_control_actions"], "analyzer human_control suspend missing")
+        assert_true("suspend" in rep["ctl_control_actions"], "analyzer ctl_control suspend missing")
 
     print("ALL 5 LOGGING, METRICS, PRIVACY & ANALYZER CHECKS PASSED.")
     return 0
