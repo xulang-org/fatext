@@ -503,6 +503,38 @@ fn agent_ext_bool(ag &AgentSummary, key string, def bool) bool {
     << json_bool_or(&doc, doc.get(en, key + ""), def)
 }
 
+pub fn agent_blocks_sender(st &State, owner_id string, sender_id string, now int) bool {
+    fd := load_friends_data(st, owner_id + "", now)
+    << str_list_contains(&fd.blocks, sender_id + "")
+}
+
+pub fn agent_is_friend(st &State, owner_id string, target_id string, now int) bool {
+    fd := load_friends_data(st, owner_id + "", now)
+    << str_list_contains(&fd.friends, target_id + "")
+}
+
+pub fn extract_json_object_field(body &string, key string) string {
+    << extract_raw_json_object(body, key + "")
+}
+
+pub fn deliver_dm_relay_raw(hub $&HubState, tag &AgentSummary, from_id string, to_id string, frame_body &string, now int) string {
+    ev_json := "{\"from\":" + json.quote(&from_id) + ",\"frame\":" + frame_body + "}"
+    delivered := hub_push_dm(hub, to_id + "", &ev_json)
+    if delivered == 0 {
+        wh := agent_ext_str(tag, "webhook_url", "")
+        if is_https_url(&wh) {
+            wh_body := "{\"event\":\"dm\",\"data\":" + ev_json + "}"
+            xu deliver_webhook(wh, wh_body)
+            hub.metrics.dm_webhook += 1
+            << "webhook"
+        }
+        hub.metrics.dm_dropped += 1
+        << "dropped_offline"
+    }
+    hub.metrics.dm_sse += 1
+    << "sse:" + strconv.itoa(delivered)
+}
+
 pub fn handle_dm_send(hub $&HubState, req &HttpReq, to_id string, now int) HttpResp {
     if !is_valid_agent_id(to_id + "") { << err_resp(404, "ERR_NOT_FOUND", "recipient not found", 0, 0, 0) }
     au := authenticate_scoped($&hub.st, req, now, "dm")
@@ -542,52 +574,18 @@ pub fn handle_dm_send(hub $&HubState, req &HttpReq, to_id string, now int) HttpR
         << err_resp(403, "ERR_FORBIDDEN", "recipient dm_policy is friends", 0, 0, 0)
     }
 
-    ev_json := "{\"from\":" + json.quote(&au.agent_id) + ",\"frame\":" + body + "}"
-    delivered := hub_push_dm(hub, to_id + "", &ev_json)
-    if delivered == 0 {
-        wh := agent_ext_str(&tag, "webhook_url", "")
-        if is_https_url(&wh) {
-            wh_body := "{\"event\":\"dm\",\"data\":" + ev_json + "}"
-            xu deliver_webhook(wh, wh_body)
-            hub.metrics.dm_webhook += 1
-            log_event_json(hub.log_ch, now, "dm_relay",
-                "\"from\":" + json.quote(&au.agent_id) + ",\"to\":" + json.quote(&to_id) +
-                ",\"delivered\":\"webhook\",\"streams\":0,\"bytes\":" + strconv.itoa(body.len))
-            << json_resp(202, "{\"ok\":true,\"delivered\":\"webhook\"}")
-        }
-        hub.metrics.dm_dropped += 1
+    del_res := deliver_dm_relay_raw(hub, &tag, au.agent_id + "", to_id + "", &body, now)
+    if strings.has_prefix(&del_res, "sse:") {
+        cnt_s := del_res[4:del_res.len]
         log_event_json(hub.log_ch, now, "dm_relay",
             "\"from\":" + json.quote(&au.agent_id) + ",\"to\":" + json.quote(&to_id) +
-            ",\"delivered\":\"dropped_offline\",\"streams\":0,\"bytes\":" + strconv.itoa(body.len))
-        << json_resp(202, "{\"ok\":true,\"delivered\":\"dropped_offline\"}")
+            ",\"delivered\":\"sse\",\"streams\":" + cnt_s + ",\"bytes\":" + strconv.itoa(body.len))
+        << json_resp(202, "{\"ok\":true,\"delivered\":\"sse\",\"streams\":" + cnt_s + "}")
     }
-    hub.metrics.dm_sse += 1
     log_event_json(hub.log_ch, now, "dm_relay",
         "\"from\":" + json.quote(&au.agent_id) + ",\"to\":" + json.quote(&to_id) +
-        ",\"delivered\":\"sse\",\"streams\":" + strconv.itoa(delivered) + ",\"bytes\":" + strconv.itoa(body.len))
-    << json_resp(202, "{\"ok\":true,\"delivered\":\"sse\",\"streams\":" + strconv.itoa(delivered) + "}")
-}
-
-pub fn handle_room_send(hub $&HubState, req &HttpReq, room_id string, now int) HttpResp {
-    if !is_valid_room_id(room_id + "") { << err_resp(400, "ERR_BAD_REQUEST", "invalid room_id", 0, 0, 0) }
-    au := authenticate_scoped($&hub.st, req, now, "room")
-    if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
-
-    body := req.body()
-    if body.len == 0 || body.len > 32768 {
-        << err_resp(413, "ERR_PAYLOAD_TOO_LARGE", "room frame must be 1..32768 bytes", 0, 0, 0)
-    }
-    fdoc := json.parse(&body)
-    if !fdoc.ok() || !fdoc.is_dict(fdoc.root()) {
-        << err_resp(400, "ERR_BAD_REQUEST", "room frame must be JSON object", 0, 0, 0)
-    }
-    ev_json := "{\"room_id\":" + json.quote(&room_id) + ",\"from\":" + json.quote(&au.agent_id) + ",\"frame\":" + body + "}"
-    delivered := hub_push_room(hub, room_id + "", au.agent_id + "", &ev_json)
-    hub.metrics.room_events += 1
-    log_event_json(hub.log_ch, now, "room_relay",
-        "\"from\":" + json.quote(&au.agent_id) + ",\"room_id\":" + json.quote(&room_id) +
-        ",\"streams\":" + strconv.itoa(delivered) + ",\"bytes\":" + strconv.itoa(body.len))
-    << json_resp(202, "{\"ok\":true,\"room_id\":" + json.quote(&room_id) + ",\"streams\":" + strconv.itoa(delivered) + "}")
+        ",\"delivered\":" + json.quote(&del_res) + ",\"streams\":0,\"bytes\":" + strconv.itoa(body.len))
+    << json_resp(202, "{\"ok\":true,\"delivered\":" + json.quote(&del_res) + "}")
 }
 
 // =========================================================================

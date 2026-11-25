@@ -126,13 +126,33 @@ pub fn hub_push_dm(hub $&HubState, to_id string, data_json &string) int {
     << hub_push_to_agent(hub, to_id, "dm", data_json)
 }
 
-pub fn hub_push_room(hub $&HubState, room_id string, sender_id string, data_json &string) int {
+pub fn hub_push_room_checked(hub $&HubState, room &RoomData, sender_id string, data_json &string, now int) int {
     msg := "event: room\ndata: " + data_json + "\n\n"
     $sent := 0
     for i in 0:hub.clients.len {
         c := &hub.clients[i]
         if c.agent_id == sender_id { -> }
-        if str_list_contains(&c.rooms, room_id + "") || c.rooms.len == 0 {
+        if !room_has_member(room, c.agent_id + "") { -> }
+        if agent_blocks_sender(&hub.st, c.agent_id + "", sender_id + "", now) { -> }
+        if str_list_contains(&c.rooms, room.room_id + "") || c.rooms.len == 0 {
+            if send_sse_msg(c, msg + "") {
+                sent += 1
+                hub.metrics.sse_events_pushed += 1
+            } else {
+                hub.metrics.sse_dropped_full += 1
+            }
+        }
+    }
+    << sent
+}
+
+pub fn hub_push_room_event(hub $&HubState, room &RoomData, data_json &string) int {
+    msg := "event: room_event\ndata: " + data_json + "\n\n"
+    $sent := 0
+    for i in 0:hub.clients.len {
+        c := &hub.clients[i]
+        if !room_has_member(room, c.agent_id + "") { -> }
+        if str_list_contains(&c.rooms, room.room_id + "") || c.rooms.len == 0 {
             if send_sse_msg(c, msg + "") {
                 sent += 1
                 hub.metrics.sse_events_pushed += 1
@@ -442,10 +462,8 @@ fn dispatch_http(hub $&HubState, req &HttpReq, now int) HttpResp {
         if method != "POST" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
         << handle_dm_send(hub, req, path[7:path.len], now)
     }
-    if strings.has_prefix(&path, "/v1/rooms/") && strings.has_suffix(&path, "/send") && path.len > 15 {
-        if method != "POST" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
-        rid := path[10:(path.len - 5)]
-        << handle_room_send(hub, req, rid, now)
+    if path == "/v1/rooms" || strings.has_prefix(&path, "/v1/rooms/") {
+        << handle_rooms_dispatch(hub, req, path + "", method + "", now)
     }
 
     if path == "/v1/mail" {

@@ -512,6 +512,17 @@ def main() -> int:
 
             # Scenario 3: Concurrent SSE Fan-Out & Room Broadcast
             print(f"[3/6] Running Scenario 3: Concurrent SSE Fan-Out ({n_sse_room} streams x {n_room_msgs} room sends)...", flush=True)
+            sender_id, sender_priv = agents[0]
+            rcreate_b = json.dumps({"room_id": ROOM_ID, "name": "stress-room", "max_members": 64}).encode("utf-8")
+            st_rc, _, err_rc = http_once(port, "POST", "/v1/rooms", rcreate_b, sign_request_headers(sender_priv, sender_id, "POST", "/v1/rooms", rcreate_b))
+            if st_rc != 201:
+                raise RuntimeError(f"stress room create failed: {st_rc} {err_rc}")
+            for aid, _ in agents[1:]:
+                rmem_b = json.dumps({"agent_id": aid, "role": "member"}).encode("utf-8")
+                st_rm, _, err_rm = http_once(port, "POST", f"/v1/rooms/{ROOM_ID}/members", rmem_b, sign_request_headers(sender_priv, sender_id, "POST", f"/v1/rooms/{ROOM_ID}/members", rmem_b))
+                if st_rm != 200:
+                    raise RuntimeError(f"stress room add member {aid} failed: {st_rm} {err_rm}")
+
             sse_room_clients: list[SseClientThread] = []
             for i in range(n_sse_room):
                 aid, priv = agents[i % len(agents)]
@@ -522,7 +533,6 @@ def main() -> int:
                 cli.opened.wait(timeout=5.0)
             opened_ok = sum(1 for c in sse_room_clients if not c.error)
 
-            sender_id, sender_priv = agents[0]
             # Wait 0.15s then pre-sign room sends by sender 0
             def mk_room_task(i: int):
                 body = json.dumps({"v": 1, "seq": i, "ct": "cm9vbS1icm9hZGNhc3Q="}).encode("utf-8")

@@ -173,6 +173,26 @@ pub fn is_valid_room_id(s string) bool {
     << true
 }
 
+pub fn is_valid_room_role(s string) bool {
+    << s == "owner" || s == "admin" || s == "member" || s == "readonly"
+}
+
+pub fn is_valid_room_assignable_role(s string) bool {
+    << s == "admin" || s == "member" || s == "readonly"
+}
+
+pub fn is_valid_send_policy(s string) bool {
+    << s == "all" || s == "admins" || s == "owner"
+}
+
+pub fn is_valid_invite_policy(s string) bool {
+    << s == "owner" || s == "admins" || s == "members"
+}
+
+pub fn is_valid_join_policy(s string) bool {
+    << s == "invite_only" || s == "friends_only" || s == "controller_only"
+}
+
 pub fn is_valid_mail_id(s string) bool {
     if s.len != 30 || !strings.has_prefix(&s, "eml_") { << false }
     for i in 4:30 {

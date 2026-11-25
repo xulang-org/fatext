@@ -296,7 +296,8 @@ pub fn normalize_route(raw_path string) string {
        path == "/v1/agents/register" || path == "/v1/agents/profile" || path == "/v1/agents/rotate-key" ||
        path == "/v1/agents/revoke" || path == "/v1/agents/docs" || path == "/v1/ctl/agents" ||
        path == "/v1/friends" || path == "/v1/friends/request" || path == "/v1/friends/accept" ||
-       path == "/v1/friends/reject" || path == "/v1/blocks" || path == "/v1/mail" || path == "/v1/stream" {
+       path == "/v1/friends/reject" || path == "/v1/blocks" || path == "/v1/mail" || path == "/v1/stream" ||
+       path == "/v1/rooms" {
         << path
     }
     if strings.has_prefix(&path, "/v1/agents/docs/") { << "/v1/agents/docs/{kind}" }
@@ -305,7 +306,16 @@ pub fn normalize_route(raw_path string) string {
     if strings.has_prefix(&path, "/v1/blocks/") { << "/v1/blocks/{target}" }
     if strings.has_prefix(&path, "/v1/dm/") { << "/v1/dm/{id}" }
     if strings.has_prefix(&path, "/v1/mail/") { << "/v1/mail/{id}" }
-    if strings.has_prefix(&path, "/v1/rooms/") && strings.has_suffix(&path, "/send") { << "/v1/rooms/{id}/send" }
+    if strings.has_prefix(&path, "/v1/rooms/") {
+        rest := path[10:path.len]
+        parts := strings.split(&rest, "/")
+        if parts.len == 1 { << "/v1/rooms/{id}" }
+        if parts.len == 2 { << "/v1/rooms/{id}/" + parts[1] }
+        if parts.len == 3 && parts[1] == "members" { << "/v1/rooms/{id}/members/{aid}" }
+        if parts.len == 3 && parts[1] == "bans" { << "/v1/rooms/{id}/bans/{aid}" }
+        if parts.len == 4 && parts[1] == "members" { << "/v1/rooms/{id}/members/{aid}/" + parts[3] }
+        << "/v1/rooms/{other}"
+    }
     if strings.has_prefix(&path, "/v1/ctl/agents/") {
         rest := path[15:path.len]
         parts := strings.split(&rest, "/")

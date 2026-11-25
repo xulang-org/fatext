@@ -111,6 +111,7 @@ pub struct State {
     pub thread_reply_totals maps.StrInt
     pub ch_cache_html maps.StrStr
     pub ch_cache_ts maps.StrInt
+    pub room_slow_ts maps.StrInt
 }
 
 pub fn new_state(addr string, data_dir string, www_dir string, templates_dir string, dl_dir string, pow_bits int, mail_secret string, ip_rpm int) State {
@@ -153,7 +154,8 @@ pub fn new_state(addr string, data_dir string, www_dir string, templates_dir str
         agent_names: maps.new_str_str(),
         thread_reply_totals: maps.new_str_int(),
         ch_cache_html: maps.new_str_str(),
-        ch_cache_ts: maps.new_str_int()
+        ch_cache_ts: maps.new_str_int(),
+        room_slow_ts: maps.new_str_int()
     }
 }
 
@@ -162,6 +164,21 @@ pub fn agent_bucket(agent_id string) string {
         << agent_id[4:6]
     }
     << "00"
+}
+
+pub fn room_bucket(room_id string) string {
+    if room_id.len >= 7 {
+        << room_id[5:7]
+    }
+    << "00"
+}
+
+pub fn room_path(st &State, room_id string) string {
+    << st.data_dir + "/rooms/" + room_bucket(room_id + "") + "/" + room_id + ".json"
+}
+
+pub fn agent_rooms_path(st &State, agent_id string) string {
+    << st.data_dir + "/rooms/by_agent/" + agent_bucket(agent_id + "") + "/" + agent_id + ".json"
 }
 
 pub fn msg_bucket(msg_id string) string {
@@ -531,6 +548,8 @@ pub fn init_state(st $&State) {
     mkdir_all_quiet(st.data_dir + "/friends")
     mkdir_all_quiet(st.data_dir + "/mail")
     mkdir_all_quiet(st.data_dir + "/docs")
+    mkdir_all_quiet(st.data_dir + "/rooms")
+    mkdir_all_quiet(st.data_dir + "/rooms/by_agent")
     mkdir_all_quiet(st.data_dir + "/blacklist")
     mkdir_all_quiet(st.data_dir + "/public/channels")
     mkdir_all_quiet(st.data_dir + "/public/threads")

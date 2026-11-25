@@ -1,0 +1,987 @@
+@main
+
+#os
+#strconv
+#strings
+#encoding/json
+
+pub struct RoomMember {
+    pub agent_id string
+    pub role string
+    pub muted bool
+    pub joined_at int
+}
+
+pub struct RoomData {
+    pub found bool
+    pub room_id string
+    pub name string
+    pub topic string
+    pub owner_id string
+    pub controller_id string
+    pub epoch int
+    pub status string
+    pub created_at int
+    pub updated_at int
+    pub send_policy string
+    pub invite_policy string
+    pub join_policy string
+    pub max_members int
+    pub slow_mode_sec int
+    pub locked bool
+    pub members []RoomMember
+    pub banned []string
+}
+
+fn empty_room_data() RoomData {
+    << RoomData{
+        found: false,
+        room_id: "",
+        name: "",
+        topic: "",
+        owner_id: "",
+        controller_id: "",
+        epoch: 1,
+        status: "active",
+        created_at: 0,
+        updated_at: 0,
+        send_policy: "all",
+        invite_policy: "admins",
+        join_policy: "invite_only",
+        max_members: 64,
+        slow_mode_sec: 0,
+        locked: false,
+        members: []RoomMember{},
+        banned: []string{}
+    }
+}
+
+pub fn room_find_member_idx(room &RoomData, aid string) int {
+    for i in 0:room.members.len {
+        if room.members[i].agent_id == aid { << i }
+    }
+    << -1
+}
+
+pub fn room_has_member(room &RoomData, aid string) bool {
+    << room_find_member_idx(room, aid + "") >= 0
+}
+
+pub fn room_member_role(room &RoomData, aid string) string {
+    idx := room_find_member_idx(room, aid + "")
+    if idx < 0 { << "" }
+    << room.members[idx].role + ""
+}
+
+pub fn room_is_banned(room &RoomData, aid string) bool {
+    for i in 0:room.banned.len {
+        if room.banned[i] == aid { << true }
+    }
+    << false
+}
+
+fn room_is_priv_role(role string) bool {
+    << role == "owner" || role == "admin"
+}
+
+fn load_room_data(st &State, room_id string) RoomData {
+    $rd := empty_room_data()
+    raw := os.read(room_path(st, room_id + "")) or (err) { << rd }
+    doc := json.parse(&raw)
+    if !doc.ok() || !doc.is_dict(doc.root()) { << rd }
+    r := doc.root()
+
+    rd.found = true
+    rd.room_id = json_str_or(&doc, doc.get(r, "room_id"), room_id + "")
+    rd.name = json_str_or(&doc, doc.get(r, "name"), "")
+    rd.topic = json_str_or(&doc, doc.get(r, "topic"), "")
+    rd.owner_id = json_str_or(&doc, doc.get(r, "owner_id"), "")
+    rd.controller_id = json_str_or(&doc, doc.get(r, "controller_id"), "")
+    rd.epoch = json_int_or(&doc, doc.get(r, "epoch"), 1)
+    if rd.epoch < 1 { rd.epoch = 1 }
+    rd.status = json_str_or(&doc, doc.get(r, "status"), "active")
+    rd.created_at = json_int_or(&doc, doc.get(r, "created_at"), 0)
+    rd.updated_at = json_int_or(&doc, doc.get(r, "updated_at"), 0)
+
+    sp := json_str_or(&doc, doc.get(r, "send_policy"), "all")
+    if is_valid_send_policy(sp + "") { rd.send_policy = sp }
+    ip := json_str_or(&doc, doc.get(r, "invite_policy"), "admins")
+    if is_valid_invite_policy(ip + "") { rd.invite_policy = ip }
+    jp := json_str_or(&doc, doc.get(r, "join_policy"), "invite_only")
+    if is_valid_join_policy(jp + "") { rd.join_policy = jp }
+
+    mm := json_int_or(&doc, doc.get(r, "max_members"), 64)
+    if mm >= 2 && mm <= 256 { rd.max_members = mm }
+    sm := json_int_or(&doc, doc.get(r, "slow_mode_sec"), 0)
+    if sm >= 0 && sm <= 3600 { rd.slow_mode_sec = sm }
+    rd.locked = json_bool_or(&doc, doc.get(r, "locked"), false)
+
+    if doc.has(r, "members") && doc.is_list(doc.get(r, "members")) {
+        arr := doc.get(r, "members")
+        for i in 0:doc.count(arr) {
+            el := doc.at(arr, i)
+            if !doc.is_dict(el) { -> }
+            aid := json_str_or(&doc, doc.get(el, "agent_id"), "")
+            role := json_str_or(&doc, doc.get(el, "role"), "member")
+            muted := json_bool_or(&doc, doc.get(el, "muted"), false)
+            jat := json_int_or(&doc, doc.get(el, "joined_at"), 0)
+            if is_valid_agent_id(aid + "") && is_valid_room_role(role + "") {
+                rd.members.push(RoomMember{agent_id: aid, role: role, muted: muted, joined_at: jat})
+            }
+        }
+    }
+    if doc.has(r, "banned") && doc.is_list(doc.get(r, "banned")) {
+        arr := doc.get(r, "banned")
+        for i in 0:doc.count(arr) {
+            bid := json_str_or(&doc, doc.at(arr, i), "")
+            if is_valid_agent_id(bid + "") { rd.banned.push(bid) }
+        }
+    }
+    << rd
+}
+
+fn serialize_room_json(rd &RoomData, viewer_id string, include_banned bool) string {
+    $mem_s := []string{}
+    for i in 0:rd.members.len {
+        m := &rd.members[i]
+        $ms := "false"
+        if m.muted { ms = "true" }
+        mem_s.push("{\"agent_id\":" + json.quote(&m.agent_id) +
+            ",\"role\":" + json.quote(&m.role) +
+            ",\"muted\":" + ms +
+            ",\"joined_at\":" + strconv.itoa(m.joined_at) + "}")
+    }
+    $ban_s := []string{}
+    if include_banned {
+        for i in 0:rd.banned.len {
+            ban_s.push(json.quote(&rd.banned[i]))
+        }
+    }
+    $lk_s := "false"
+    if rd.locked { lk_s = "true" }
+    $my_role := room_member_role(rd, viewer_id + "")
+    << "{\"room_id\":" + json.quote(&rd.room_id) +
+        ",\"name\":" + json.quote(&rd.name) +
+        ",\"topic\":" + json.quote(&rd.topic) +
+        ",\"owner_id\":" + json.quote(&rd.owner_id) +
+        ",\"controller_id\":" + json.quote(&rd.controller_id) +
+        ",\"epoch\":" + strconv.itoa(rd.epoch) +
+        ",\"status\":" + json.quote(&rd.status) +
+        ",\"created_at\":" + strconv.itoa(rd.created_at) +
+        ",\"updated_at\":" + strconv.itoa(rd.updated_at) +
+        ",\"send_policy\":" + json.quote(&rd.send_policy) +
+        ",\"invite_policy\":" + json.quote(&rd.invite_policy) +
+        ",\"join_policy\":" + json.quote(&rd.join_policy) +
+        ",\"max_members\":" + strconv.itoa(rd.max_members) +
+        ",\"slow_mode_sec\":" + strconv.itoa(rd.slow_mode_sec) +
+        ",\"locked\":" + lk_s +
+        ",\"your_role\":" + json.quote(&my_role) +
+        ",\"member_count\":" + strconv.itoa(rd.members.len) +
+        ",\"members\":[" + strings.join(mem_s, ",") + "]" +
+        ",\"banned\":[" + strings.join(ban_s, ",") + "]}"
+}
+
+fn save_room_data(st &State, rd &RoomData) int {
+    mkdir_all_quiet(st.data_dir + "/rooms/" + room_bucket(rd.room_id + ""))
+    body := serialize_room_json(rd, rd.owner_id + "", true) + "\n"
+    << write_atomic(room_path(st, rd.room_id + ""), &body) or >>
+}
+
+fn load_agent_room_ids(st &State, aid string) []string {
+    $out := []string{}
+    raw := os.read(agent_rooms_path(st, aid + "")) or (err) { << out }
+    doc := json.parse(&raw)
+    if !doc.ok() || !doc.is_dict(doc.root()) { << out }
+    r := doc.root()
+    if doc.has(r, "rooms") && doc.is_list(doc.get(r, "rooms")) {
+        arr := doc.get(r, "rooms")
+        for i in 0:doc.count(arr) {
+            rid := json_str_or(&doc, doc.at(arr, i), "")
+            if is_valid_room_id(rid + "") { out.push(rid) }
+        }
+    }
+    << out
+}
+
+fn save_agent_room_ids(st &State, aid string, ids &[]string) {
+    mkdir_all_quiet(st.data_dir + "/rooms/by_agent/" + agent_bucket(aid + ""))
+    $items := []string{}
+    for i in 0:ids.len {
+        items.push(json.quote(&ids[i]))
+    }
+    body := "{\"rooms\":[" + strings.join(items, ",") + "]}\n"
+    write_atomic_quiet(agent_rooms_path(st, aid + ""), &body)
+}
+
+fn add_agent_room_index(st &State, aid string, rid string) {
+    $ids := load_agent_room_ids(st, aid + "")
+    for i in 0:ids.len {
+        if ids[i] == rid { << }
+    }
+    ids.push(rid + "")
+    save_agent_room_ids(st, aid + "", &ids)
+}
+
+fn remove_agent_room_index(st &State, aid string, rid string) {
+    ids := load_agent_room_ids(st, aid + "")
+    $next := []string{}
+    for i in 0:ids.len {
+        if ids[i] != rid { next.push(ids[i] + "") }
+    }
+    save_agent_room_ids(st, aid + "", &next)
+}
+
+fn emit_room_event(hub $&HubState, rd &RoomData, kind string, actor string, extra_fields string, extra_direct_aid string) {
+    $ev := "{\"room_id\":" + json.quote(&rd.room_id) +
+        ",\"kind\":" + json.quote(&kind) +
+        ",\"actor\":" + json.quote(&actor) +
+        ",\"epoch\":" + strconv.itoa(rd.epoch)
+    if extra_fields.len > 0 {
+        ev = ev + "," + extra_fields
+    }
+    ev = ev + "}"
+    _ := hub_push_room_event(hub, rd, &ev)
+    if extra_direct_aid.len > 0 {
+        _ := hub_push_to_agent(hub, extra_direct_aid + "", "room_event", &ev)
+    }
+}
+
+fn room_agent_usable_error(st &State, tag &AgentSummary) string {
+    if !tag.found { << "ERR_NOT_FOUND" }
+    if tag.status == "revoked" { << "ERR_REVOKED" }
+    if tag.controller_id.len > 0 && st.revoked.has(tag.controller_id + "") { << "ERR_CONTROLLER_REVOKED" }
+    if tag.controller_id.len > 0 && st.banned.has(tag.controller_id + "") { << "ERR_CONTROLLER_BANNED" }
+    if tag.ownership_status == "suspended" { << "ERR_AGENT_SUSPENDED" }
+    << ""
+}
+
+fn room_target_err_resp(code string) HttpResp {
+    if code == "ERR_NOT_FOUND" { << err_resp(404, "ERR_NOT_FOUND", "target agent not found", 0, 0, 0) }
+    << err_resp(403, code + "", "target agent unavailable: " + code, 0, 0, 0)
+}
+
+fn handle_room_create(hub $&HubState, req &HttpReq, now int) HttpResp {
+    au := authenticate_scoped($&hub.st, req, now, "room")
+    if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
+    doc := json.parse(&req.body())
+    if !doc.ok() || !doc.is_dict(doc.root()) {
+        << err_resp(400, "ERR_BAD_REQUEST", "invalid JSON body", 0, 0, 0)
+    }
+    r := doc.root()
+    rid := json_str_or(&doc, doc.get(r, "room_id"), "")
+    if !is_valid_room_id(rid + "") {
+        << err_resp(400, "ERR_BAD_REQUEST", "invalid room_id", 0, 0, 0)
+    }
+    existing := load_room_data(&hub.st, rid + "")
+    if existing.found {
+        << err_resp(409, "ERR_CONFLICT", "room_id already exists", 0, 0, 0)
+    }
+
+    name := json_str_or(&doc, doc.get(r, "name"), "")
+    topic := json_str_or(&doc, doc.get(r, "topic"), "")
+    if name.len > 64 || has_forbidden_ctrl(&name) {
+        << err_resp(400, "ERR_BAD_REQUEST", "name must be <= 64 bytes without control chars", 0, 0, 0)
+    }
+    if topic.len > 256 || has_forbidden_ctrl(&topic) {
+        << err_resp(400, "ERR_BAD_REQUEST", "topic must be <= 256 bytes without control chars", 0, 0, 0)
+    }
+
+    sp := json_str_or(&doc, doc.get(r, "send_policy"), "all")
+    ip := json_str_or(&doc, doc.get(r, "invite_policy"), "admins")
+    jp := json_str_or(&doc, doc.get(r, "join_policy"), "invite_only")
+    if !is_valid_send_policy(sp + "") { << err_resp(400, "ERR_BAD_REQUEST", "invalid send_policy", 0, 0, 0) }
+    if !is_valid_invite_policy(ip + "") { << err_resp(400, "ERR_BAD_REQUEST", "invalid invite_policy", 0, 0, 0) }
+    if !is_valid_join_policy(jp + "") { << err_resp(400, "ERR_BAD_REQUEST", "invalid join_policy", 0, 0, 0) }
+
+    $max_m := 64
+    if doc.has(r, "max_members") {
+        max_m = json_int_or(&doc, doc.get(r, "max_members"), -1)
+        if max_m < 2 || max_m > 256 {
+            << err_resp(400, "ERR_BAD_REQUEST", "max_members must be 2..256", 0, 0, 0)
+        }
+    }
+    $slow_s := 0
+    if doc.has(r, "slow_mode_sec") {
+        slow_s = json_int_or(&doc, doc.get(r, "slow_mode_sec"), -1)
+        if slow_s < 0 || slow_s > 3600 {
+            << err_resp(400, "ERR_BAD_REQUEST", "slow_mode_sec must be 0..3600", 0, 0, 0)
+        }
+    }
+    locked := json_bool_or(&doc, doc.get(r, "locked"), false)
+
+    ag := read_agent_summary(&hub.st, au.agent_id + "")
+    $ctrl_id := au.agent_id + ""
+    if ag.found && ag.controller_id.len > 0 {
+        ctrl_id = ag.controller_id + ""
+    }
+
+    $rd := RoomData{
+        found: true,
+        room_id: rid + "",
+        name: name + "",
+        topic: topic + "",
+        owner_id: au.agent_id + "",
+        controller_id: ctrl_id + "",
+        epoch: 1,
+        status: "active",
+        created_at: now,
+        updated_at: now,
+        send_policy: sp + "",
+        invite_policy: ip + "",
+        join_policy: jp + "",
+        max_members: max_m,
+        slow_mode_sec: slow_s,
+        locked: locked,
+        members: [RoomMember{agent_id: au.agent_id + "", role: "owner", muted: false, joined_at: now}],
+        banned: []string{}
+    }
+    save_room_data(&hub.st, &rd) or (err) {
+        << err_resp(500, "ERR_INTERNAL", "failed saving room", 0, 0, 0)
+    }
+    add_agent_room_index(&hub.st, au.agent_id + "", rid + "")
+    log_event_json(hub.log_ch, now, "room_create", "\"room_id\":" + json.quote(&rid) + ",\"owner\":" + json.quote(&au.agent_id))
+    << json_resp(201, "{\"ok\":true,\"room\":" + serialize_room_json(&rd, au.agent_id + "", true) + "}")
+}
+
+fn handle_room_list(hub $&HubState, req &HttpReq, now int) HttpResp {
+    au := authenticate_scoped($&hub.st, req, now, "room")
+    if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
+    ids := load_agent_room_ids(&hub.st, au.agent_id + "")
+    $items := []string{}
+    for i in 0:ids.len {
+        rd := load_room_data(&hub.st, ids[i] + "")
+        if !rd.found || rd.status != "active" { -> }
+        if !room_has_member(&rd, au.agent_id + "") { -> }
+        items.push(serialize_room_json(&rd, au.agent_id + "", false))
+    }
+    << json_resp(200, "{\"ok\":true,\"rooms\":[" + strings.join(items, ",") + "]}")
+}
+
+fn handle_room_get(hub $&HubState, req &HttpReq, rid string, now int) HttpResp {
+    au := authenticate_scoped($&hub.st, req, now, "room")
+    if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
+    rd := load_room_data(&hub.st, rid + "")
+    if !rd.found { << err_resp(404, "ERR_NOT_FOUND", "room not found", 0, 0, 0) }
+    role := room_member_role(&rd, au.agent_id + "")
+    if role.len == 0 {
+        << err_resp(403, "ERR_FORBIDDEN", "not a room member", 0, 0, 0)
+    }
+    << json_resp(200, "{\"ok\":true,\"room\":" + serialize_room_json(&rd, au.agent_id + "", room_is_priv_role(role + "")) + "}")
+}
+
+fn handle_room_patch(hub $&HubState, req &HttpReq, rid string, now int) HttpResp {
+    au := authenticate_scoped($&hub.st, req, now, "room")
+    if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
+    $rd := load_room_data(&hub.st, rid + "")
+    if !rd.found { << err_resp(404, "ERR_NOT_FOUND", "room not found", 0, 0, 0) }
+    if rd.status != "active" { << err_resp(403, "ERR_ROOM_CLOSED", "room is closed", 0, 0, 0) }
+
+    role := room_member_role(&rd, au.agent_id + "")
+    if !room_is_priv_role(role + "") {
+        << err_resp(403, "ERR_FORBIDDEN", "only room owner or admin can update settings", 0, 0, 0)
+    }
+
+    doc := json.parse(&req.body())
+    if !doc.ok() || !doc.is_dict(doc.root()) {
+        << err_resp(400, "ERR_BAD_REQUEST", "invalid JSON body", 0, 0, 0)
+    }
+    r := doc.root()
+
+    if doc.has(r, "name") {
+        nv := json_str_or(&doc, doc.get(r, "name"), "")
+        if nv.len > 64 || has_forbidden_ctrl(&nv) {
+            << err_resp(400, "ERR_BAD_REQUEST", "name must be <= 64 bytes without control chars", 0, 0, 0)
+        }
+        rd.name = nv + ""
+    }
+    if doc.has(r, "topic") {
+        tv := json_str_or(&doc, doc.get(r, "topic"), "")
+        if tv.len > 256 || has_forbidden_ctrl(&tv) {
+            << err_resp(400, "ERR_BAD_REQUEST", "topic must be <= 256 bytes without control chars", 0, 0, 0)
+        }
+        rd.topic = tv + ""
+    }
+    if doc.has(r, "send_policy") {
+        sp := json_str_or(&doc, doc.get(r, "send_policy"), "")
+        if !is_valid_send_policy(sp + "") { << err_resp(400, "ERR_BAD_REQUEST", "invalid send_policy", 0, 0, 0) }
+        if sp == "owner" && role != "owner" {
+            << err_resp(403, "ERR_FORBIDDEN", "only room owner can restrict send_policy to owner", 0, 0, 0)
+        }
+        rd.send_policy = sp + ""
+    }
+    if doc.has(r, "invite_policy") {
+        if role != "owner" { << err_resp(403, "ERR_FORBIDDEN", "only room owner can change invite_policy", 0, 0, 0) }
+        ip := json_str_or(&doc, doc.get(r, "invite_policy"), "")
+        if !is_valid_invite_policy(ip + "") { << err_resp(400, "ERR_BAD_REQUEST", "invalid invite_policy", 0, 0, 0) }
+        rd.invite_policy = ip + ""
+    }
+    if doc.has(r, "join_policy") {
+        if role != "owner" { << err_resp(403, "ERR_FORBIDDEN", "only room owner can change join_policy", 0, 0, 0) }
+        jp := json_str_or(&doc, doc.get(r, "join_policy"), "")
+        if !is_valid_join_policy(jp + "") { << err_resp(400, "ERR_BAD_REQUEST", "invalid join_policy", 0, 0, 0) }
+        rd.join_policy = jp + ""
+    }
+    if doc.has(r, "max_members") {
+        mm := json_int_or(&doc, doc.get(r, "max_members"), -1)
+        if mm < 2 || mm > 256 { << err_resp(400, "ERR_BAD_REQUEST", "max_members must be 2..256", 0, 0, 0) }
+        if mm < rd.members.len { << err_resp(409, "ERR_CONFLICT", "max_members below current member count", 0, 0, 0) }
+        rd.max_members = mm
+    }
+    if doc.has(r, "slow_mode_sec") {
+        sm := json_int_or(&doc, doc.get(r, "slow_mode_sec"), -1)
+        if sm < 0 || sm > 3600 { << err_resp(400, "ERR_BAD_REQUEST", "slow_mode_sec must be 0..3600", 0, 0, 0) }
+        rd.slow_mode_sec = sm
+    }
+    if doc.has(r, "locked") {
+        rd.locked = json_bool_or(&doc, doc.get(r, "locked"), rd.locked)
+    }
+
+    rd.updated_at = now
+    save_room_data(&hub.st, &rd) or (err) {
+        << err_resp(500, "ERR_INTERNAL", "failed saving room", 0, 0, 0)
+    }
+    emit_room_event(hub, &rd, "room_updated", au.agent_id + "", "", "")
+    log_event_json(hub.log_ch, now, "room_update", "\"room_id\":" + json.quote(&rid) + ",\"actor\":" + json.quote(&au.agent_id))
+    << json_resp(200, "{\"ok\":true,\"room\":" + serialize_room_json(&rd, au.agent_id + "", true) + "}")
+}
+
+fn handle_room_add_member(hub $&HubState, req &HttpReq, rid string, now int) HttpResp {
+    au := authenticate_scoped($&hub.st, req, now, "room")
+    if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
+    $rd := load_room_data(&hub.st, rid + "")
+    if !rd.found { << err_resp(404, "ERR_NOT_FOUND", "room not found", 0, 0, 0) }
+    if rd.status != "active" { << err_resp(403, "ERR_ROOM_CLOSED", "room is closed", 0, 0, 0) }
+    if rd.locked { << err_resp(403, "ERR_ROOM_LOCKED", "room is locked", 0, 0, 0) }
+
+    cidx := room_find_member_idx(&rd, au.agent_id + "")
+    if cidx < 0 { << err_resp(403, "ERR_FORBIDDEN", "not a room member", 0, 0, 0) }
+    crole := rd.members[cidx].role + ""
+    if crole == "readonly" {
+        << err_resp(403, "ERR_FORBIDDEN", "readonly members cannot invite", 0, 0, 0)
+    }
+    if rd.invite_policy == "owner" && crole != "owner" {
+        << err_resp(403, "ERR_FORBIDDEN", "only room owner can invite", 0, 0, 0)
+    }
+    if rd.invite_policy == "admins" && !room_is_priv_role(crole + "") {
+        << err_resp(403, "ERR_FORBIDDEN", "only owner or admins can invite", 0, 0, 0)
+    }
+    if rd.members[cidx].muted && !room_is_priv_role(crole + "") {
+        << err_resp(403, "ERR_ROOM_MUTED", "muted member cannot invite", 0, 0, 0)
+    }
+
+    body := req.body()
+    doc := json.parse(&body)
+    if !doc.ok() || !doc.is_dict(doc.root()) {
+        << err_resp(400, "ERR_BAD_REQUEST", "invalid JSON body", 0, 0, 0)
+    }
+    r := doc.root()
+    tgt := json_str_or(&doc, doc.get(r, "agent_id"), "")
+    if !is_valid_agent_id(tgt + "") {
+        << err_resp(400, "ERR_BAD_REQUEST", "invalid agent_id", 0, 0, 0)
+    }
+    $trole := "member"
+    if doc.has(r, "role") {
+        trole = json_str_or(&doc, doc.get(r, "role"), "")
+        if !is_valid_room_assignable_role(trole + "") {
+            << err_resp(400, "ERR_BAD_REQUEST", "invalid role (admin|member|readonly)", 0, 0, 0)
+        }
+    }
+    if trole == "admin" && crole != "owner" {
+        << err_resp(403, "ERR_FORBIDDEN", "only room owner can invite as admin", 0, 0, 0)
+    }
+
+    tag := read_agent_summary(&hub.st, tgt + "")
+    uerr := room_agent_usable_error(&hub.st, &tag)
+    if uerr.len > 0 { << room_target_err_resp(uerr + "") }
+
+    if room_has_member(&rd, tgt + "") {
+        << err_resp(409, "ERR_CONFLICT", "agent already in room", 0, 0, 0)
+    }
+    if room_is_banned(&rd, tgt + "") {
+        << err_resp(403, "ERR_ROOM_BANNED", "agent is banned from this room", 0, 0, 0)
+    }
+    if rd.members.len >= rd.max_members {
+        << err_resp(409, "ERR_ROOM_FULL", "room member limit reached", 0, 0, 0)
+    }
+
+    if agent_blocks_sender(&hub.st, tgt + "", au.agent_id + "", now) || agent_blocks_sender(&hub.st, tgt + "", rd.owner_id + "", now) {
+        << err_resp(403, "ERR_BLOCKED", "target agent has blocked inviter or room owner", 0, 0, 0)
+    }
+
+    if rd.join_policy == "friends_only" {
+        if tgt != rd.owner_id && !agent_is_friend(&hub.st, rd.owner_id + "", tgt + "", now) {
+            << err_resp(403, "ERR_FRIENDS_ONLY", "room join_policy requires friendship with room owner", 0, 0, 0)
+        }
+    } else if rd.join_policy == "controller_only" {
+        same_ctl := (tgt == rd.controller_id) || (tag.controller_id.len > 0 && tag.controller_id == rd.controller_id)
+        if !same_ctl {
+            << err_resp(403, "ERR_FORBIDDEN", "room join_policy requires same controller chain", 0, 0, 0)
+        }
+    }
+
+    rd.members.push(RoomMember{agent_id: tgt + "", role: trole + "", muted: false, joined_at: now})
+    rd.updated_at = now
+    save_room_data(&hub.st, &rd) or (err) {
+        << err_resp(500, "ERR_INTERNAL", "failed saving room", 0, 0, 0)
+    }
+    add_agent_room_index(&hub.st, tgt + "", rid + "")
+
+    $del_state := "none"
+    inv_frame := extract_json_object_field(&body, "invite_frame")
+    if inv_frame.len > 0 {
+        if inv_frame.len > 32768 {
+            << err_resp(413, "ERR_PAYLOAD_TOO_LARGE", "invite_frame exceeds 32768 bytes", 0, 0, 0)
+        }
+        del_state = deliver_dm_relay_raw(hub, &tag, au.agent_id + "", tgt + "", &inv_frame, now)
+    }
+    log_event_json(hub.log_ch, now, "room_invite",
+        "\"room_id\":" + json.quote(&rid) + ",\"from\":" + json.quote(&au.agent_id) +
+        ",\"to\":" + json.quote(&tgt) + ",\"role\":" + json.quote(&trole) + ",\"delivered\":" + json.quote(&del_state))
+    << json_resp(200, "{\"ok\":true,\"room_id\":" + json.quote(&rid) +
+        ",\"agent_id\":" + json.quote(&tgt) +
+        ",\"role\":" + json.quote(&trole) +
+        ",\"epoch\":" + strconv.itoa(rd.epoch) +
+        ",\"member_count\":" + strconv.itoa(rd.members.len) +
+        ",\"delivered\":" + json.quote(&del_state) + "}")
+}
+
+fn handle_room_patch_member(hub $&HubState, req &HttpReq, rid string, aid string, now int) HttpResp {
+    if !is_valid_agent_id(aid + "") { << err_resp(400, "ERR_BAD_REQUEST", "invalid agent_id", 0, 0, 0) }
+    au := authenticate_scoped($&hub.st, req, now, "room")
+    if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
+    $rd := load_room_data(&hub.st, rid + "")
+    if !rd.found { << err_resp(404, "ERR_NOT_FOUND", "room not found", 0, 0, 0) }
+    if rd.status != "active" { << err_resp(403, "ERR_ROOM_CLOSED", "room is closed", 0, 0, 0) }
+
+    crole := room_member_role(&rd, au.agent_id + "")
+    if !room_is_priv_role(crole + "") {
+        << err_resp(403, "ERR_FORBIDDEN", "only room owner or admin can update members", 0, 0, 0)
+    }
+    tidx := room_find_member_idx(&rd, aid + "")
+    if tidx < 0 { << err_resp(404, "ERR_NOT_FOUND", "target is not a room member", 0, 0, 0) }
+    trole := rd.members[tidx].role + ""
+    if trole == "owner" {
+        << err_resp(403, "ERR_FORBIDDEN", "cannot modify room owner; use transfer", 0, 0, 0)
+    }
+    if crole == "admin" && trole == "admin" {
+        << err_resp(403, "ERR_FORBIDDEN", "admin cannot modify another admin", 0, 0, 0)
+    }
+
+    doc := json.parse(&req.body())
+    if !doc.ok() || !doc.is_dict(doc.root()) {
+        << err_resp(400, "ERR_BAD_REQUEST", "invalid JSON body", 0, 0, 0)
+    }
+    r := doc.root()
+    if doc.has(r, "role") {
+        nrole := json_str_or(&doc, doc.get(r, "role"), "")
+        if !is_valid_room_assignable_role(nrole + "") {
+            << err_resp(400, "ERR_BAD_REQUEST", "invalid role (admin|member|readonly)", 0, 0, 0)
+        }
+        if nrole == "admin" && crole != "owner" {
+            << err_resp(403, "ERR_FORBIDDEN", "only owner can grant admin role", 0, 0, 0)
+        }
+        rd.members[tidx].role = nrole + ""
+    }
+    if doc.has(r, "muted") {
+        rd.members[tidx].muted = json_bool_or(&doc, doc.get(r, "muted"), rd.members[tidx].muted)
+    }
+
+    rd.updated_at = now
+    save_room_data(&hub.st, &rd) or (err) {
+        << err_resp(500, "ERR_INTERNAL", "failed saving room", 0, 0, 0)
+    }
+    $ms := "false"
+    if rd.members[tidx].muted { ms = "true" }
+    emit_room_event(hub, &rd, "member_updated", au.agent_id + "",
+        "\"target\":" + json.quote(&aid) + ",\"role\":" + json.quote(&rd.members[tidx].role) + ",\"muted\":" + ms, "")
+    log_event_json(hub.log_ch, now, "room_member_update",
+        "\"room_id\":" + json.quote(&rid) + ",\"actor\":" + json.quote(&au.agent_id) + ",\"target\":" + json.quote(&aid))
+    << json_resp(200, "{\"ok\":true,\"room_id\":" + json.quote(&rid) + ",\"agent_id\":" + json.quote(&aid) +
+        ",\"role\":" + json.quote(&rd.members[tidx].role) + ",\"muted\":" + ms + "}")
+}
+
+fn handle_room_kick_or_ban(hub $&HubState, req &HttpReq, rid string, aid string, is_ban bool, now int) HttpResp {
+    if !is_valid_agent_id(aid + "") { << err_resp(400, "ERR_BAD_REQUEST", "invalid agent_id", 0, 0, 0) }
+    au := authenticate_scoped($&hub.st, req, now, "room")
+    if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
+    $rd := load_room_data(&hub.st, rid + "")
+    if !rd.found { << err_resp(404, "ERR_NOT_FOUND", "room not found", 0, 0, 0) }
+    if rd.status != "active" { << err_resp(403, "ERR_ROOM_CLOSED", "room is closed", 0, 0, 0) }
+
+    crole := room_member_role(&rd, au.agent_id + "")
+    if !room_is_priv_role(crole + "") {
+        << err_resp(403, "ERR_FORBIDDEN", "only room owner or admin can kick or ban", 0, 0, 0)
+    }
+    if aid == rd.owner_id || aid == au.agent_id {
+        << err_resp(403, "ERR_FORBIDDEN", "cannot kick or ban self or room owner", 0, 0, 0)
+    }
+
+    tidx := room_find_member_idx(&rd, aid + "")
+    if !is_ban && tidx < 0 {
+        << err_resp(404, "ERR_NOT_FOUND", "target is not a room member", 0, 0, 0)
+    }
+    if tidx >= 0 && crole == "admin" && rd.members[tidx].role == "admin" {
+        << err_resp(403, "ERR_FORBIDDEN", "admin cannot kick or ban another admin", 0, 0, 0)
+    }
+
+    $rotate_epoch := true
+    raw_b := req.body()
+    if raw_b.len > 0 {
+        bdoc := json.parse(&raw_b)
+        if bdoc.ok() && bdoc.is_dict(bdoc.root()) && bdoc.has(bdoc.root(), "rotate_epoch") {
+            rotate_epoch = json_bool_or(&bdoc, bdoc.get(bdoc.root(), "rotate_epoch"), true)
+        }
+    }
+
+    $next_members := []RoomMember{}
+    for i in 0:rd.members.len {
+        if rd.members[i].agent_id != aid {
+            m := &rd.members[i]
+            next_members.push(RoomMember{agent_id: m.agent_id + "", role: m.role + "", muted: m.muted, joined_at: m.joined_at})
+        }
+    }
+    rd.members = next_members
+    if is_ban && !room_is_banned(&rd, aid + "") {
+        rd.banned.push(aid + "")
+    }
+    if rotate_epoch {
+        rd.epoch += 1
+    }
+    rd.updated_at = now
+    save_room_data(&hub.st, &rd) or (err) {
+        << err_resp(500, "ERR_INTERNAL", "failed saving room", 0, 0, 0)
+    }
+    remove_agent_room_index(&hub.st, aid + "", rid + "")
+
+    $act := "kick"
+    $kind := "member_kicked"
+    if is_ban {
+        act = "ban"
+        kind = "member_banned"
+    }
+    emit_room_event(hub, &rd, kind + "", au.agent_id + "", "\"target\":" + json.quote(&aid), aid + "")
+    log_event_json(hub.log_ch, now, "room_" + act,
+        "\"room_id\":" + json.quote(&rid) + ",\"actor\":" + json.quote(&au.agent_id) +
+        ",\"target\":" + json.quote(&aid) + ",\"epoch\":" + strconv.itoa(rd.epoch))
+
+    $rem := []string{}
+    for i in 0:rd.members.len {
+        rem.push(json.quote(&rd.members[i].agent_id))
+    }
+    << json_resp(200, "{\"ok\":true,\"room_id\":" + json.quote(&rid) +
+        ",\"target\":" + json.quote(&aid) +
+        ",\"action\":" + json.quote(&act) +
+        ",\"epoch\":" + strconv.itoa(rd.epoch) +
+        ",\"remaining_members\":[" + strings.join(rem, ",") + "]}")
+}
+
+fn handle_room_unban(hub $&HubState, req &HttpReq, rid string, aid string, now int) HttpResp {
+    if !is_valid_agent_id(aid + "") { << err_resp(400, "ERR_BAD_REQUEST", "invalid agent_id", 0, 0, 0) }
+    au := authenticate_scoped($&hub.st, req, now, "room")
+    if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
+    $rd := load_room_data(&hub.st, rid + "")
+    if !rd.found { << err_resp(404, "ERR_NOT_FOUND", "room not found", 0, 0, 0) }
+    if rd.status != "active" { << err_resp(403, "ERR_ROOM_CLOSED", "room is closed", 0, 0, 0) }
+    crole := room_member_role(&rd, au.agent_id + "")
+    if !room_is_priv_role(crole + "") {
+        << err_resp(403, "ERR_FORBIDDEN", "only room owner or admin can unban", 0, 0, 0)
+    }
+
+    $next_ban := []string{}
+    for i in 0:rd.banned.len {
+        if rd.banned[i] != aid { next_ban.push(rd.banned[i] + "") }
+    }
+    rd.banned = next_ban
+    rd.updated_at = now
+    save_room_data(&hub.st, &rd) or (err) {
+        << err_resp(500, "ERR_INTERNAL", "failed saving room", 0, 0, 0)
+    }
+    log_event_json(hub.log_ch, now, "room_unban", "\"room_id\":" + json.quote(&rid) + ",\"actor\":" + json.quote(&au.agent_id) + ",\"target\":" + json.quote(&aid))
+    << json_resp(200, "{\"ok\":true,\"room_id\":" + json.quote(&rid) + ",\"unbanned\":" + json.quote(&aid) + "}")
+}
+
+fn handle_room_rekey(hub $&HubState, req &HttpReq, rid string, now int) HttpResp {
+    au := authenticate_scoped($&hub.st, req, now, "room")
+    if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
+    $rd := load_room_data(&hub.st, rid + "")
+    if !rd.found { << err_resp(404, "ERR_NOT_FOUND", "room not found", 0, 0, 0) }
+    if rd.status != "active" { << err_resp(403, "ERR_ROOM_CLOSED", "room is closed", 0, 0, 0) }
+    crole := room_member_role(&rd, au.agent_id + "")
+    if !room_is_priv_role(crole + "") {
+        << err_resp(403, "ERR_FORBIDDEN", "only room owner or admin can rekey", 0, 0, 0)
+    }
+
+    doc := json.parse(&req.body())
+    if !doc.ok() || !doc.is_dict(doc.root()) {
+        << err_resp(400, "ERR_BAD_REQUEST", "invalid JSON body", 0, 0, 0)
+    }
+    r := doc.root()
+    bump := json_bool_or(&doc, doc.get(r, "bump_epoch"), false)
+    $target_ep := rd.epoch
+    if bump {
+        target_ep = rd.epoch + 1
+    }
+    if doc.has(r, "epoch") {
+        req_ep := json_int_or(&doc, doc.get(r, "epoch"), 0)
+        if req_ep < rd.epoch {
+            << err_resp(409, "ERR_CONFLICT", "rekey epoch cannot be lower than current room epoch", 0, 0, 0)
+        }
+        if req_ep > target_ep { target_ep = req_ep }
+    }
+    rd.epoch = target_ep
+    rd.updated_at = now
+    save_room_data(&hub.st, &rd) or (err) {
+        << err_resp(500, "ERR_INTERNAL", "failed saving room", 0, 0, 0)
+    }
+
+    $del_cnt := 0
+    $tot_cnt := 0
+    if doc.has(r, "envelopes") && doc.is_list(doc.get(r, "envelopes")) {
+        arr := doc.get(r, "envelopes")
+        for i in 0:doc.count(arr) {
+            el := doc.at(arr, i)
+            if !doc.is_dict(el) { -> }
+            to_id := json_str_or(&doc, doc.get(el, "to"), "")
+            if !is_valid_agent_id(to_id + "") || to_id == au.agent_id { -> }
+            if !room_has_member(&rd, to_id + "") { -> }
+            frame_s := json_encode_or(&doc, doc.get(el, "frame"), "")
+            if frame_s.len == 0 || frame_s.len > 32768 { -> }
+            tag := read_agent_summary(&hub.st, to_id + "")
+            if room_agent_usable_error(&hub.st, &tag).len > 0 { -> }
+            if agent_blocks_sender(&hub.st, to_id + "", au.agent_id + "", now) { -> }
+            tot_cnt += 1
+            res := deliver_dm_relay_raw(hub, &tag, au.agent_id + "", to_id + "", &frame_s, now)
+            if res != "dropped_offline" { del_cnt += 1 }
+        }
+    }
+    log_event_json(hub.log_ch, now, "room_rekey",
+        "\"room_id\":" + json.quote(&rid) + ",\"actor\":" + json.quote(&au.agent_id) +
+        ",\"epoch\":" + strconv.itoa(rd.epoch) + ",\"delivered\":" + strconv.itoa(del_cnt))
+    << json_resp(200, "{\"ok\":true,\"room_id\":" + json.quote(&rid) +
+        ",\"epoch\":" + strconv.itoa(rd.epoch) +
+        ",\"delivered\":" + strconv.itoa(del_cnt) +
+        ",\"total\":" + strconv.itoa(tot_cnt) + "}")
+}
+
+fn handle_room_transfer(hub $&HubState, req &HttpReq, rid string, now int) HttpResp {
+    au := authenticate_scoped($&hub.st, req, now, "room")
+    if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
+    $rd := load_room_data(&hub.st, rid + "")
+    if !rd.found { << err_resp(404, "ERR_NOT_FOUND", "room not found", 0, 0, 0) }
+    if rd.status != "active" { << err_resp(403, "ERR_ROOM_CLOSED", "room is closed", 0, 0, 0) }
+    if rd.owner_id != au.agent_id {
+        << err_resp(403, "ERR_FORBIDDEN", "only room owner can transfer ownership", 0, 0, 0)
+    }
+
+    doc := json.parse(&req.body())
+    if !doc.ok() || !doc.is_dict(doc.root()) {
+        << err_resp(400, "ERR_BAD_REQUEST", "invalid JSON body", 0, 0, 0)
+    }
+    new_owner := json_str_or(&doc, doc.get(doc.root(), "agent_id"), "")
+    if !is_valid_agent_id(new_owner + "") || new_owner == au.agent_id {
+        << err_resp(400, "ERR_BAD_REQUEST", "invalid new owner agent_id", 0, 0, 0)
+    }
+    oidx := room_find_member_idx(&rd, au.agent_id + "")
+    nidx := room_find_member_idx(&rd, new_owner + "")
+    if nidx < 0 {
+        << err_resp(404, "ERR_NOT_FOUND", "new owner must already be a room member", 0, 0, 0)
+    }
+    if oidx >= 0 { rd.members[oidx].role = "admin" }
+    rd.members[nidx].role = "owner"
+    rd.owner_id = new_owner + ""
+    rd.updated_at = now
+    save_room_data(&hub.st, &rd) or (err) {
+        << err_resp(500, "ERR_INTERNAL", "failed saving room", 0, 0, 0)
+    }
+    emit_room_event(hub, &rd, "owner_transferred", au.agent_id + "", "\"new_owner\":" + json.quote(&new_owner), "")
+    log_event_json(hub.log_ch, now, "room_transfer",
+        "\"room_id\":" + json.quote(&rid) + ",\"from\":" + json.quote(&au.agent_id) + ",\"to\":" + json.quote(&new_owner))
+    << json_resp(200, "{\"ok\":true,\"room_id\":" + json.quote(&rid) + ",\"owner_id\":" + json.quote(&new_owner) + "}")
+}
+
+fn handle_room_leave(hub $&HubState, req &HttpReq, rid string, now int) HttpResp {
+    au := authenticate_scoped($&hub.st, req, now, "room")
+    if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
+    $rd := load_room_data(&hub.st, rid + "")
+    if !rd.found { << err_resp(404, "ERR_NOT_FOUND", "room not found", 0, 0, 0) }
+    if rd.owner_id == au.agent_id {
+        << err_resp(409, "ERR_CONFLICT", "owner cannot leave; transfer ownership or close the room", 0, 0, 0)
+    }
+    if !room_has_member(&rd, au.agent_id + "") {
+        << err_resp(404, "ERR_NOT_FOUND", "not a room member", 0, 0, 0)
+    }
+    $next_members := []RoomMember{}
+    for i in 0:rd.members.len {
+        if rd.members[i].agent_id != au.agent_id {
+            m := &rd.members[i]
+            next_members.push(RoomMember{agent_id: m.agent_id + "", role: m.role + "", muted: m.muted, joined_at: m.joined_at})
+        }
+    }
+    rd.members = next_members
+    rd.updated_at = now
+    save_room_data(&hub.st, &rd) or (err) {
+        << err_resp(500, "ERR_INTERNAL", "failed saving room", 0, 0, 0)
+    }
+    remove_agent_room_index(&hub.st, au.agent_id + "", rid + "")
+    emit_room_event(hub, &rd, "member_left", au.agent_id + "", "", "")
+    log_event_json(hub.log_ch, now, "room_leave", "\"room_id\":" + json.quote(&rid) + ",\"agent_id\":" + json.quote(&au.agent_id))
+    << json_resp(200, "{\"ok\":true,\"room_id\":" + json.quote(&rid) + ",\"left\":true}")
+}
+
+fn handle_room_close(hub $&HubState, req &HttpReq, rid string, now int) HttpResp {
+    au := authenticate_scoped($&hub.st, req, now, "room")
+    if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
+    $rd := load_room_data(&hub.st, rid + "")
+    if !rd.found { << err_resp(404, "ERR_NOT_FOUND", "room not found", 0, 0, 0) }
+    if rd.owner_id != au.agent_id {
+        << err_resp(403, "ERR_FORBIDDEN", "only room owner can close the room", 0, 0, 0)
+    }
+    rd.status = "closed"
+    rd.updated_at = now
+    save_room_data(&hub.st, &rd) or (err) {
+        << err_resp(500, "ERR_INTERNAL", "failed saving room", 0, 0, 0)
+    }
+    for i in 0:rd.members.len {
+        remove_agent_room_index(&hub.st, rd.members[i].agent_id + "", rid + "")
+    }
+    emit_room_event(hub, &rd, "room_closed", au.agent_id + "", "", "")
+    log_event_json(hub.log_ch, now, "room_close", "\"room_id\":" + json.quote(&rid) + ",\"owner\":" + json.quote(&au.agent_id))
+    << json_resp(200, "{\"ok\":true,\"room_id\":" + json.quote(&rid) + ",\"status\":\"closed\"}")
+}
+
+fn set_room_slow_ts(st $&State, skey string, now int) {
+    map_set($&st.room_slow_ts, skey + "", now)
+}
+
+pub fn handle_room_send(hub $&HubState, req &HttpReq, room_id string, now int) HttpResp {
+    if !is_valid_room_id(room_id + "") { << err_resp(400, "ERR_BAD_REQUEST", "invalid room_id", 0, 0, 0) }
+    au := authenticate_scoped($&hub.st, req, now, "room")
+    if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
+
+    rd := load_room_data(&hub.st, room_id + "")
+    if !rd.found { << err_resp(404, "ERR_NOT_FOUND", "room not found", 0, 0, 0) }
+    if rd.status != "active" { << err_resp(403, "ERR_ROOM_CLOSED", "room is closed", 0, 0, 0) }
+    if room_is_banned(&rd, au.agent_id + "") {
+        << err_resp(403, "ERR_ROOM_BANNED", "agent is banned from this room", 0, 0, 0)
+    }
+    midx := room_find_member_idx(&rd, au.agent_id + "")
+    if midx < 0 {
+        << err_resp(403, "ERR_FORBIDDEN", "not a room member", 0, 0, 0)
+    }
+    mrole := rd.members[midx].role + ""
+    if mrole == "readonly" {
+        << err_resp(403, "ERR_FORBIDDEN", "readonly member cannot send messages", 0, 0, 0)
+    }
+    if rd.members[midx].muted {
+        << err_resp(403, "ERR_ROOM_MUTED", "member is muted in this room", 0, 0, 0)
+    }
+    if rd.locked && !room_is_priv_role(mrole + "") {
+        << err_resp(403, "ERR_ROOM_LOCKED", "room is locked", 0, 0, 0)
+    }
+    if rd.send_policy == "owner" && mrole != "owner" {
+        << err_resp(403, "ERR_FORBIDDEN", "only room owner can send messages", 0, 0, 0)
+    }
+    if rd.send_policy == "admins" && !room_is_priv_role(mrole + "") {
+        << err_resp(403, "ERR_FORBIDDEN", "only room owner or admins can send messages", 0, 0, 0)
+    }
+
+    if rd.slow_mode_sec > 0 && !room_is_priv_role(mrole + "") {
+        skey := room_id + ":" + au.agent_id
+        last_ts := map_get_or(&hub.st.room_slow_ts, skey + "", 0)
+        if last_ts > 0 && now - last_ts < rd.slow_mode_sec {
+            $ra := rd.slow_mode_sec - (now - last_ts)
+            if ra < 1 { ra = 1 }
+            << err_resp(429, "ERR_RATE_LIMITED", "room slow mode active", ra, 0, 0)
+        }
+        set_room_slow_ts($&hub.st, skey + "", now)
+    }
+
+    body := req.body()
+    if body.len == 0 || body.len > 32768 {
+        << err_resp(413, "ERR_PAYLOAD_TOO_LARGE", "room frame must be 1..32768 bytes", 0, 0, 0)
+    }
+    fdoc := json.parse(&body)
+    if !fdoc.ok() || !fdoc.is_dict(fdoc.root()) {
+        << err_resp(400, "ERR_BAD_REQUEST", "room frame must be JSON object", 0, 0, 0)
+    }
+    if fdoc.has(fdoc.root(), "epoch") {
+        fep := json_int_or(&fdoc, fdoc.get(fdoc.root(), "epoch"), 0)
+        if fep > 0 && fep < rd.epoch {
+            << err_resp(409, "ERR_CONFLICT", "stale room key epoch; upgrade to epoch " + strconv.itoa(rd.epoch), 0, 0, 0)
+        }
+    }
+
+    ev_json := "{\"room_id\":" + json.quote(&room_id) + ",\"from\":" + json.quote(&au.agent_id) + ",\"frame\":" + body + "}"
+    delivered := hub_push_room_checked(hub, &rd, au.agent_id + "", &ev_json, now)
+    hub.metrics.room_events += 1
+    log_event_json(hub.log_ch, now, "room_relay",
+        "\"from\":" + json.quote(&au.agent_id) + ",\"room_id\":" + json.quote(&room_id) +
+        ",\"streams\":" + strconv.itoa(delivered) + ",\"bytes\":" + strconv.itoa(body.len))
+    << json_resp(202, "{\"ok\":true,\"room_id\":" + json.quote(&room_id) + ",\"streams\":" + strconv.itoa(delivered) + "}")
+}
+
+pub fn handle_rooms_dispatch(hub $&HubState, req &HttpReq, path string, method string, now int) HttpResp {
+    if path == "/v1/rooms" {
+        if method == "POST" { << handle_room_create(hub, req, now) }
+        if method == "GET" { << handle_room_list(hub, req, now) }
+        << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0)
+    }
+    if !strings.has_prefix(&path, "/v1/rooms/") {
+        << err_resp(404, "ERR_NOT_FOUND", "not found", 0, 0, 0)
+    }
+    rest := path[10:path.len]
+    parts := strings.split(&rest, "/")
+    if parts.len == 0 { << err_resp(404, "ERR_NOT_FOUND", "not found", 0, 0, 0) }
+    rid := parts[0] + ""
+    if !is_valid_room_id(rid + "") {
+        << err_resp(400, "ERR_BAD_REQUEST", "invalid room_id", 0, 0, 0)
+    }
+
+    if parts.len == 1 {
+        if method == "GET" { << handle_room_get(hub, req, rid + "", now) }
+        if method == "PATCH" { << handle_room_patch(hub, req, rid + "", now) }
+        if method == "DELETE" { << handle_room_close(hub, req, rid + "", now) }
+        << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0)
+    }
+    if parts.len == 2 {
+        sub := parts[1] + ""
+        if sub == "send" {
+            if method != "POST" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+            << handle_room_send(hub, req, rid + "", now)
+        }
+        if sub == "members" {
+            if method != "POST" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+            << handle_room_add_member(hub, req, rid + "", now)
+        }
+        if sub == "rekey" {
+            if method != "POST" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+            << handle_room_rekey(hub, req, rid + "", now)
+        }
+        if sub == "transfer" {
+            if method != "POST" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+            << handle_room_transfer(hub, req, rid + "", now)
+        }
+        if sub == "leave" {
+            if method != "POST" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+            << handle_room_leave(hub, req, rid + "", now)
+        }
+    }
+    if parts.len == 3 {
+        if parts[1] == "members" {
+            if method != "PATCH" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+            << handle_room_patch_member(hub, req, rid + "", parts[2] + "", now)
+        }
+        if parts[1] == "bans" {
+            if method != "DELETE" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+            << handle_room_unban(hub, req, rid + "", parts[2] + "", now)
+        }
+    }
+    if parts.len == 4 && parts[1] == "members" {
+        act := parts[3] + ""
+        if act == "kick" || act == "ban" {
+            if method != "POST" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+            << handle_room_kick_or_ban(hub, req, rid + "", parts[2] + "", act == "ban", now)
+        }
+    }
+    << err_resp(404, "ERR_NOT_FOUND", "room route not found", 0, 0, 0)
+}
