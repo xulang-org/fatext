@@ -1,0 +1,8 @@
+[Unit]
+Description=fatext-server daily log health report
+
+[Service]
+Type=oneshot
+User=fatext
+Group=fatext
+ExecStart=/bin/bash -c 'Y=$(date -u -d yesterday +%%Y-%%m-%%d); python3 /opt/fatext/scripts/analyze_logs.py --log-dir /var/lib/fatext/logs --date "$Y" > "/var/lib/fatext/logs/report-${Y}.txt"'

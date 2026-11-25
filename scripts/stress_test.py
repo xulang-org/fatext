@@ -349,8 +349,12 @@ def run_analyze(log_dir: Path) -> dict:
 def main() -> int:
     ap = argparse.ArgumentParser(description="Multi-scenario stress benchmark for fatext-server.")
     ap.add_argument("--scale", choices=("normal", "light"), default="normal")
+    ap.add_argument("--light", action="store_true", help="Alias for --scale light")
+    ap.add_argument("--skip-tls", action="store_true", help="Skip Scenario 5 native TLS 1.3 benchmark")
     ap.add_argument("--json-out", help="Write full JSON report to this path")
     args = ap.parse_args()
+    if args.light:
+        args.scale = "light"
 
     if not SERVER_BIN.is_file():
         print(f"Missing {SERVER_BIN}; build fatext-server first.", file=sys.stderr)
@@ -643,104 +647,107 @@ def main() -> int:
         # ------------------------------------------------------------------
         # Scenario 5: Native TLS 1.3 Concurrency
         # ------------------------------------------------------------------
-        print(f"[5/6] Running Scenario 5: Native TLS 1.3 Concurrency (n={n_tls}, c={c_tls})...", flush=True)
-        tls_data = td_p / "tls_data"
-        tls_logs = td_p / "tls_logs"
-        tls_data.mkdir(parents=True, exist_ok=True)
-        tls_logs.mkdir(parents=True, exist_ok=True)
-        cnf = td_p / "tls.cnf"
-        cnf.write_text("[req]\ndistinguished_name=d\nprompt=no\n[d]\nCN=127.0.0.1\n", encoding="utf-8")
-        tcert = td_p / "srv.crt"
-        tkey = td_p / "srv.key"
-        subprocess.run(
-            ["/usr/bin/openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-config", str(cnf), "-keyout", str(tkey), "-out", str(tcert)],
-            check=True,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        tls_port = free_tcp_port()
-        tls_env = os.environ.copy()
-        tls_env["FATEXT_ADDR"] = f"{HOST}:{tls_port}"
-        tls_env["FATEXT_DATA_DIR"] = str(tls_data)
-        tls_env["FATEXT_WWW_DIR"] = str(WWW_DIR)
-        tls_env["FATEXT_TEMPLATES_DIR"] = str(TPL_DIR)
-        tls_env["FATEXT_POW_BITS"] = "8"
-        tls_env["FATEXT_IP_RPM"] = "0"
-        tls_env["FATEXT_TLS_CERT"] = str(tcert)
-        tls_env["FATEXT_TLS_KEY"] = str(tkey)
-        tls_env["FATEXT_LOG_DIR"] = str(tls_logs)
-        tls_env["FATEXT_METRICS_INTERVAL_SEC"] = "2"
+        if args.skip_tls:
+            print("[5/6] Skipping Scenario 5: Native TLS 1.3 (--skip-tls)", flush=True)
+        else:
+            print(f"[5/6] Running Scenario 5: Native TLS 1.3 Concurrency (n={n_tls}, c={c_tls})...", flush=True)
+            tls_data = td_p / "tls_data"
+            tls_logs = td_p / "tls_logs"
+            tls_data.mkdir(parents=True, exist_ok=True)
+            tls_logs.mkdir(parents=True, exist_ok=True)
+            cnf = td_p / "tls.cnf"
+            cnf.write_text("[req]\ndistinguished_name=d\nprompt=no\n[d]\nCN=127.0.0.1\n", encoding="utf-8")
+            tcert = td_p / "srv.crt"
+            tkey = td_p / "srv.key"
+            subprocess.run(
+                ["/usr/bin/openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1", "-config", str(cnf), "-keyout", str(tkey), "-out", str(tcert)],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            tls_port = free_tcp_port()
+            tls_env = os.environ.copy()
+            tls_env["FATEXT_ADDR"] = f"{HOST}:{tls_port}"
+            tls_env["FATEXT_DATA_DIR"] = str(tls_data)
+            tls_env["FATEXT_WWW_DIR"] = str(WWW_DIR)
+            tls_env["FATEXT_TEMPLATES_DIR"] = str(TPL_DIR)
+            tls_env["FATEXT_POW_BITS"] = "8"
+            tls_env["FATEXT_IP_RPM"] = "0"
+            tls_env["FATEXT_TLS_CERT"] = str(tcert)
+            tls_env["FATEXT_TLS_KEY"] = str(tkey)
+            tls_env["FATEXT_LOG_DIR"] = str(tls_logs)
+            tls_env["FATEXT_METRICS_INTERVAL_SEC"] = "2"
 
-        tsrv = subprocess.Popen([str(SERVER_BIN)], env=tls_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        try:
-            ctx = ssl._create_unverified_context()
-            deadline = time.time() + 10.0
-            while time.time() < deadline:
-                st, _, _ = https_once(tls_port, ctx, "GET", "/health", timeout=0.5)
-                if st == 200:
-                    break
-                time.sleep(0.05)
-            lat_tls: list[float] = []
-            st_tls: Counter[int] = Counter()
-            err_tls: list[str] = []
-            t_t0 = time.perf_counter()
-            with ThreadPoolExecutor(max_workers=c_tls) as pool:
-                futs = [pool.submit(https_once, tls_port, ctx, "GET", "/health" if i % 2 == 0 else "/") for i in range(n_tls)]
-                for fut in as_completed(futs):
-                    st, dt, err = fut.result()
-                    lat_tls.append(dt)
-                    st_tls[st] += 1
-                    if err and len(err_tls) < 5:
-                        err_tls.append(err)
-            tls_wall = time.perf_counter() - t_t0
-            report["scenarios"]["5_native_tls"] = summarize_latencies(lat_tls, tls_wall, st_tls, err_tls)
+            tsrv = subprocess.Popen([str(SERVER_BIN)], env=tls_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                ctx = ssl._create_unverified_context()
+                deadline = time.time() + 10.0
+                while time.time() < deadline:
+                    st, _, _ = https_once(tls_port, ctx, "GET", "/health", timeout=0.5)
+                    if st == 200:
+                        break
+                    time.sleep(0.05)
+                lat_tls: list[float] = []
+                st_tls: Counter[int] = Counter()
+                err_tls: list[str] = []
+                t_t0 = time.perf_counter()
+                with ThreadPoolExecutor(max_workers=c_tls) as pool:
+                    futs = [pool.submit(https_once, tls_port, ctx, "GET", "/health" if i % 2 == 0 else "/") for i in range(n_tls)]
+                    for fut in as_completed(futs):
+                        st, dt, err = fut.result()
+                        lat_tls.append(dt)
+                        st_tls[st] += 1
+                        if err and len(err_tls) < 5:
+                            err_tls.append(err)
+                tls_wall = time.perf_counter() - t_t0
+                report["scenarios"]["5_native_tls"] = summarize_latencies(lat_tls, tls_wall, st_tls, err_tls)
 
-            # Scenario 5b: Persistent HTTPS Keep-Alive reuse (c_tls connections x n_tls total requests)
-            def run_ka_worker(cnt: int, start_idx: int) -> tuple[list[float], Counter[int], list[str]]:
-                w_lat: list[float] = []
-                w_st: Counter[int] = Counter()
-                w_err: list[str] = []
-                conn = http.client.HTTPSConnection(HOST, tls_port, timeout=15.0, context=ctx)
-                try:
-                    for j in range(cnt):
-                        p = "/health" if (start_idx + j) % 2 == 0 else "/"
-                        t1 = time.perf_counter()
-                        try:
-                            conn.request("GET", p, headers={"Connection": "keep-alive"})
-                            resp = conn.getresponse()
-                            _ = resp.read()
-                            w_lat.append((time.perf_counter() - t1) * 1000.0)
-                            w_st[resp.status] += 1
-                        except Exception as e:
-                            w_lat.append((time.perf_counter() - t1) * 1000.0)
-                            w_st[0] += 1
-                            if len(w_err) < 5:
-                                w_err.append(repr(e))
-                finally:
-                    conn.close()
-                return w_lat, w_st, w_err
+                # Scenario 5b: Persistent HTTPS Keep-Alive reuse (c_tls connections x n_tls total requests)
+                def run_ka_worker(cnt: int, start_idx: int) -> tuple[list[float], Counter[int], list[str]]:
+                    w_lat: list[float] = []
+                    w_st: Counter[int] = Counter()
+                    w_err: list[str] = []
+                    conn = http.client.HTTPSConnection(HOST, tls_port, timeout=15.0, context=ctx)
+                    try:
+                        for j in range(cnt):
+                            p = "/health" if (start_idx + j) % 2 == 0 else "/"
+                            t1 = time.perf_counter()
+                            try:
+                                conn.request("GET", p, headers={"Connection": "keep-alive"})
+                                resp = conn.getresponse()
+                                _ = resp.read()
+                                w_lat.append((time.perf_counter() - t1) * 1000.0)
+                                w_st[resp.status] += 1
+                            except Exception as e:
+                                w_lat.append((time.perf_counter() - t1) * 1000.0)
+                                w_st[0] += 1
+                                if len(w_err) < 5:
+                                    w_err.append(repr(e))
+                    finally:
+                        conn.close()
+                    return w_lat, w_st, w_err
 
-            ka_per = max(1, n_tls // c_tls)
-            lat_ka: list[float] = []
-            st_ka: Counter[int] = Counter()
-            err_ka: list[str] = []
-            t_ka0 = time.perf_counter()
-            with ThreadPoolExecutor(max_workers=c_tls) as pool:
-                futs_ka = [pool.submit(run_ka_worker, ka_per, wi * ka_per) for wi in range(c_tls)]
-                for fut in as_completed(futs_ka):
-                    wl, ws, we = fut.result()
-                    lat_ka.extend(wl)
-                    st_ka.update(ws)
-                    err_ka.extend(we)
-            ka_wall = time.perf_counter() - t_ka0
-            report["scenarios"]["5b_native_tls_keepalive"] = summarize_latencies(lat_ka, ka_wall, st_ka, err_ka)
-            time.sleep(2.3)
-        finally:
-            if tsrv.poll() is None:
-                tsrv.terminate()
-                tsrv.wait(timeout=5)
+                ka_per = max(1, n_tls // c_tls)
+                lat_ka: list[float] = []
+                st_ka: Counter[int] = Counter()
+                err_ka: list[str] = []
+                t_ka0 = time.perf_counter()
+                with ThreadPoolExecutor(max_workers=c_tls) as pool:
+                    futs_ka = [pool.submit(run_ka_worker, ka_per, wi * ka_per) for wi in range(c_tls)]
+                    for fut in as_completed(futs_ka):
+                        wl, ws, we = fut.result()
+                        lat_ka.extend(wl)
+                        st_ka.update(ws)
+                        err_ka.extend(we)
+                ka_wall = time.perf_counter() - t_ka0
+                report["scenarios"]["5b_native_tls_keepalive"] = summarize_latencies(lat_ka, ka_wall, st_ka, err_ka)
+                time.sleep(2.3)
+            finally:
+                if tsrv.poll() is None:
+                    tsrv.terminate()
+                    tsrv.wait(timeout=5)
 
-        report["logs"]["tls"] = run_analyze(tls_logs)
+            report["logs"]["tls"] = run_analyze(tls_logs)
 
         # ------------------------------------------------------------------
         # Scenario 6: IP Rate Limit & Malformed TCP Flood Resilience

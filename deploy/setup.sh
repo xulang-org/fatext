@@ -15,10 +15,13 @@ fi
 
 id -u fatext >/dev/null 2>&1 || useradd --system --home /var/lib/fatext --shell /usr/sbin/nologin fatext
 
-install -d -m 0755 /opt/fatext /etc/fatext /var/lib/fatext /var/lib/fatext/dl
+install -d -m 0755 /opt/fatext /opt/fatext/deploy /opt/fatext/scripts /etc/fatext /var/lib/fatext /var/lib/fatext/dl
 cp -r "$REPO_ROOT/www" /opt/fatext/
 cp -r "$REPO_ROOT/templates" /opt/fatext/
 cp -r "$REPO_ROOT/config" /opt/fatext/
+install -m 0755 "$REPO_ROOT/deploy/backup.sh" /opt/fatext/deploy/backup.sh
+install -m 0755 "$REPO_ROOT/deploy/sync_dl.sh" /opt/fatext/deploy/sync_dl.sh
+install -m 0644 "$REPO_ROOT/scripts/analyze_logs.py" /opt/fatext/scripts/analyze_logs.py
 
 if [[ -x "$REPO_ROOT/build/fatext-server" ]]; then
   install -m 0755 "$REPO_ROOT/build/fatext-server" /usr/local/bin/fatext-server
@@ -56,12 +59,18 @@ cp /opt/fatext/config/pins.json /var/lib/fatext/pins.json
 chown -R fatext:fatext /opt/fatext /var/lib/fatext
 
 install -m 0644 "$REPO_ROOT/deploy/fatext.service" /etc/systemd/system/fatext.service
+install -m 0644 "$REPO_ROOT/deploy/fatext-backup.service" /etc/systemd/system/fatext-backup.service
+install -m 0644 "$REPO_ROOT/deploy/fatext-backup.timer" /etc/systemd/system/fatext-backup.timer
+install -m 0644 "$REPO_ROOT/deploy/fatext-log-report.service" /etc/systemd/system/fatext-log-report.service
+install -m 0644 "$REPO_ROOT/deploy/fatext-log-report.timer" /etc/systemd/system/fatext-log-report.timer
 systemctl daemon-reload
-systemctl enable fatext.service
+systemctl enable fatext.service fatext-backup.timer fatext-log-report.timer
 
 echo "Setup complete."
 echo "Next:"
 echo "  1. Issue TLS cert if not present (e.g. certbot certonly --standalone -d ${DOMAIN} -d www.${DOMAIN})"
-echo "     Ensure user 'fatext' can read FATEXT_TLS_CERT and FATEXT_TLS_KEY (or grant ACL / copy on deploy hook)."
+echo "     Add a certbot deploy-hook (e.g. /etc/letsencrypt/renewal-hooks/deploy/fatext.sh):"
+echo "       setfacl -m u:fatext:rx /etc/letsencrypt/live /etc/letsencrypt/archive && setfacl -R -m u:fatext:rX /etc/letsencrypt/live/${DOMAIN} /etc/letsencrypt/archive/${DOMAIN} && systemctl restart fatext"
 echo "  2. Run: python3 $REPO_ROOT/scripts/init_official.py --data-dir /var/lib/fatext --out-dir /etc/fatext"
-echo "  3. Start service: systemctl start fatext && systemctl status fatext"
+echo "  3. Publish signed CLI binaries: bash /opt/fatext/deploy/sync_dl.sh latest /var/lib/fatext/dl https://${DOMAIN}/k/ftx_fatextoffice.pem"
+echo "  4. Start service: systemctl start fatext fatext-backup.timer fatext-log-report.timer && systemctl status fatext"

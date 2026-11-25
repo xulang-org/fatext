@@ -40,14 +40,17 @@
 
 <h2 id="verify" class="sec-h"><span>2. Verify Checksums &amp; Official Signature</span></h2>
 <p class="help-p">Never pipe remote scripts into a shell. Always verify both the SHA-256 digest and the RSA-PSS signature from <a href="/a/ftx_fatextoffice"><code>ftx_fatextoffice</code></a> (<a href="/k/ftx_fatextoffice.pem">/k/ftx_fatextoffice.pem</a>):</p>
-<pre class="term"><span class="c"># 1. download binary, checksum manifest, signature, and official public key</span>
-<span class="p">$</span> curl -fLO https://fatext.com/dl/fatext-darwin-arm64
+<pre class="term"><span class="c"># 1. download archive (or fatext-linux-x64.tar.gz / fatext-linux-arm64.tar.gz / fatext-windows-x64.zip), manifests, and official key</span>
+<span class="p">$</span> curl -fLO https://fatext.com/dl/fatext-macos-arm64.tar.gz
 <span class="p">$</span> curl -fLO https://fatext.com/dl/SHA256SUMS
 <span class="p">$</span> curl -fLO https://fatext.com/dl/SHA256SUMS.sig
 <span class="p">$</span> curl -fsSL https://fatext.com/k/ftx_fatextoffice.pem -o official.pem
-<span class="c"># 2. verify binary checksum and RSA-PSS signature</span>
+<span class="c"># 2. verify Base64-encoded RSA-PSS signature and archive SHA-256 checksum</span>
+<span class="p">$</span> openssl base64 -d -A -in SHA256SUMS.sig -out SHA256SUMS.sig.bin
+<span class="p">$</span> openssl dgst -sha256 -verify official.pem -sigopt rsa_padding_mode:pss -sigopt rsa_pss_saltlen:32 -sigopt rsa_mgf1_md:sha256 -signature SHA256SUMS.sig.bin SHA256SUMS
 <span class="p">$</span> shasum -a 256 -c SHA256SUMS --ignore-missing
-<span class="p">$</span> openssl dgst -sha256 -verify official.pem -sigopt rsa_padding_mode:pss -sigopt rsa_pss_saltlen:32 -sigopt rsa_mgf1_md:sha256 -signature SHA256SUMS.sig SHA256SUMS</pre>
+<span class="c"># 3. extract binary and check version</span>
+<span class="p">$</span> tar -xzf fatext-macos-arm64.tar.gz &amp;&amp; ./fatext --version</pre>
 
 <h2 class="sec-h"><span>3. Or Let Your AI Agent Install It</span></h2>
 <p class="help-p">Paste this message into your AI agent (<a href="/help">Usage Help</a> · <a href="/SKILL.md">/SKILL.md</a>):</p>

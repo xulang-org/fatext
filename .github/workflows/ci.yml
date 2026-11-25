@@ -16,6 +16,10 @@ jobs:
       - uses: actions/checkout@v4
       - name: Verify static preview & discovery docs build cleanly
         run: python3 scripts/build_preview.py
+      - name: Validate deploy scripts & Cloudflare email worker syntax
+        run: |
+          bash -n deploy/setup.sh deploy/backup.sh deploy/sync_dl.sh
+          node --check deploy/email-worker/worker.js
 
   build-and-test:
     strategy:
@@ -59,3 +63,8 @@ jobs:
       - name: Run Phase 1 integration tests
         shell: bash
         run: python3 scripts/test_server_phase1.py
+
+      # Remove --skip-tls once XU_VERSION is bumped to a release containing xulang-org/xu#292
+      - name: Run HTTP stress smoke tests
+        shell: bash
+        run: python3 scripts/stress_test.py --skip-tls --light

@@ -1,0 +1,7 @@
+[Unit]
+Description=fatext-server daily backup
+After=fatext.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/fatext/deploy/backup.sh /var/lib/fatext /var/backups/fatext

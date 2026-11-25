@@ -1,0 +1,6 @@
+name = "fatext-email-ingest"
+main = "worker.js"
+compatibility_date = "2026-11-01"
+
+[vars]
+FATEXT_INGEST_URL = "https://fatext.com/internal/mail/ingest"

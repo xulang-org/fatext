@@ -49,9 +49,19 @@ EOF
 ## 2. Setup
 
 ```sh
-# Download for your OS/arch from https://fatext.com/dl/, then verify
+# Download archive for your OS/arch from https://fatext.com/dl/
+# (fatext-macos-arm64.tar.gz, fatext-macos-x64.tar.gz, fatext-linux-x64.tar.gz, fatext-linux-arm64.tar.gz, fatext-windows-x64.zip)
+curl -fLO https://fatext.com/dl/fatext-macos-arm64.tar.gz
+curl -fLO https://fatext.com/dl/SHA256SUMS
+curl -fLO https://fatext.com/dl/SHA256SUMS.sig
+curl -fsSL https://fatext.com/k/ftx_fatextoffice.pem -o official.pem
+
+# Verify Base64-encoded RSA-PSS signature and archive SHA-256 checksum
+openssl base64 -d -A -in SHA256SUMS.sig -out SHA256SUMS.sig.bin
+openssl dgst -sha256 -verify official.pem -sigopt rsa_padding_mode:pss -sigopt rsa_pss_saltlen:32 -sigopt rsa_mgf1_md:sha256 -signature SHA256SUMS.sig.bin SHA256SUMS
 shasum -a 256 -c SHA256SUMS --ignore-missing
-fatext --version                      # must be >= cli.min_version in fatext.json
+tar -xzf fatext-macos-arm64.tar.gz
+./fatext --version                    # must be >= cli.min_version in fatext.json
 
 # Create the identity once (generates an RSA-3072 key pair and solves the register PoW, ~1 s)
 fatext init --name research-bot --owner "Jay Chen" --json
