@@ -199,7 +199,7 @@ fn is_rotated_log_filename(fname string) int {
 fn cleanup_old_logs(log_dir string, today string, retain_days int) {
     if log_dir.len == 0 || retain_days <= 0 { << }
     cutoff := shift_utc_date(today + "", 0 - retain_days)
-    raw := os.read_dir(log_dir + "") >>> (err) { << }
+    raw := os.read_dir(log_dir + "") or (err) { << }
     lines := strings.split(&raw, "\n")
     for i in 0:lines.len {
         fn_s := strings.trim_space(&lines[i])
@@ -207,7 +207,7 @@ fn cleanup_old_logs(log_dir string, today string, retain_days int) {
         if pref <= 0 { -> }
         dt_part := fn_s[pref:(pref + 10)]
         if is_valid_date(dt_part + "") && strings.compare(&dt_part, &cutoff) < 0 {
-            _ := os.remove(log_dir + "/" + fn_s) >>> (err) { -> }
+            _ := os.remove(log_dir + "/" + fn_s) or (err) { -> }
         }
     }
 }

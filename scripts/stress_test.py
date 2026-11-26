@@ -348,32 +348,50 @@ def run_analyze(log_dir: Path) -> dict:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Multi-scenario stress benchmark for fatext-server.")
-    ap.add_argument("--scale", choices=("normal", "light"), default="normal")
+    ap.add_argument("--scale", choices=("normal", "light", "heavy"), default="normal")
     ap.add_argument("--light", action="store_true", help="Alias for --scale light")
+    ap.add_argument("--heavy", action="store_true", help="Alias for --scale heavy (100 SSE streams, c=48, Native TLS 1.3)")
     ap.add_argument("--skip-tls", action="store_true", help="Skip Scenario 5 native TLS 1.3 benchmark")
     ap.add_argument("--json-out", help="Write full JSON report to this path")
     args = ap.parse_args()
     if args.light:
         args.scale = "light"
+    if args.heavy:
+        args.scale = "heavy"
 
     if not SERVER_BIN.is_file():
         print(f"Missing {SERVER_BIN}; build fatext-server first.", file=sys.stderr)
         return 1
 
-    scale = 0.35 if args.scale == "light" else 1.0
-    n_health = max(100, int(600 * scale))
-    n_home = max(60, int(300 * scale))
-    n_help_dl = max(60, int(300 * scale))
-    n_key = max(80, int(400 * scale))
-    n_friends = max(60, int(240 * scale))
-    n_dm = max(60, int(240 * scale))
-    n_sse_room = max(12, int(32 * scale))
-    n_room_msgs = max(10, int(30 * scale))
-    n_sse_mixed = max(6, int(16 * scale))
-    n_mixed = max(100, int(320 * scale))
-    n_tls = max(40, int(120 * scale))
-    c_http = 24 if args.scale == "normal" else 12
-    c_tls = 12 if args.scale == "normal" else 8
+    if args.scale == "heavy":
+        n_health = 1600
+        n_home = 800
+        n_help_dl = 800
+        n_key = 1000
+        n_friends = 600
+        n_dm = 600
+        n_sse_room = 100
+        n_room_msgs = 40
+        n_sse_mixed = 32
+        n_mixed = 800
+        n_tls = 200
+        c_http = 48
+        c_tls = 16
+    else:
+        scale = 0.35 if args.scale == "light" else 1.0
+        n_health = max(100, int(600 * scale))
+        n_home = max(60, int(300 * scale))
+        n_help_dl = max(60, int(300 * scale))
+        n_key = max(80, int(400 * scale))
+        n_friends = max(60, int(240 * scale))
+        n_dm = max(60, int(240 * scale))
+        n_sse_room = max(12, int(32 * scale))
+        n_room_msgs = max(10, int(30 * scale))
+        n_sse_mixed = max(6, int(16 * scale))
+        n_mixed = max(100, int(320 * scale))
+        n_tls = max(40, int(120 * scale))
+        c_http = 24 if args.scale == "normal" else 12
+        c_tls = 12 if args.scale == "normal" else 8
 
     report: dict = {"scale": args.scale, "scenarios": {}, "rss_kb": {}, "logs": {}}
 
@@ -410,6 +428,9 @@ def main() -> int:
         srv_env["FATEXT_IP_RPM"] = "0"
         srv_env["FATEXT_LOG_DIR"] = str(http_logs)
         srv_env["FATEXT_METRICS_INTERVAL_SEC"] = "2"
+        if args.scale == "heavy":
+            srv_env["FATEXT_MAX_CONNS_PER_IP"] = "512"
+            srv_env["FATEXT_MAX_SSE_PER_AGENT"] = "32"
 
         srv = subprocess.Popen([str(SERVER_BIN)], env=srv_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
@@ -548,8 +569,8 @@ def main() -> int:
 
             t_b0 = time.perf_counter()
             s3_send = run_burst(room_tasks, port, min(8, c_http))
-            # Give reader threads up to 2s to drain all events
-            deadline = time.time() + 2.5
+            # Give reader threads up to 5s (heavy) or 2.5s to drain all events
+            deadline = time.time() + (5.0 if n_sse_room >= 64 else 2.5)
             while time.time() < deadline:
                 got = sum(c.events_by_type["room"] for c in sse_room_clients)
                 if got >= expected_deliveries:
@@ -687,6 +708,8 @@ def main() -> int:
             tls_env["FATEXT_TLS_KEY"] = str(tkey)
             tls_env["FATEXT_LOG_DIR"] = str(tls_logs)
             tls_env["FATEXT_METRICS_INTERVAL_SEC"] = "2"
+            if args.scale == "heavy":
+                tls_env["FATEXT_MAX_CONNS_PER_IP"] = "512"
 
             tsrv = subprocess.Popen([str(SERVER_BIN)], env=tls_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             try:

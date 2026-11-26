@@ -30,7 +30,7 @@ fn getenv_int_or(key string, fallback int) int {
 
 fn close_raw_fd_quiet(fd int) {
     if fd >= 0 {
-        _ := net.conn_close(fd) >>> (err) { << }
+        _ := net.conn_close(fd) or (err) { << }
     }
 }
 
@@ -122,7 +122,7 @@ fn handle_connection(fd int, req_seq int, peer_ip string, tls_on bool, tls_hs_ns
     $tls_ms := 0
     if tls_on {
         t_tls0 := time.now()
-        cc = cc_from_tls(fd, &cert_pem, &key_pem, peer_ip + "", tls_hs_ns) >>> (err) {
+        cc = cc_from_tls(fd, &cert_pem, &key_pem, peer_ip + "", tls_hs_ns) or (err) {
             tls_ms = (time.now() - t_tls0) / 1000000
             if tls_ms < 0 { tls_ms = 0 }
             jobs <- HubJob{kind: HUB_METRIC_TLS, req: empty_req(), sse_id: 0, enqueued_ns: 0, flag: 0, reply_ch: chan HubReply{cap: 1}}
@@ -354,7 +354,7 @@ fn handle_connection(fd int, req_seq int, peer_ip string, tls_on bool, tls_hs_ns
 fn handle_redirect_conn(fd int, https_host string) {
     cc_disable_sigpipe(fd)
     $cc := cc_from_tcp(fd, "127.0.0.1")
-    req := read_http_request($&cc) >>> (err) {
+    req := read_http_request($&cc) or (err) {
         cc_close($&cc)
         <<
     }
@@ -368,12 +368,12 @@ fn handle_redirect_conn(fd int, https_host string) {
 }
 
 fn redirect_loop(redir_addr string, https_host string) {
-    lfd := net.listen(redir_addr + "") >>> (err) {
+    lfd := net.listen(redir_addr + "") or (err) {
         println("fatext-server: redirect listen failed: " + err.msg())
         <<
     }
     while true {
-        fd := net.accept(lfd) >>> (err) { -> }
+        fd := net.accept(lfd) or (err) { -> }
         xu handle_redirect_conn(fd, https_host + "")
     }
 }
@@ -388,11 +388,11 @@ fn metrics_ticker_loop(interval_sec int, jobs chan HubJob) {
 }
 
 fn ignore_sigpipe_quiet() {
-    _ := signal.ignore(signal.SIGPIPE) >>> (err) { << }
+    _ := signal.ignore(signal.SIGPIPE) or (err) { << }
 }
 
 fn watch_signal_quiet(ch chan int, sig int) {
-    _ := signal.notify(ch, sig) >>> (err) { << }
+    _ := signal.notify(ch, sig) or (err) { << }
 }
 
 fn shutdown_watcher_loop(sig_ch chan int, accept_stop chan int, lfd int, drain_ms int, jobs chan HubJob, log_ch chan string, flush_done chan int) {
@@ -474,11 +474,11 @@ fn main() int {
     $cert_pem := ""
     $key_pem := ""
     if tls_cert_path.len > 0 && tls_key_path.len > 0 {
-        cert_pem = os.read(tls_cert_path + "") >>> (err) {
+        cert_pem = os.read(tls_cert_path + "") or (err) {
             println("fatext-server: failed reading FATEXT_TLS_CERT: " + err.msg())
             << 1
         }
-        key_pem = os.read(tls_key_path + "") >>> (err) {
+        key_pem = os.read(tls_key_path + "") or (err) {
             println("fatext-server: failed reading FATEXT_TLS_KEY: " + err.msg())
             << 1
         }
@@ -517,7 +517,7 @@ fn main() int {
         xu redirect_loop(redir_addr + "", "fatext.com")
     }
 
-    lfd := net.listen(addr + "") >>> (err) {
+    lfd := net.listen(addr + "") or (err) {
         println("fatext-server: listen failed: " + err.msg())
         << 1
     }
@@ -552,7 +552,7 @@ fn main() int {
             else {}
         }
         if !accept_running { -> }
-        fd := net.accept(lfd) >>> (err) {
+        fd := net.accept(lfd) or (err) {
             select {
                 _ := <-accept_stop {
                     accept_running = false

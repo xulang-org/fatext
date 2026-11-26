@@ -89,7 +89,7 @@ pub fn read_agent_doc(st &State, agent_id string, kind string) AgentDocSummary {
     if !is_valid_agent_id(agent_id + "") || !is_valid_doc_kind(kind + "") {
         << out
     }
-    raw := os.read(agent_doc_path(st, agent_id + "", kind + "")) >>> (err) { << out }
+    raw := os.read(agent_doc_path(st, agent_id + "", kind + "")) or (err) { << out }
     doc := json.parse(&raw)
     if !doc.ok() || !doc.is_dict(doc.root()) { << out }
     r := doc.root()
@@ -229,7 +229,7 @@ fn store_agent_doc(
     if !doc.has(r, "version") {
         << err_resp(400, "ERR_BAD_REQUEST", "missing version", 0, 0, 0)
     }
-    ver := doc.as_int(doc.get(r, "version")) >>> (err) {
+    ver := doc.as_int(doc.get(r, "version")) or (err) {
         << err_resp(400, "ERR_BAD_REQUEST", "version must be integer", 0, 0, 0)
     }
     expected_ver := cur.version + 1
@@ -261,7 +261,7 @@ fn store_agent_doc(
         if !doc.is_bool(doc.get(r, "locked")) {
             << err_resp(400, "ERR_BAD_REQUEST", "locked must be boolean", 0, 0, 0)
         }
-        locked = doc.as_bool(doc.get(r, "locked")) >>> (err) { << err_resp(400, "ERR_BAD_REQUEST", "invalid locked", 0, 0, 0) }
+        locked = doc.as_bool(doc.get(r, "locked")) or (err) { << err_resp(400, "ERR_BAD_REQUEST", "invalid locked", 0, 0, 0) }
     }
     if actor_type == "agent" && locked {
         << err_resp(403, "ERR_FORBIDDEN", "only owning controller can lock documents", 0, 0, 0)
@@ -278,7 +278,7 @@ fn store_agent_doc(
     if !doc.has(r, "updated_at") {
         << err_resp(400, "ERR_BAD_REQUEST", "missing updated_at", 0, 0, 0)
     }
-    uat := doc.as_int(doc.get(r, "updated_at")) >>> (err) {
+    uat := doc.as_int(doc.get(r, "updated_at")) or (err) {
         << err_resp(400, "ERR_BAD_REQUEST", "updated_at must be integer", 0, 0, 0)
     }
     diff := now - uat
@@ -301,7 +301,7 @@ fn store_agent_doc(
         if !doc.has(r, "content") || !doc.is_string(doc.get(r, "content")) {
             << err_resp(400, "ERR_BAD_REQUEST", "public doc requires string content", 0, 0, 0)
         }
-        content = doc.as_string(doc.get(r, "content")) >>> (err) {
+        content = doc.as_string(doc.get(r, "content")) or (err) {
             << err_resp(400, "ERR_BAD_REQUEST", "invalid content string", 0, 0, 0)
         }
         if content.len > DOC_MAX_PLAIN_BYTES {
@@ -324,7 +324,7 @@ fn store_agent_doc(
         if !doc.has(r, "content_bytes") {
             << err_resp(400, "ERR_BAD_REQUEST", "private doc requires content_bytes", 0, 0, 0)
         }
-        cbytes = doc.as_int(doc.get(r, "content_bytes")) >>> (err) {
+        cbytes = doc.as_int(doc.get(r, "content_bytes")) or (err) {
             << err_resp(400, "ERR_BAD_REQUEST", "content_bytes must be integer", 0, 0, 0)
         }
         if cbytes < 0 || cbytes > DOC_MAX_PLAIN_BYTES {
@@ -340,7 +340,7 @@ fn store_agent_doc(
         env_json = ec.env_json
     }
 
-    spk := parse_spki_rsa_pem(signer_pub_pem) >>> (err) {
+    spk := parse_spki_rsa_pem(signer_pub_pem) or (err) {
         << err_resp(500, "ERR_INTERNAL", "stored signer public key invalid", 0, 0, 0)
     }
     canon := canonical_doc_payload(aid + "", csha + "", kind + "", locked, signer_id + "", signer_kv, uat, ver, vis + "")
@@ -379,10 +379,10 @@ fn store_agent_doc(
         "}\n"
 
     ddir := agent_doc_dir(&hub.st, aid + "")
-    os.mkdir_all(ddir) >>> (err) {
+    os.mkdir_all(ddir) or (err) {
         << err_resp(500, "ERR_INTERNAL", "failed creating docs dir", 0, 0, 0)
     }
-    write_atomic(agent_doc_path(&hub.st, aid + "", kind + ""), &doc_json) >>> (err) {
+    write_atomic(agent_doc_path(&hub.st, aid + "", kind + ""), &doc_json) or (err) {
         << err_resp(500, "ERR_INTERNAL", "failed persisting document", 0, 0, 0)
     }
 
@@ -421,7 +421,7 @@ pub fn handle_agent_doc_get(st $&State, req &HttpReq, kind string, now int) Http
     }
     au := authenticate_scoped(st, req, now, "")
     if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
-    raw := os.read(agent_doc_path(st, au.agent_id + "", kind + "")) >>> (err) {
+    raw := os.read(agent_doc_path(st, au.agent_id + "", kind + "")) or (err) {
         << err_resp(404, "ERR_NOT_FOUND", kind + " document not found", 0, 0, 0)
     }
     << json_resp(200, raw)
@@ -451,7 +451,7 @@ pub fn handle_agent_doc_delete(hub $&HubState, req &HttpReq, kind string, now in
         << err_resp(403, "ERR_DOC_LOCKED", "document is locked by controller", 0, 0, 0)
     }
     p := agent_doc_path(&hub.st, au.agent_id + "", kind + "")
-    os.remove(p + "") >>> (err) {
+    os.remove(p + "") or (err) {
         << err_resp(500, "ERR_INTERNAL", "failed removing document", 0, 0, 0)
     }
     log_event_json(hub.log_ch, now, "doc_update",
@@ -482,7 +482,7 @@ pub fn handle_ctl_agent_doc_get(st $&State, req &HttpReq, aid string, kind strin
     ag := read_agent_summary(st, aid + "")
     if !ag.found { << err_resp(404, "ERR_NOT_FOUND", "agent not found", 0, 0, 0) }
     if ag.controller_id != au.agent_id { << err_resp(403, "ERR_FORBIDDEN", "not controller of agent", 0, 0, 0) }
-    raw := os.read(agent_doc_path(st, aid + "", kind + "")) >>> (err) {
+    raw := os.read(agent_doc_path(st, aid + "", kind + "")) or (err) {
         << err_resp(404, "ERR_NOT_FOUND", kind + " document not found", 0, 0, 0)
     }
     << json_resp(200, raw)
@@ -515,10 +515,10 @@ pub fn handle_ctl_agent_doc_delete(hub $&HubState, req &HttpReq, aid string, kin
     if ag.controller_id != au.agent_id { << err_resp(403, "ERR_FORBIDDEN", "not controller of agent", 0, 0, 0) }
     if ag.status == "revoked" { << err_resp(403, "ERR_REVOKED", "agent is permanently revoked", 0, 0, 0) }
     p := agent_doc_path(&hub.st, aid + "", kind + "")
-    _ := os.stat(p + "") >>> (err) {
+    _ := os.stat(p + "") or (err) {
         << err_resp(404, "ERR_NOT_FOUND", kind + " document not found", 0, 0, 0)
     }
-    os.remove(p + "") >>> (err) {
+    os.remove(p + "") or (err) {
         << err_resp(500, "ERR_INTERNAL", "failed removing document", 0, 0, 0)
     }
     log_event_json(hub.log_ch, now, "doc_update",

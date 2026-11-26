@@ -119,7 +119,7 @@ pub fn rewrite_agent_doc_full(
     managed_json string,
     sig_json string
 ) int {
-    if !orig_doc.ok() { >>> errors.new("corrupt original identity json") }
+    if !orig_doc.ok() { >> errors.new("corrupt original identity json") }
     doc_s := "{" +
         "\"agent_id\":" + json.quote(&aid) + "," +
         "\"created_at\":" + strconv.itoa(created_at) + "," +
@@ -135,8 +135,8 @@ pub fn rewrite_agent_doc_full(
         "\"managed_agents\":" + managed_json + "," +
         "\"signature\":" + sig_json +
         "}\n"
-    if doc_s.len > 65536 { >>> errors.new("identity document exceeds 64 KB") }
-    rc := write_atomic(agent_json_path(st, aid + ""), &doc_s) >>>
+    if doc_s.len > 65536 { >> errors.new("identity document exceeds 64 KB") }
+    rc := write_atomic(agent_json_path(st, aid + ""), &doc_s) or >>
     invalidate_agent_cache(st, aid + "")
     << rc
 }
@@ -154,9 +154,9 @@ pub fn sync_controller_agent_roster(
     expires_at int
 ) int {
     ctrl := read_agent_summary(st, controller_id + "")
-    if !ctrl.found { >>> errors.new("controller not found") }
+    if !ctrl.found { >> errors.new("controller not found") }
     cdoc := json.parse(&ctrl.raw_json)
-    if !cdoc.ok() { >>> errors.new("corrupt controller document") }
+    if !cdoc.ok() { >> errors.new("corrupt controller document") }
     cr := cdoc.root()
 
     $kh_json := "[]"
@@ -210,7 +210,7 @@ pub fn sync_controller_agent_roster(
     managed_json := "[" + strings.join(items, ",") + "]"
     << rewrite_agent_doc_full(st, &cdoc, controller_id + "", ctrl.created_at, ctrl.revision, ctrl.key_version,
         ctrl.status + "", succ_json + "", &ctrl.pub_pem, kh_json, &ctrl.name, &ctrl.bio, ctrl.updated_at,
-        ext_json, own_json, managed_json, sig_json) >>>
+        ext_json, own_json, managed_json, sig_json) or >>
 }
 
 pub struct EnrollmentCheck {
@@ -305,7 +305,7 @@ pub fn verify_and_prepare_enrollment(st $&State, doc &json.Doc, root int, agent_
     if cpem.len == 0 {
         << enroll_fail(401, "ERR_BAD_SIGNATURE", "controller_key_version not found")
     }
-    cpk := parse_spki_rsa_pem(&cpem) >>> (err) {
+    cpk := parse_spki_rsa_pem(&cpem) or (err) {
         << enroll_fail(500, "ERR_INTERNAL", "stored controller public key invalid")
     }
     canon_enr := canonical_enrollment_payload(controller_id + "", ckv, cred_id + "", expires_at, issued_at, label + "", &sr.scopes)
@@ -334,7 +334,7 @@ pub fn verify_and_prepare_enrollment(st $&State, doc &json.Doc, root int, agent_
     if now - ab_ts > 300 || ab_ts - now > 300 {
         << enroll_fail(401, "ERR_CLOCK_SKEW", "agent_binding timestamp skew exceeds 300s")
     }
-    apk := parse_spki_rsa_pem(agent_pub_pem) >>> (err) {
+    apk := parse_spki_rsa_pem(agent_pub_pem) or (err) {
         << enroll_fail(400, "ERR_BAD_REQUEST", "agent public key invalid")
     }
     canon_ab := canonical_binding_payload(ab_fp + "", ab_ctrl + "", ab_cid + "", ab_ts)
@@ -493,7 +493,7 @@ pub fn handle_ctl_grant_credential(hub $&HubState, req &HttpReq, aid string, now
 
     cpem := find_agent_pubkey_for_version(&au.agent, pl_ckv)
     if cpem.len == 0 { << err_resp(401, "ERR_BAD_SIGNATURE", "controller_key_version not found", 0, 0, 0) }
-    cpk := parse_spki_rsa_pem(&cpem) >>> (err) { << err_resp(500, "ERR_INTERNAL", "controller key invalid", 0, 0, 0) }
+    cpk := parse_spki_rsa_pem(&cpem) or (err) { << err_resp(500, "ERR_INTERNAL", "controller key invalid", 0, 0, 0) }
     canon_cert := canonical_agent_cert_payload(aid + "", pl_akv, expected_fp + "", au.agent_id + "", pl_ckv, cred_id + "", exp, iat, lbl + "", &sr.scopes)
     if !verify_pss_message(&cpk, &canon_cert, ctrl_sig + "") {
         << err_resp(401, "ERR_BAD_SIGNATURE", "agent_cert controller_sig verification failed", 0, 0, 0)
@@ -526,7 +526,7 @@ pub fn handle_ctl_grant_credential(hub $&HubState, req &HttpReq, aid string, now
         if now - ap_ts > 3600 || ap_ts - now > 3600 {
             << err_resp(401, "ERR_CLOCK_SKEW", "adoption_proof expired (>3600s)", 0, 0, 0)
         }
-        apk := parse_spki_rsa_pem(&ag.pub_pem) >>> (err) { << err_resp(500, "ERR_INTERNAL", "agent key invalid", 0, 0, 0) }
+        apk := parse_spki_rsa_pem(&ag.pub_pem) or (err) { << err_resp(500, "ERR_INTERNAL", "agent key invalid", 0, 0, 0) }
         canon_ap := canonical_adoption_payload(aid + "", expected_fp + "", au.agent_id + "", ap_ts)
         if !verify_pss_message(&apk, &canon_ap, asig + "") {
             << err_resp(401, "ERR_BAD_SIGNATURE", "adoption_proof agent_sig verification failed", 0, 0, 0)
@@ -574,11 +574,11 @@ pub fn handle_ctl_grant_credential(hub $&HubState, req &HttpReq, aid string, now
     managed_json := preserve_managed_agents_json(&odoc)
 
     rewrite_agent_doc_full($&hub.st, &odoc, aid + "", ag.created_at, ag.revision + 1, ag.key_version,
-        ag.status + "", "null", &ag.pub_pem, kh_json, &ag.name, &ag.bio, now, ext_json, ownership_json, managed_json, sig_json) >>> (err) {
+        ag.status + "", "null", &ag.pub_pem, kh_json, &ag.name, &ag.bio, now, ext_json, ownership_json, managed_json, sig_json) or (err) {
         << err_resp(500, "ERR_INTERNAL", "failed updating agent credential", 0, 0, 0)
     }
     record_credential_used($&hub.st, cred_id + "", au.agent_id + "", aid + "", "agent_cert", now)
-    sync_controller_agent_roster($&hub.st, au.agent_id + "", aid + "", cred_id + "", "agent_cert", lbl + "", &sr.scopes, next_ost + "", iat, exp) >>> (err) {
+    sync_controller_agent_roster($&hub.st, au.agent_id + "", aid + "", cred_id + "", "agent_cert", lbl + "", &sr.scopes, next_ost + "", iat, exp) or (err) {
         << err_resp(500, "ERR_INTERNAL", "failed syncing controller agent roster", 0, 0, 0)
     }
     log_event_json(hub.log_ch, now, "ctl_control",
@@ -588,10 +588,10 @@ pub fn handle_ctl_grant_credential(hub $&HubState, req &HttpReq, aid string, now
 
 fn update_managed_ownership_status(hub $&HubState, aid string, ag &AgentSummary, new_ost string, reason string, agent_status string, succ_json string, rev_by string, rev_sig string, now int) int {
     odoc := json.parse(&ag.raw_json)
-    if !odoc.ok() || !odoc.has(odoc.root(), "ownership") { >>> errors.new("missing ownership") }
+    if !odoc.ok() || !odoc.has(odoc.root(), "ownership") { >> errors.new("missing ownership") }
     oroot := odoc.root()
     on := odoc.get(oroot, "ownership")
-    if !odoc.is_dict(on) { >>> errors.new("ownership is null") }
+    if !odoc.is_dict(on) { >> errors.new("ownership is null") }
 
     pl_s := json_encode_or(&odoc, odoc.get(on, "payload"), "null")
     csig := json_str_or(&odoc, odoc.get(on, "controller_sig"), "")
@@ -633,9 +633,9 @@ fn update_managed_ownership_status(hub $&HubState, aid string, ag &AgentSummary,
     managed_json := preserve_managed_agents_json(&odoc)
 
     rewrite_agent_doc_full($&hub.st, &odoc, aid + "", ag.created_at, ag.revision + 1, ag.key_version,
-        agent_status, succ_json, &ag.pub_pem, kh_json, &ag.name, &ag.bio, now, ext_json, new_ownership, managed_json, sig_json) >>>
+        agent_status, succ_json, &ag.pub_pem, kh_json, &ag.name, &ag.bio, now, ext_json, new_ownership, managed_json, sig_json) or >>
     sync_controller_agent_roster($&hub.st, ag.controller_id + "", aid + "", ag.cred_id + "", ag.ownership_kind + "",
-        ag.ownership_label + "", &ag.cred_scopes, new_ost + "", ag.cred_issued_at, ag.cred_expires_at) >>>
+        ag.ownership_label + "", &ag.cred_scopes, new_ost + "", ag.cred_issued_at, ag.cred_expires_at) or >>
     << 0
 }
 
@@ -661,7 +661,7 @@ pub fn handle_ctl_suspend_agent(hub $&HubState, req &HttpReq, aid string, now in
         }
     }
 
-    update_managed_ownership_status(hub, aid + "", &ag, "suspended", reason + "", ag.status + "", "null", "", "", now) >>> (err) {
+    update_managed_ownership_status(hub, aid + "", &ag, "suspended", reason + "", ag.status + "", "null", "", "", now) or (err) {
         << err_resp(500, "ERR_INTERNAL", "failed suspending agent", 0, 0, 0)
     }
     hub_disconnect_agent(hub, aid + "")
@@ -679,7 +679,7 @@ pub fn handle_ctl_resume_agent(hub $&HubState, req &HttpReq, aid string, now int
     if ag.controller_id != au.agent_id { << err_resp(403, "ERR_FORBIDDEN", "not controller of agent", 0, 0, 0) }
     if ag.status == "revoked" { << err_resp(403, "ERR_REVOKED", "agent already permanently revoked", 0, 0, 0) }
 
-    update_managed_ownership_status(hub, aid + "", &ag, "active", "", ag.status + "", "null", "", "", now) >>> (err) {
+    update_managed_ownership_status(hub, aid + "", &ag, "active", "", ag.status + "", "null", "", "", now) or (err) {
         << err_resp(500, "ERR_INTERNAL", "failed resuming agent", 0, 0, 0)
     }
     log_event_json(hub.log_ch, now, "ctl_control",
@@ -723,7 +723,7 @@ pub fn handle_ctl_revoke_agent(hub $&HubState, req &HttpReq, aid string, now int
     $succ_json := "null"
     if succ_id.len > 0 { succ_json = json.quote(&succ_id) }
 
-    update_managed_ownership_status(hub, aid + "", &ag, "revoked", reason + "", "revoked", succ_json + "", au.agent_id + "", au.sig_b64 + "", now) >>> (err) {
+    update_managed_ownership_status(hub, aid + "", &ag, "revoked", reason + "", "revoked", succ_json + "", au.agent_id + "", au.sig_b64 + "", now) or (err) {
         << err_resp(500, "ERR_INTERNAL", "failed revoking managed agent", 0, 0, 0)
     }
     rev_line := "{\"agent_id\":" + json.quote(&aid) + ",\"successor_id\":" + succ_json + ",\"revoked_by\":" + json.quote(&au.agent_id) + ",\"revoked_at\":" + strconv.itoa(now) + "}"
@@ -828,7 +828,7 @@ pub fn handle_ctl_update_agent_policy(hub $&HubState, req &HttpReq, aid string, 
     own_json := preserve_ownership_json(&odoc)
     managed_json := preserve_managed_agents_json(&odoc)
     rewrite_agent_doc_full($&hub.st, &odoc, aid + "", ag.created_at, ag.revision + 1, ag.key_version,
-        ag.status + "", "null", &ag.pub_pem, kh_json, &next_name, &ag.bio, now, ext_json, own_json, managed_json, sig_json) >>> (err) {
+        ag.status + "", "null", &ag.pub_pem, kh_json, &next_name, &ag.bio, now, ext_json, own_json, managed_json, sig_json) or (err) {
         << err_resp(500, "ERR_INTERNAL", "failed updating agent policy", 0, 0, 0)
     }
     cache_set_agent_name($&hub.st, aid + "", next_name + "")

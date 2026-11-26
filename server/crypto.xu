@@ -24,44 +24,44 @@ fn oid_is_rsa(arcs &[]int) bool {
 pub fn parse_spki_rsa_pem(pem_str &string) rsa.PublicKey {
     blk := pem.decode(pem_str)
     if blk.typ != "PUBLIC KEY" || blk.bytes.len == 0 {
-        >>> errors.new("crypto: expected PUBLIC KEY PEM")
+        >> errors.new("crypto: expected PUBLIC KEY PEM")
     }
-    spki := asn1.unmarshal(&blk.bytes) >>>
+    spki := asn1.unmarshal(&blk.bytes) or >>
     if spki.tag != asn1.TAG_SEQUENCE {
-        >>> errors.new("crypto: invalid SPKI sequence")
+        >> errors.new("crypto: invalid SPKI sequence")
     }
     $d := asn1.new_decoder(&spki.bytes)
-    alg := d.next() >>>
-    keyv := d.next() >>>
+    alg := d.next() or >>
+    keyv := d.next() or >>
     if alg.tag != asn1.TAG_SEQUENCE {
-        >>> errors.new("crypto: invalid SPKI algorithm")
+        >> errors.new("crypto: invalid SPKI algorithm")
     }
     $ad := asn1.new_decoder(&alg.bytes)
-    oidv := ad.next() >>>
-    arcs := oidv.as_oid() >>>
+    oidv := ad.next() or >>
+    arcs := oidv.as_oid() or >>
     if !oid_is_rsa(&arcs) {
-        >>> errors.new("crypto: public key must be RSA")
+        >> errors.new("crypto: public key must be RSA")
     }
-    bits := keyv.as_bit_string() >>>
-    rseq := asn1.unmarshal(&bits) >>>
+    bits := keyv.as_bit_string() or >>
+    rseq := asn1.unmarshal(&bits) or >>
     if rseq.tag != asn1.TAG_SEQUENCE {
-        >>> errors.new("crypto: invalid RSAPublicKey sequence")
+        >> errors.new("crypto: invalid RSAPublicKey sequence")
     }
     $rd := asn1.new_decoder(&rseq.bytes)
-    nv := rd.next() >>>
-    ev := rd.next() >>>
+    nv := rd.next() or >>
+    ev := rd.next() or >>
     if nv.tag != asn1.TAG_INTEGER || ev.tag != asn1.TAG_INTEGER {
-        >>> errors.new("crypto: invalid RSA integers")
+        >> errors.new("crypto: invalid RSA integers")
     }
     $n := big.new_int(0)
     n.set_bytes(nv.bytes + "")
-    e := ev.as_int() >>>
+    e := ev.as_int() or >>
     if e != 65537 {
-        >>> errors.new("crypto: RSA public exponent must be 65537")
+        >> errors.new("crypto: RSA public exponent must be 65537")
     }
     nbits := n.bit_len()
     if nbits < 2048 || nbits > 4096 {
-        >>> errors.new("crypto: RSA key size must be 2048..4096 bits")
+        >> errors.new("crypto: RSA key size must be 2048..4096 bits")
     }
     << rsa.PublicKey{n: n, e: e}
 }
@@ -69,9 +69,9 @@ pub fn parse_spki_rsa_pem(pem_str &string) rsa.PublicKey {
 pub fn verify_pss_message(pk &rsa.PublicKey, msg &string, sig_b64 string) bool {
     trimmed := strings.trim_space(&sig_b64)
     if trimmed.len == 0 { << false }
-    sig := base64.decode_string(trimmed) >>> (err) { << false }
+    sig := base64.decode_string(trimmed) or (err) { << false }
     hashed := sha256.sum256_bytes(msg + "")
-    rc := oaep.verify_pss(pk, rsa.SHA256, &hashed, &sig) >>> (err) { << false }
+    rc := oaep.verify_pss(pk, rsa.SHA256, &hashed, &sig) or (err) { << false }
     << rc == 0
 }
 
@@ -127,7 +127,7 @@ pub fn verify_pow_post(agent_id string, ts string, nonce string, bits int) bool 
 
 pub fn generate_agent_id() string {
     alphabet := "abcdefghijklmnopqrstuvwxyz0123456789"
-    rnd := rand.read(12) >>>
+    rnd := rand.read(12) or >>
     $out := "ftx_"
     for i in 0:12 {
         idx := (rnd[i] & 255) % 36
@@ -151,7 +151,7 @@ pub fn normalize_pem(pem_str &string) string {
 pub fn new_ulid() string {
     b32 := "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
     ms := time.now_time().unix_milli()
-    rnd := rand.read(10) >>>
+    rnd := rand.read(10) or >>
     $out := ""
     // 48-bit timestamp in 10 Crockford base32 characters (2 leading zero bits)
     $shift := 45
@@ -178,13 +178,13 @@ pub fn new_ulid() string {
 }
 
 pub fn encrypt_mail_envelope(to_id string, mail_id string, to_key_ver int, to_pk &rsa.PublicKey, plaintext &string) string {
-    cek := rand.read(32) >>>
-    iv := rand.read(12) >>>
+    cek := rand.read(32) or >>
+    iv := rand.read(12) or >>
     empty_lbl := ""
-    ek := oaep.encrypt_oaep(to_pk, rsa.SHA256, &cek, &empty_lbl) >>>
-    ciph := aes.new_cipher(&cek) >>>
+    ek := oaep.encrypt_oaep(to_pk, rsa.SHA256, &cek, &empty_lbl) or >>
+    ciph := aes.new_cipher(&cek) or >>
     aad := "fatext-mail\n" + to_id + "\n" + mail_id + "\n" + strconv.itoa(to_key_ver)
-    ct := cipher.seal_gcm(&ciph, &iv, plaintext, &aad) >>>
+    ct := cipher.seal_gcm(&ciph, &iv, plaintext, &aad) or >>
     ek_b64 := base64.encode_to_string(ek)
     iv_b64 := base64.encode_to_string(iv)
     ct_b64 := base64.encode_to_string(ct)

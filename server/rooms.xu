@@ -153,7 +153,7 @@ fn load_room_data(st &State, room_id string) RoomData {
         cached := str_map_get_or(&st.room_raw_cache, room_id + "", "")
         << parse_room_raw(room_id + "", &cached)
     }
-    raw := os.read(room_path(st, room_id + "")) >>> (err) { << empty_room_data() }
+    raw := os.read(room_path(st, room_id + "")) or (err) { << empty_room_data() }
     << parse_room_raw(room_id + "", &raw)
 }
 
@@ -162,7 +162,7 @@ fn load_room_data_cached(st $&State, room_id string) RoomData {
         cached := str_map_get_or(&st.room_raw_cache, room_id + "", "")
         << parse_room_raw(room_id + "", &cached)
     }
-    raw := os.read(room_path(st, room_id + "")) >>> (err) { << empty_room_data() }
+    raw := os.read(room_path(st, room_id + "")) or (err) { << empty_room_data() }
     rd := parse_room_raw(room_id + "", &raw)
     if rd.found {
         str_map_set($&st.room_raw_cache, room_id + "", raw)
@@ -214,14 +214,14 @@ fn serialize_room_json(rd &RoomData, viewer_id string, include_banned bool) stri
 fn save_room_data(st $&State, rd &RoomData) int {
     mkdir_all_quiet(st.data_dir + "/rooms/" + room_bucket(rd.room_id + ""))
     body := serialize_room_json(rd, rd.owner_id + "", true) + "\n"
-    rc := write_atomic(room_path(st, rd.room_id + ""), &body) >>>
+    rc := write_atomic(room_path(st, rd.room_id + ""), &body) or >>
     str_map_set($&st.room_raw_cache, rd.room_id + "", body)
     << rc
 }
 
 fn load_room_keybox(st &State, rid string) []RoomKeyBoxEntry {
     $out := []RoomKeyBoxEntry{}
-    raw := os.read(room_keybox_path(st, rid + "")) >>> (err) { << out }
+    raw := os.read(room_keybox_path(st, rid + "")) or (err) { << out }
     doc := json.parse(&raw)
     if !doc.ok() || !doc.is_dict(doc.root()) { << out }
     r := doc.root()
@@ -245,7 +245,7 @@ fn load_room_keybox(st &State, rid string) []RoomKeyBoxEntry {
 fn save_room_keybox(st &State, rid string, entries &[]RoomKeyBoxEntry) {
     p := room_keybox_path(st, rid + "")
     if entries.len == 0 {
-        os.remove(p) >>> (err) { << }
+        os.remove(p) or (err) { << }
         <<
     }
     mkdir_all_quiet(st.data_dir + "/rooms/" + room_bucket(rid + ""))
@@ -295,12 +295,12 @@ fn remove_room_keybox_entry(st &State, rid string, target_id string) {
 }
 
 fn delete_room_keybox_file(st &State, rid string) {
-    os.remove(room_keybox_path(st, rid + "")) >>> (err) { << }
+    os.remove(room_keybox_path(st, rid + "")) or (err) { << }
 }
 
 fn load_agent_room_ids(st &State, aid string) []string {
     $out := []string{}
-    raw := os.read(agent_rooms_path(st, aid + "")) >>> (err) { << out }
+    raw := os.read(agent_rooms_path(st, aid + "")) or (err) { << out }
     doc := json.parse(&raw)
     if !doc.ok() || !doc.is_dict(doc.root()) { << out }
     r := doc.root()
@@ -446,7 +446,7 @@ fn handle_room_create(hub $&HubState, req &HttpReq, now int) HttpResp {
         members: [RoomMember{agent_id: au.agent_id + "", role: "owner", muted: false, joined_at: now}],
         banned: []string{}
     }
-    save_room_data($&hub.st, &rd) >>> (err) {
+    save_room_data($&hub.st, &rd) or (err) {
         << err_resp(500, "ERR_INTERNAL", "failed saving room", 0, 0, 0)
     }
     add_agent_room_index(&hub.st, au.agent_id + "", rid + "")
@@ -548,7 +548,7 @@ fn handle_room_patch(hub $&HubState, req &HttpReq, rid string, now int) HttpResp
     }
 
     rd.updated_at = now
-    save_room_data($&hub.st, &rd) >>> (err) {
+    save_room_data($&hub.st, &rd) or (err) {
         << err_resp(500, "ERR_INTERNAL", "failed saving room", 0, 0, 0)
     }
     emit_room_event(hub, &rd, "room_updated", au.agent_id + "", "", "")
@@ -632,7 +632,7 @@ fn handle_room_add_member(hub $&HubState, req &HttpReq, rid string, now int) Htt
 
     rd.members.push(RoomMember{agent_id: tgt + "", role: trole + "", muted: false, joined_at: now})
     rd.updated_at = now
-    save_room_data($&hub.st, &rd) >>> (err) {
+    save_room_data($&hub.st, &rd) or (err) {
         << err_resp(500, "ERR_INTERNAL", "failed saving room", 0, 0, 0)
     }
     add_agent_room_index(&hub.st, tgt + "", rid + "")
@@ -699,7 +699,7 @@ fn handle_room_patch_member(hub $&HubState, req &HttpReq, rid string, aid string
     }
 
     rd.updated_at = now
-    save_room_data($&hub.st, &rd) >>> (err) {
+    save_room_data($&hub.st, &rd) or (err) {
         << err_resp(500, "ERR_INTERNAL", "failed saving room", 0, 0, 0)
     }
     $ms := "false"
@@ -760,7 +760,7 @@ fn handle_room_kick_or_ban(hub $&HubState, req &HttpReq, rid string, aid string,
         rd.epoch += 1
     }
     rd.updated_at = now
-    save_room_data($&hub.st, &rd) >>> (err) {
+    save_room_data($&hub.st, &rd) or (err) {
         << err_resp(500, "ERR_INTERNAL", "failed saving room", 0, 0, 0)
     }
     remove_agent_room_index(&hub.st, aid + "", rid + "")
@@ -806,7 +806,7 @@ fn handle_room_unban(hub $&HubState, req &HttpReq, rid string, aid string, now i
     }
     rd.banned = next_ban
     rd.updated_at = now
-    save_room_data($&hub.st, &rd) >>> (err) {
+    save_room_data($&hub.st, &rd) or (err) {
         << err_resp(500, "ERR_INTERNAL", "failed saving room", 0, 0, 0)
     }
     log_event_json(hub.log_ch, now, "room_unban", "\"room_id\":" + json.quote(&rid) + ",\"actor\":" + json.quote(&au.agent_id) + ",\"target\":" + json.quote(&aid))
@@ -843,7 +843,7 @@ fn handle_room_rekey(hub $&HubState, req &HttpReq, rid string, now int) HttpResp
     }
     rd.epoch = target_ep
     rd.updated_at = now
-    save_room_data($&hub.st, &rd) >>> (err) {
+    save_room_data($&hub.st, &rd) or (err) {
         << err_resp(500, "ERR_INTERNAL", "failed saving room", 0, 0, 0)
     }
 
@@ -904,7 +904,7 @@ fn handle_room_transfer(hub $&HubState, req &HttpReq, rid string, now int) HttpR
     rd.members[nidx].role = "owner"
     rd.owner_id = new_owner + ""
     rd.updated_at = now
-    save_room_data($&hub.st, &rd) >>> (err) {
+    save_room_data($&hub.st, &rd) or (err) {
         << err_resp(500, "ERR_INTERNAL", "failed saving room", 0, 0, 0)
     }
     emit_room_event(hub, &rd, "owner_transferred", au.agent_id + "", "\"new_owner\":" + json.quote(&new_owner), "")
@@ -933,7 +933,7 @@ fn handle_room_leave(hub $&HubState, req &HttpReq, rid string, now int) HttpResp
     }
     rd.members = next_members
     rd.updated_at = now
-    save_room_data($&hub.st, &rd) >>> (err) {
+    save_room_data($&hub.st, &rd) or (err) {
         << err_resp(500, "ERR_INTERNAL", "failed saving room", 0, 0, 0)
     }
     remove_agent_room_index(&hub.st, au.agent_id + "", rid + "")
@@ -953,7 +953,7 @@ fn handle_room_close(hub $&HubState, req &HttpReq, rid string, now int) HttpResp
     }
     rd.status = "closed"
     rd.updated_at = now
-    save_room_data($&hub.st, &rd) >>> (err) {
+    save_room_data($&hub.st, &rd) or (err) {
         << err_resp(500, "ERR_INTERNAL", "failed saving room", 0, 0, 0)
     }
     for i in 0:rd.members.len {

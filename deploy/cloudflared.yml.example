@@ -7,6 +7,9 @@ credentials-file: /etc/cloudflared/fatext-tunnel.json
 
 ingress:
   - hostname: fatext.com
+    path: ^/internal/
+    service: http_status:403
+  - hostname: fatext.com
     service: http://127.0.0.1:8080
     originRequest:
       noHappyEyeballs: true

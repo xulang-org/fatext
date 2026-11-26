@@ -7,7 +7,7 @@ on:
     branches: [main]
 
 env:
-  XU_VERSION: v0.14.0
+  XU_VERSION: v0.14.1
 
 jobs:
   preview-check:
@@ -18,7 +18,7 @@ jobs:
         run: python3 scripts/build_preview.py
       - name: Validate deploy scripts & Cloudflare email worker syntax
         run: |
-          bash -n deploy/setup.sh deploy/backup.sh deploy/sync_dl.sh
+          bash -n deploy/setup.sh deploy/backup.sh deploy/restore.sh deploy/graceful_stop.sh deploy/sync_dl.sh
           node --check deploy/email-worker/worker.js
 
   build-and-test:
@@ -28,13 +28,13 @@ jobs:
         include:
           - target: linux-x64
             os: ubuntu-24.04
-            asset: xu-v0.14.0-linux-x64.tar.gz
+            asset: xu-v0.14.1-linux-x64.tar.gz
           - target: linux-arm64
             os: ubuntu-24.04-arm
-            asset: xu-v0.14.0-linux-arm64.tar.gz
+            asset: xu-v0.14.1-linux-arm64.tar.gz
           - target: macos-arm64
             os: macos-14
-            asset: xu-v0.14.0-macos-arm64.tar.gz
+            asset: xu-v0.14.1-macos-arm64.tar.gz
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -60,11 +60,12 @@ jobs:
             codesign -fs - build/fatext-server
           fi
 
-      - name: Run Phase 1 integration tests
+      - name: Run Phase 1 & Logging integration tests
         shell: bash
-        run: python3 scripts/test_server_phase1.py
+        run: |
+          python3 scripts/test_server_phase1.py
+          python3 scripts/test_logging.py
 
-      # Remove --skip-tls once XU_VERSION is bumped to a release containing xulang-org/xu#292
-      - name: Run HTTP stress smoke tests
+      - name: Run HTTP + Native TLS 1.3 stress smoke tests
         shell: bash
-        run: python3 scripts/stress_test.py --skip-tls --light
+        run: python3 scripts/stress_test.py --light

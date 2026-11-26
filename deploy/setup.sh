@@ -15,11 +15,13 @@ fi
 
 id -u fatext >/dev/null 2>&1 || useradd --system --home /var/lib/fatext --shell /usr/sbin/nologin fatext
 
-install -d -m 0755 /opt/fatext /opt/fatext/deploy /opt/fatext/scripts /etc/fatext /var/lib/fatext /var/lib/fatext/dl
+install -d -m 0755 /opt/fatext /opt/fatext/deploy /opt/fatext/scripts /etc/fatext /var/lib/fatext /var/lib/fatext/dl /var/lib/fatext/public
 cp -r "$REPO_ROOT/www" /opt/fatext/
 cp -r "$REPO_ROOT/templates" /opt/fatext/
 cp -r "$REPO_ROOT/config" /opt/fatext/
 install -m 0755 "$REPO_ROOT/deploy/backup.sh" /opt/fatext/deploy/backup.sh
+install -m 0755 "$REPO_ROOT/deploy/restore.sh" /opt/fatext/deploy/restore.sh
+install -m 0755 "$REPO_ROOT/deploy/graceful_stop.sh" /opt/fatext/deploy/graceful_stop.sh
 install -m 0755 "$REPO_ROOT/deploy/sync_dl.sh" /opt/fatext/deploy/sync_dl.sh
 install -m 0644 "$REPO_ROOT/scripts/analyze_logs.py" /opt/fatext/scripts/analyze_logs.py
 
@@ -31,6 +33,7 @@ fi
 
 if [[ ! -f /etc/fatext/fatext.env ]]; then
   SECRET="$(openssl rand -hex 32)"
+  SHUTDOWN_SECRET="$(openssl rand -hex 32)"
   cat >/etc/fatext/fatext.env <<EOF
 FATEXT_ADDR=0.0.0.0:443
 FATEXT_HTTP_REDIRECT_ADDR=0.0.0.0:80
@@ -44,6 +47,9 @@ FATEXT_POW_BITS=20
 FATEXT_IP_RPM=600
 FATEXT_MAX_CONNS=4096
 FATEXT_MAX_CONNS_PER_IP=64
+FATEXT_MAX_SSE=2048
+FATEXT_MAX_SSE_PER_AGENT=8
+FATEXT_DRAIN_MS=300
 FATEXT_TLS_HANDSHAKE_MS=5000
 FATEXT_LOG_DIR=/var/lib/fatext/logs
 FATEXT_LOG_RETENTION_DAYS=30
@@ -52,13 +58,14 @@ FATEXT_METRICS_INTERVAL_SEC=60
 FATEXT_LOG_STDOUT=1
 FATEXT_TRUST_PROXY=0
 FATEXT_MAIL_INTERNAL_SECRET=${SECRET}
+FATEXT_SHUTDOWN_SECRET=${SHUTDOWN_SECRET}
 EOF
   chmod 0600 /etc/fatext/fatext.env
-  echo "Created /etc/fatext/fatext.env (generated FATEXT_MAIL_INTERNAL_SECRET)."
+  echo "Created /etc/fatext/fatext.env (generated FATEXT_MAIL_INTERNAL_SECRET & FATEXT_SHUTDOWN_SECRET)."
 fi
 
-cp /opt/fatext/config/channels.json /var/lib/fatext/channels.json
-cp /opt/fatext/config/pins.json /var/lib/fatext/pins.json
+cp /opt/fatext/config/channels.json /var/lib/fatext/public/channels.json
+cp /opt/fatext/config/pins.json /var/lib/fatext/public/pins.json
 chown -R fatext:fatext /opt/fatext /var/lib/fatext
 
 install -m 0644 "$REPO_ROOT/deploy/fatext.service" /etc/systemd/system/fatext.service

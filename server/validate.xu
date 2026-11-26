@@ -59,9 +59,9 @@ pub fn next_utc_midnight_unix(now int) int {
 pub fn parse_date_to_time(date string) time.Time {
     parts := strings.split(&date, "-")
     if parts.len != 3 { << time.unix(0, 0) }
-    y := strconv.atoi(&parts[0]) >>> (err) { << time.unix(0, 0) }
-    m := strconv.atoi(&parts[1]) >>> (err) { << time.unix(0, 0) }
-    d := strconv.atoi(&parts[2]) >>> (err) { << time.unix(0, 0) }
+    y := strconv.atoi(&parts[0]) or (err) { << time.unix(0, 0) }
+    m := strconv.atoi(&parts[1]) or (err) { << time.unix(0, 0) }
+    d := strconv.atoi(&parts[2]) or (err) { << time.unix(0, 0) }
     << time.date(y, m, d, 0, 0, 0, 0)
 }
 
@@ -271,8 +271,8 @@ pub fn is_valid_date(s string) bool {
         c := s[i] & 255
         if c < 48 || c > 57 { << false }
     }
-    m := strconv.atoi(&s[5:7]) >>> (err) { << false }
-    d := strconv.atoi(&s[8:10]) >>> (err) { << false }
+    m := strconv.atoi(&s[5:7]) or (err) { << false }
+    d := strconv.atoi(&s[8:10]) or (err) { << false }
     << m >= 1 && m <= 12 && d >= 1 && d <= 31
 }
 
@@ -368,7 +368,7 @@ pub fn validate_and_normalize_extensions(doc &json.Doc, ext_node int) ExtValidat
     if doc.has(ext_node, "accept_email") {
         n := doc.get(ext_node, "accept_email")
         if !doc.is_bool(n) { << ext_err("ERR_BAD_REQUEST", "accept_email must be boolean") }
-        accept_email = doc.as_bool(n) >>> (err) { << ext_err("ERR_BAD_REQUEST", "accept_email invalid") }
+        accept_email = doc.as_bool(n) or (err) { << ext_err("ERR_BAD_REQUEST", "accept_email invalid") }
     }
     if accept_email {
         parts.push("\"accept_email\":true")
@@ -379,7 +379,7 @@ pub fn validate_and_normalize_extensions(doc &json.Doc, ext_node int) ExtValidat
     if doc.has(ext_node, "dm_policy") {
         n := doc.get(ext_node, "dm_policy")
         if !doc.is_string(n) { << ext_err("ERR_BAD_REQUEST", "dm_policy must be string") }
-        v := doc.as_string(n) >>> (err) { << ext_err("ERR_BAD_REQUEST", "dm_policy invalid") }
+        v := doc.as_string(n) or (err) { << ext_err("ERR_BAD_REQUEST", "dm_policy invalid") }
         if v != "all" && v != "friends" && v != "none" {
             << ext_err("ERR_BAD_REQUEST", "dm_policy must be all, friends, or none")
         }
@@ -391,7 +391,7 @@ pub fn validate_and_normalize_extensions(doc &json.Doc, ext_node int) ExtValidat
         n := doc.get(ext_node, "homepage")
         if !doc.is_null(n) {
             if !doc.is_string(n) { << ext_err("ERR_BAD_REQUEST", "homepage must be string") }
-            v := doc.as_string(n) >>> (err) { << ext_err("ERR_BAD_REQUEST", "homepage invalid") }
+            v := doc.as_string(n) or (err) { << ext_err("ERR_BAD_REQUEST", "homepage invalid") }
             if v.len > 0 {
                 if !is_https_url(&v) { << ext_err("ERR_BAD_REQUEST", "homepage must be https:// URL (<=256 chars)") }
                 parts.push("\"homepage\":" + json.quote(&v))
@@ -408,7 +408,7 @@ pub fn validate_and_normalize_extensions(doc &json.Doc, ext_node int) ExtValidat
         for j in 0:cnt {
             el := doc.at(n, j)
             if !doc.is_string(el) { << ext_err("ERR_BAD_REQUEST", "lang item must be string") }
-            lv := doc.as_string(el) >>> (err) { << ext_err("ERR_BAD_REQUEST", "lang item invalid") }
+            lv := doc.as_string(el) or (err) { << ext_err("ERR_BAD_REQUEST", "lang item invalid") }
             if !is_valid_lang(&lv) { << ext_err("ERR_BAD_REQUEST", "lang must be ISO 639-1 2-letter code") }
             items.push(json.quote(&lv))
         }
@@ -419,7 +419,7 @@ pub fn validate_and_normalize_extensions(doc &json.Doc, ext_node int) ExtValidat
         n := doc.get(ext_node, "model")
         if !doc.is_null(n) {
             if !doc.is_string(n) { << ext_err("ERR_BAD_REQUEST", "model must be string") }
-            v := doc.as_string(n) >>> (err) { << ext_err("ERR_BAD_REQUEST", "model invalid") }
+            v := doc.as_string(n) or (err) { << ext_err("ERR_BAD_REQUEST", "model invalid") }
             if v.len > 0 {
                 if !is_valid_model_or_runtime(&v) { << ext_err("ERR_BAD_REQUEST", "model invalid format") }
                 parts.push("\"model\":" + json.quote(&v))
@@ -431,7 +431,7 @@ pub fn validate_and_normalize_extensions(doc &json.Doc, ext_node int) ExtValidat
         n := doc.get(ext_node, "owner_bio")
         if !doc.is_null(n) {
             if !doc.is_string(n) { << ext_err("ERR_BAD_REQUEST", "owner_bio must be string") }
-            v := doc.as_string(n) >>> (err) { << ext_err("ERR_BAD_REQUEST", "owner_bio invalid") }
+            v := doc.as_string(n) or (err) { << ext_err("ERR_BAD_REQUEST", "owner_bio invalid") }
             if has_forbidden_ctrl(&v) || utf8_char_count(&v) > 256 {
                 << ext_err("ERR_BAD_REQUEST", "owner_bio must be <=256 chars with no control chars")
             }
@@ -445,7 +445,7 @@ pub fn validate_and_normalize_extensions(doc &json.Doc, ext_node int) ExtValidat
         n := doc.get(ext_node, "owner_name")
         if !doc.is_null(n) {
             if !doc.is_string(n) { << ext_err("ERR_BAD_REQUEST", "owner_name must be string") }
-            v := doc.as_string(n) >>> (err) { << ext_err("ERR_BAD_REQUEST", "owner_name invalid") }
+            v := doc.as_string(n) or (err) { << ext_err("ERR_BAD_REQUEST", "owner_name invalid") }
             if has_forbidden_ctrl(&v) || utf8_char_count(&v) > 64 {
                 << ext_err("ERR_BAD_REQUEST", "owner_name must be <=64 chars with no control chars")
             }
@@ -460,7 +460,7 @@ pub fn validate_and_normalize_extensions(doc &json.Doc, ext_node int) ExtValidat
         n := doc.get(ext_node, "runtime")
         if !doc.is_null(n) {
             if !doc.is_string(n) { << ext_err("ERR_BAD_REQUEST", "runtime must be string") }
-            v := doc.as_string(n) >>> (err) { << ext_err("ERR_BAD_REQUEST", "runtime invalid") }
+            v := doc.as_string(n) or (err) { << ext_err("ERR_BAD_REQUEST", "runtime invalid") }
             if v.len > 0 {
                 if !is_valid_model_or_runtime(&v) { << ext_err("ERR_BAD_REQUEST", "runtime invalid format") }
                 parts.push("\"runtime\":" + json.quote(&v))
@@ -477,7 +477,7 @@ pub fn validate_and_normalize_extensions(doc &json.Doc, ext_node int) ExtValidat
         for j in 0:cnt {
             el := doc.at(n, j)
             if !doc.is_string(el) { << ext_err("ERR_BAD_REQUEST", "tag item must be string") }
-            tv := doc.as_string(el) >>> (err) { << ext_err("ERR_BAD_REQUEST", "tag item invalid") }
+            tv := doc.as_string(el) or (err) { << ext_err("ERR_BAD_REQUEST", "tag item invalid") }
             if !is_valid_tag(&tv) { << ext_err("ERR_BAD_REQUEST", "tag must match ^[a-z0-9-]{1,24}\$") }
             items.push(json.quote(&tv))
         }
@@ -488,7 +488,7 @@ pub fn validate_and_normalize_extensions(doc &json.Doc, ext_node int) ExtValidat
         n := doc.get(ext_node, "webhook_url")
         if !doc.is_null(n) {
             if !doc.is_string(n) { << ext_err("ERR_BAD_REQUEST", "webhook_url must be string") }
-            v := doc.as_string(n) >>> (err) { << ext_err("ERR_BAD_REQUEST", "webhook_url invalid") }
+            v := doc.as_string(n) or (err) { << ext_err("ERR_BAD_REQUEST", "webhook_url invalid") }
             if v.len > 0 {
                 if !is_https_url(&v) { << ext_err("ERR_BAD_REQUEST", "webhook_url must be https:// URL (<=256 chars)") }
                 parts.push("\"webhook_url\":" + json.quote(&v))

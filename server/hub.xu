@@ -272,19 +272,19 @@ fn hex_val(c int) int {
 fn run_mail_gc_pass(data_dir string, now int) int {
     $deleted := 0
     mail_root := data_dir + "/mail"
-    buckets := os.read_dir(mail_root + "") >>> (err) { << 0 }
+    buckets := os.read_dir(mail_root + "") or (err) { << 0 }
     blines := strings.split(&buckets, "\n")
     for bi in 0:blines.len {
         b := strings.trim_space(&blines[bi])
         if b.len != 2 { -> }
         bdir := mail_root + "/" + b
-        agents := os.read_dir(bdir + "") >>> (err) { -> }
+        agents := os.read_dir(bdir + "") or (err) { -> }
         alines := strings.split(&agents, "\n")
         for ai in 0:alines.len {
             aid := strings.trim_space(&alines[ai])
             if !is_valid_agent_id(aid + "") { -> }
             adir := bdir + "/" + aid
-            files := os.read_dir(adir + "") >>> (err) { -> }
+            files := os.read_dir(adir + "") or (err) { -> }
             flines := strings.split(&files, "\n")
             for fi in 0:flines.len {
                 fn_s := strings.trim_space(&flines[fi])
@@ -295,7 +295,7 @@ fn run_mail_gc_pass(data_dir string, now int) int {
                 if doc.ok() && doc.has(doc.root(), "received_at") {
                     rat := json_int_or(&doc, doc.get(doc.root(), "received_at"), 0)
                     if rat > 0 && now - rat > MAIL_TTL_SEC {
-                        _ := os.remove(fpath + "") >>> (err) { -> }
+                        _ := os.remove(fpath + "") or (err) { -> }
                         deleted += 1
                     }
                 }

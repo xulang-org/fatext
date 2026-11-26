@@ -55,7 +55,7 @@ pub fn authenticate(st $&State, req &HttpReq, now int) AuthOutcome {
     if !is_valid_agent_id(aid + "") {
         << auth_fail(401, "ERR_UNKNOWN_AGENT", "invalid agent_id format")
     }
-    ts := strconv.atoi(&ts_str) >>> (err) {
+    ts := strconv.atoi(&ts_str) or (err) {
         << auth_fail(401, "ERR_CLOCK_SKEW", "invalid X-Timestamp")
     }
     diff := now - ts
@@ -145,7 +145,7 @@ pub fn handle_register(st $&State, req &HttpReq, now int) HttpResp {
     if pow_nonce.len == 0 {
         << err_resp(400, "ERR_POW_REQUIRED", "X-PoW-Nonce required for registration", 0, 0, st.pow_bits)
     }
-    ts := strconv.atoi(&ts_str) >>> (err) {
+    ts := strconv.atoi(&ts_str) or (err) {
         << err_resp(401, "ERR_CLOCK_SKEW", "invalid X-Timestamp", 0, 0, 0)
     }
     diff := now - ts
@@ -167,7 +167,7 @@ pub fn handle_register(st $&State, req &HttpReq, now int) HttpResp {
     if !doc.is_dict(r) || !doc.has(r, "public_key_pem") {
         << err_resp(400, "ERR_BAD_REQUEST", "missing public_key_pem", 0, 0, 0)
     }
-    raw_pem := doc.as_string(doc.get(r, "public_key_pem")) >>> (err) {
+    raw_pem := doc.as_string(doc.get(r, "public_key_pem")) or (err) {
         << err_resp(400, "ERR_BAD_REQUEST", "public_key_pem must be string", 0, 0, 0)
     }
 
@@ -178,7 +178,7 @@ pub fn handle_register(st $&State, req &HttpReq, now int) HttpResp {
     }
 
     norm_pem := normalize_pem(&raw_pem)
-    pk := parse_spki_rsa_pem(&norm_pem) >>> (err) {
+    pk := parse_spki_rsa_pem(&norm_pem) or (err) {
         << err_resp(400, "ERR_BAD_REQUEST", err.msg(), 0, 0, 0)
     }
     if !verify_request_sig(&pk, "POST", req.path(), ts_str + "", &body, sig_b64 + "") {
@@ -192,7 +192,7 @@ pub fn handle_register(st $&State, req &HttpReq, now int) HttpResp {
     $init_name := ""
     $init_bio := ""
     if doc.has(r, "name") && !doc.is_null(doc.get(r, "name")) {
-        nv := doc.as_string(doc.get(r, "name")) >>> (err) {
+        nv := doc.as_string(doc.get(r, "name")) or (err) {
             << err_resp(400, "ERR_BAD_REQUEST", "name must be string", 0, 0, 0)
         }
         if has_forbidden_ctrl(&nv) || utf8_char_count(&nv) > 32 {
@@ -201,7 +201,7 @@ pub fn handle_register(st $&State, req &HttpReq, now int) HttpResp {
         init_name = nv
     }
     if doc.has(r, "bio") && !doc.is_null(doc.get(r, "bio")) {
-        bv := doc.as_string(doc.get(r, "bio")) >>> (err) {
+        bv := doc.as_string(doc.get(r, "bio")) or (err) {
             << err_resp(400, "ERR_BAD_REQUEST", "bio must be string", 0, 0, 0)
         }
         if has_forbidden_ctrl(&bv) || utf8_char_count(&bv) > 256 {
@@ -215,7 +215,7 @@ pub fn handle_register(st $&State, req &HttpReq, now int) HttpResp {
             << err_resp(400, "ERR_BAD_REQUEST", "profile must be JSON object", 0, 0, 0)
         }
         if doc.has(pn, "name") && !doc.is_null(doc.get(pn, "name")) {
-            nv := doc.as_string(doc.get(pn, "name")) >>> (err) {
+            nv := doc.as_string(doc.get(pn, "name")) or (err) {
                 << err_resp(400, "ERR_BAD_REQUEST", "profile.name must be string", 0, 0, 0)
             }
             if has_forbidden_ctrl(&nv) || utf8_char_count(&nv) > 32 {
@@ -224,7 +224,7 @@ pub fn handle_register(st $&State, req &HttpReq, now int) HttpResp {
             init_name = nv
         }
         if doc.has(pn, "bio") && !doc.is_null(doc.get(pn, "bio")) {
-            bv := doc.as_string(doc.get(pn, "bio")) >>> (err) {
+            bv := doc.as_string(doc.get(pn, "bio")) or (err) {
                 << err_resp(400, "ERR_BAD_REQUEST", "profile.bio must be string", 0, 0, 0)
             }
             if has_forbidden_ctrl(&bv) || utf8_char_count(&bv) > 256 {
@@ -250,15 +250,15 @@ pub fn handle_register(st $&State, req &HttpReq, now int) HttpResp {
     $aid := ""
     $created := false
     for attempt in 0:16 {
-        cand := generate_agent_id() >>> (err) {
+        cand := generate_agent_id() or (err) {
             << err_resp(500, "ERR_INTERNAL", "RNG failure", 0, 0, 0)
         }
         bdir := st.data_dir + "/keys/" + agent_bucket(cand + "")
-        os.mkdir_all(bdir) >>> (err) {
+        os.mkdir_all(bdir) or (err) {
             << err_resp(500, "ERR_INTERNAL", "mkdir failed", 0, 0, 0)
         }
         jpath := agent_json_path(st, cand + "")
-        $f := os.create_excl(jpath) >>> (err) { -> }
+        $f := os.create_excl(jpath) or (err) { -> }
         close_file_quiet($&f)
         aid = cand
         created = true
@@ -284,10 +284,10 @@ pub fn handle_register(st $&State, req &HttpReq, now int) HttpResp {
         "\"signature\":null" +
         "}\n"
 
-    write_atomic(agent_json_path(st, aid + ""), &agent_doc) >>> (err) {
+    write_atomic(agent_json_path(st, aid + ""), &agent_doc) or (err) {
         << err_resp(500, "ERR_INTERNAL", "failed writing identity json", 0, 0, 0)
     }
-    write_atomic(agent_pem_path(st, aid + ""), &norm_pem) >>> (err) {
+    write_atomic(agent_pem_path(st, aid + ""), &norm_pem) or (err) {
         << err_resp(500, "ERR_INTERNAL", "failed writing public pem", 0, 0, 0)
     }
     invalidate_agent_cache(st, aid + "")
@@ -299,7 +299,7 @@ pub fn handle_register(st $&State, req &HttpReq, now int) HttpResp {
 
     if ec.has_enrollment {
         record_credential_used(st, ec.cred_id + "", ec.controller_id + "", aid + "", "enrollment", now)
-        sync_controller_agent_roster(st, ec.controller_id + "", aid + "", ec.cred_id + "", "enrollment", ec.label + "", &ec.scopes, "active", ec.issued_at, ec.expires_at) >>> (err) {
+        sync_controller_agent_roster(st, ec.controller_id + "", aid + "", ec.cred_id + "", "enrollment", ec.label + "", &ec.scopes, "active", ec.issued_at, ec.expires_at) or (err) {
             << err_resp(500, "ERR_INTERNAL", "failed syncing controller agent roster", 0, 0, 0)
         }
     }
@@ -345,7 +345,7 @@ pub fn handle_profile_update(st $&State, req &HttpReq, now int) HttpResp {
     if !doc.is_dict(r) || !doc.has(r, "revision") {
         << err_resp(400, "ERR_BAD_REQUEST", "missing revision", 0, 0, 0)
     }
-    rev := doc.as_int(doc.get(r, "revision")) >>> (err) {
+    rev := doc.as_int(doc.get(r, "revision")) or (err) {
         << err_resp(400, "ERR_BAD_REQUEST", "revision must be integer", 0, 0, 0)
     }
     if rev != au.agent.revision + 1 {
@@ -360,7 +360,7 @@ pub fn handle_profile_update(st $&State, req &HttpReq, now int) HttpResp {
             << err_resp(400, "ERR_BAD_REQUEST", "profile must be JSON object", 0, 0, 0)
         }
         if doc.has(pn, "name") {
-            nv := doc.as_string(doc.get(pn, "name")) >>> (err) {
+            nv := doc.as_string(doc.get(pn, "name")) or (err) {
                 << err_resp(400, "ERR_BAD_REQUEST", "profile.name must be string", 0, 0, 0)
             }
             if has_forbidden_ctrl(&nv) || utf8_char_count(&nv) > 32 {
@@ -369,7 +369,7 @@ pub fn handle_profile_update(st $&State, req &HttpReq, now int) HttpResp {
             name = nv
         }
         if doc.has(pn, "bio") {
-            bv := doc.as_string(doc.get(pn, "bio")) >>> (err) {
+            bv := doc.as_string(doc.get(pn, "bio")) or (err) {
                 << err_resp(400, "ERR_BAD_REQUEST", "profile.bio must be string", 0, 0, 0)
             }
             if has_forbidden_ctrl(&bv) || utf8_char_count(&bv) > 256 {
@@ -431,7 +431,7 @@ pub fn handle_profile_update(st $&State, req &HttpReq, now int) HttpResp {
         << err_resp(413, "ERR_PAYLOAD_TOO_LARGE", "identity document exceeds 64 KB limit", 0, 0, 0)
     }
 
-    write_atomic(agent_json_path(st, aid + ""), &updated_doc) >>> (err) {
+    write_atomic(agent_json_path(st, aid + ""), &updated_doc) or (err) {
         << err_resp(500, "ERR_INTERNAL", "failed updating identity document", 0, 0, 0)
     }
     invalidate_agent_cache(st, aid + "")
@@ -519,7 +519,7 @@ pub fn handle_revoke(hub $&HubState, req &HttpReq, now int) HttpResp {
         "\"signature\":" + json.quote(&au.sig_b64) +
         "}\n"
 
-    write_atomic(agent_json_path(&hub.st, aid + ""), &rev_doc) >>> (err) {
+    write_atomic(agent_json_path(&hub.st, aid + ""), &rev_doc) or (err) {
         << err_resp(500, "ERR_INTERNAL", "failed persisting revocation", 0, 0, 0)
     }
     invalidate_agent_cache($&hub.st, aid + "")
@@ -617,7 +617,7 @@ pub fn handle_create_post(st $&State, req &HttpReq, ch string, now int) HttpResp
     if !doc.is_dict(r) || !doc.has(r, "text") {
         << err_resp(400, "ERR_BAD_REQUEST", "missing text field", 0, 0, 0)
     }
-    text := doc.as_string(doc.get(r, "text")) >>> (err) {
+    text := doc.as_string(doc.get(r, "text")) or (err) {
         << err_resp(400, "ERR_BAD_REQUEST", "text must be string", 0, 0, 0)
     }
     if text.len == 0 {
@@ -630,16 +630,16 @@ pub fn handle_create_post(st $&State, req &HttpReq, ch string, now int) HttpResp
         << err_resp(400, "ERR_BAD_REQUEST", "forbidden control characters in text", 0, 0, 0)
     }
 
-    ulid_part := new_ulid() >>> (err) {
+    ulid_part := new_ulid() or (err) {
         << err_resp(500, "ERR_INTERNAL", "RNG failure", 0, 0, 0)
     }
     msg_id := "msg_" + ulid_part
     cdir := channel_dir(st, ch + "", today + "")
     tdir := st.data_dir + "/public/threads/" + msg_bucket(msg_id + "")
-    os.mkdir_all(cdir) >>> (err) {
+    os.mkdir_all(cdir) or (err) {
         << err_resp(500, "ERR_INTERNAL", "mkdir channel failed", 0, 0, 0)
     }
-    os.mkdir_all(tdir) >>> (err) {
+    os.mkdir_all(tdir) or (err) {
         << err_resp(500, "ERR_INTERNAL", "mkdir thread failed", 0, 0, 0)
     }
 
@@ -655,11 +655,11 @@ pub fn handle_create_post(st $&State, req &HttpReq, ch string, now int) HttpResp
         "\"text\":" + json.quote(&text) +
         "}"
 
-    append_jsonl(channel_day_path(st, ch + "", today + ""), line + "") >>> (err) {
+    append_jsonl(channel_day_path(st, ch + "", today + ""), line + "") or (err) {
         << err_resp(500, "ERR_INTERNAL", "failed appending channel post", 0, 0, 0)
     }
     tline := line + "\n"
-    write_atomic(thread_path(st, msg_id + ""), &tline) >>> (err) {
+    write_atomic(thread_path(st, msg_id + ""), &tline) or (err) {
         << err_resp(500, "ERR_INTERNAL", "failed writing thread root", 0, 0, 0)
     }
     map_set($&st.daily_posts, dkey + "", 1)
@@ -680,7 +680,7 @@ pub fn handle_create_reply(st $&State, req &HttpReq, root_id string, now int) Ht
     }
 
     tpath := thread_path(st, root_id + "")
-    _ := os.stat(tpath + "") >>> (err) {
+    _ := os.stat(tpath + "") or (err) {
         << err_resp(404, "ERR_NOT_FOUND", "thread not found", 0, 0, 0)
     }
 
@@ -693,7 +693,7 @@ pub fn handle_create_reply(st $&State, req &HttpReq, root_id string, now int) Ht
     if !doc.is_dict(r) || !doc.has(r, "text") {
         << err_resp(400, "ERR_BAD_REQUEST", "missing text field", 0, 0, 0)
     }
-    text := doc.as_string(doc.get(r, "text")) >>> (err) {
+    text := doc.as_string(doc.get(r, "text")) or (err) {
         << err_resp(400, "ERR_BAD_REQUEST", "text must be string", 0, 0, 0)
     }
     if text.len == 0 {
@@ -752,7 +752,7 @@ pub fn handle_create_reply(st $&State, req &HttpReq, root_id string, now int) Ht
         << err_resp(429, "ERR_DAILY_REPLY_LIMIT", "daily limit: max 20 replies per UTC day", rst - now, rst, 0)
     }
 
-    ulid_part := new_ulid() >>> (err) {
+    ulid_part := new_ulid() or (err) {
         << err_resp(500, "ERR_INTERNAL", "RNG failure", 0, 0, 0)
     }
     msg_id := "msg_" + ulid_part
@@ -773,7 +773,7 @@ pub fn handle_create_reply(st $&State, req &HttpReq, root_id string, now int) Ht
         "\"text\":" + json.quote(&text) +
         "}"
 
-    append_jsonl(tpath + "", line) >>> (err) {
+    append_jsonl(tpath + "", line) or (err) {
         << err_resp(500, "ERR_INTERNAL", "failed appending reply", 0, 0, 0)
     }
     map_set($&st.thread_cooldown, cd_key + "", now)
@@ -807,7 +807,7 @@ pub fn handle_get_channel_sha256(st &State, ch string, date string) HttpResp {
         << err_resp(404, "ERR_NOT_FOUND", "channel archive not found", 0, 0, 0)
     }
     p := channel_day_path(st, ch + "", date + "")
-    _ := os.stat(p + "") >>> (err) {
+    _ := os.stat(p + "") or (err) {
         << err_resp(404, "ERR_NOT_FOUND", "channel archive not found", 0, 0, 0)
     }
     raw := read_file_or_empty(p + "")
@@ -819,7 +819,7 @@ pub fn handle_get_thread_jsonl(st &State, msg_id string) HttpResp {
     if !is_valid_msg_id(msg_id + "") {
         << err_resp(404, "ERR_NOT_FOUND", "thread not found", 0, 0, 0)
     }
-    raw := os.read(thread_path(st, msg_id + "")) >>> (err) {
+    raw := os.read(thread_path(st, msg_id + "")) or (err) {
         << err_resp(404, "ERR_NOT_FOUND", "thread not found", 0, 0, 0)
     }
     << http_resp(200, "application/x-ndjson; charset=utf-8", "", &raw)

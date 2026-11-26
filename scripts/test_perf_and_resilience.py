@@ -459,7 +459,7 @@ def main() -> int:
             # -----------------------------------------------------------------
             # 1. Zero-plaintext room key-box + `room sync` + `listen` auto-sync
             # -----------------------------------------------------------------
-            print("[1/6] Testing offline room key-box, room sync, and listen auto-sync...")
+            print("[1/7] Testing offline room key-box, room sync, and listen auto-sync...")
             rm = cli_json(["room", "create", "--name", "resilience-room"], home=home_a, api_url=api_url)
             rid = rm["room_id"]
             secret_room_key = json.loads((home_a / "rooms" / f"{rid}.json").read_text(encoding="utf-8"))["key"]
@@ -518,7 +518,7 @@ def main() -> int:
             # -----------------------------------------------------------------
             # 2. HA /ready + gated graceful shutdown + `listen` & `p2p --star` reconnect
             # -----------------------------------------------------------------
-            print("[2/6] Testing HA /ready, SSE drain on shutdown, listen & p2p --star auto-reconnect...")
+            print("[2/7] Testing HA /ready, SSE drain on shutdown, listen & p2p --star auto-reconnect...")
             r_st, _, r_body = signed_http(HOST, port, "GET", "/ready")
             assert_eq(r_st, 200, "/ready returns 200")
             assert_eq(json.loads(r_body.decode("utf-8"))["status"], "ready", "/ready status=ready")
@@ -597,7 +597,7 @@ def main() -> int:
             # -----------------------------------------------------------------
             # 3. High-Concurrency Overload Guards (SSE limits + Cache-Control + 20-thread burst)
             # -----------------------------------------------------------------
-            print("[3/6] Testing SSE overload guards (429/503), Cache-Control, and 20-thread 200-req burst...")
+            print("[3/7] Testing SSE overload guards (429/503), Cache-Control, and 20-thread 200-req burst...")
             ov_port = free_tcp_port()
             ov_data = tmp / "ov_data"
             ov_home_a = tmp / "ov_a"
@@ -691,7 +691,7 @@ def main() -> int:
             # -----------------------------------------------------------------
             # 4. CLI 24h nonce replay cache
             # -----------------------------------------------------------------
-            print("[4/6] Testing CLI 24h nonce replay cache...")
+            print("[4/7] Testing CLI 24h nonce replay cache...")
             nonce_file = home_b / "nonces.jsonl"
             assert_true(nonce_file.is_file(), "nonces.jsonl exists")
             assert_eq(stat.S_IMODE(nonce_file.stat().st_mode), 0o600, "nonces.jsonl mode 0600")
@@ -716,7 +716,7 @@ def main() -> int:
             # -----------------------------------------------------------------
             # 5. Multi-chunk (>8 KB) P2P stdio & 5x TCP forward + stale offer rejection
             # -----------------------------------------------------------------
-            print("[5/6] Testing P2P 60s stale offer, 16KB --stdio, and 5 consecutive 12KB --forward rounds...")
+            print("[5/7] Testing P2P 60s stale offer, 16KB --stdio, and 5 consecutive 12KB --forward rounds...")
             payload_16k = (b"FATEXT_P2P_CHUNK_VERIFY_0123456789ABCDEF\n" * 410)[:16384]
             out_stdio = tmp / "p2p_stdio_out.bin"
 
@@ -837,7 +837,7 @@ def main() -> int:
             # -----------------------------------------------------------------
             # 6. Hard Crash (SIGKILL) Recovery
             # -----------------------------------------------------------------
-            print("[6/6] Testing hard crash (SIGKILL) recovery and state persistence...")
+            print("[6/7] Testing hard crash (SIGKILL) recovery and state persistence...")
             srv.kill()
             srv.wait(timeout=5)
             time.sleep(0.3)
@@ -867,7 +867,87 @@ def main() -> int:
             ls_b.close()
             ls_b = None
 
-            print("ALL 6 HIGH-CONCURRENCY & HIGH-AVAILABILITY RESILIENCE TESTS PASSED!")
+            # -----------------------------------------------------------------
+            # 7. Production Ops Drill: backup.sh, graceful_stop.sh, restore.sh
+            # -----------------------------------------------------------------
+            print("[7/7] Testing deploy/backup.sh, deploy/restore.sh, and deploy/graceful_stop.sh end-to-end...")
+            pub_text = "Pre-backup channel post for DR restore verification."
+            post_res = cli_json(["pub", "post", "general", pub_text], home=home_a, api_url=api_url)
+            post_id = post_res["msg_id"]
+            soul_text = "Role: Bob HA disaster recovery soul document."
+            cli_json(["soul", "set", "--text", soul_text, "--public"], home=home_b, api_url=api_url)
+
+            backup_dir = tmp / "backups"
+            bk = subprocess.run(
+                ["bash", str(ROOT / "deploy" / "backup.sh"), str(data_dir), str(backup_dir)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=True,
+                timeout=15,
+            )
+            archives = sorted(backup_dir.glob("fatext-*.tar.gz"))
+            assert_eq(len(archives), 1, f"expected 1 backup archive: {bk.stdout}")
+            archive = archives[0]
+            assert_eq(stat.S_IMODE(archive.stat().st_mode), 0o600, "backup archive mode 0600")
+
+            # Verify deploy/graceful_stop.sh triggers clean exit 0
+            stop_env = os.environ.copy()
+            stop_env["FATEXT_ADDR"] = f"{HOST}:{port}"
+            stop_env["FATEXT_SHUTDOWN_SECRET"] = "test-shutdown-secret"
+            stop_env["MAINPID"] = str(srv.pid)
+            gs = subprocess.run(
+                ["bash", str(ROOT / "deploy" / "graceful_stop.sh")],
+                env=stop_env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=15,
+            )
+            assert_eq(gs.returncode, 0, f"graceful_stop.sh failed: {gs.stderr}")
+            assert_eq(srv.wait(timeout=8), 0, "server exited 0 via graceful_stop.sh")
+
+            restored_data = tmp / "restored_data"
+            dr_dry = subprocess.run(
+                ["bash", str(ROOT / "deploy" / "restore.sh"), str(archive), str(restored_data), "--dry-run"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=True,
+                timeout=15,
+            )
+            for root_name in ("keys/", "friends/", "docs/", "rooms/", "public/"):
+                assert_true(root_name in dr_dry.stdout, f"restore dry-run missing {root_name}: {dr_dry.stdout}")
+
+            subprocess.run(
+                ["bash", str(ROOT / "deploy" / "restore.sh"), str(archive), str(restored_data)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=True,
+                timeout=15,
+            )
+
+            # Boot fresh server from restored_data and verify full state integrity
+            srv = start_server(port, restored_data)
+            for check_id in (aid, bid):
+                ks, _, kb = signed_http(HOST, port, "GET", f"/k/{check_id}.json")
+                assert_eq(ks, 200, f"restored key lookup failed for {check_id}: {kb}")
+            fr_r = cli_json(["friend", "list"], home=home_b, api_url=api_url)
+            assert_true(any(f["agent_id"] == aid for f in fr_r["friends"]), "restored friend missing")
+            rm_r = cli_json(["room", "list"], home=home_b, api_url=api_url)
+            assert_true(any(r["room_id"] == rid and r["epoch"] == 2 for r in rm_r["rooms"]), "restored room missing")
+            sync_r = cli_json(["room", "sync", rid], home=home_b, api_url=api_url)
+            assert_true(sync_r.get("ok") is True, f"restored room key-box sync failed: {sync_r}")
+            rc_pub, pub_out, pub_err = run_cli(["--json", "pub", "list", "general"], home=home_b, api_url=api_url)
+            assert_eq(rc_pub, 0, f"restored pub list failed: {pub_err}")
+            pub_recs = [json.loads(ln) for ln in pub_out.splitlines() if ln.strip()]
+            assert_true(any(r.get("msg_id") == post_id and r.get("verified") is True and r.get("text") == pub_text for r in pub_recs), f"restored channel post missing or unverified: {pub_recs}")
+            doc_st, _, doc_body = signed_http(HOST, port, "GET", f"/k/{bid}/soul.json")
+            assert_eq(doc_st, 200, "restored soul doc status 200")
+            assert_true(soul_text.encode("utf-8") in doc_body, "restored soul text missing")
+
+            print("ALL 7 HIGH-CONCURRENCY, HA & DISASTER-RECOVERY TESTS PASSED!")
             return 0
         finally:
             if ls_a:

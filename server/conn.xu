@@ -17,23 +17,23 @@ pub struct ClientConn {
 }
 
 fn tls_read_q(tc $&tls.Conn, n int) string {
-    << tc.read(n) >>>
+    << tc.read(n) or >>
 }
 
 fn tls_write_q(tc $&tls.Conn, data &string) int {
-    << tc.write(data) >>>
+    << tc.write(data) or >>
 }
 
 fn tls_close_q(tc $&tls.Conn) {
-    tc.close() >>> (err) { << }
+    tc.close() or (err) { << }
 }
 
 fn tls_set_deadline_q(tc $&tls.Conn, dl int) {
-    _ := tc.set_deadline(dl) >>> (err) { << }
+    _ := tc.set_deadline(dl) or (err) { << }
 }
 
 fn net_set_deadline_q(nc $&net.Conn, dl int) {
-    _ := nc.set_deadline(dl) >>> (err) { << }
+    _ := nc.set_deadline(dl) or (err) { << }
 }
 
 pub fn cc_from_tcp(fd int, remote_ip string) ClientConn {
@@ -50,11 +50,11 @@ pub fn cc_from_tls(fd int, cert_pem &string, key_pem &string, remote_ip string, 
     $cfg := tls.new_config("")
     cfg.cert_pem = cert_pem + ""
     cfg.key_pem = key_pem + ""
-    $nc := net.file_conn(fd) >>>
+    $nc := net.file_conn(fd) or >>
     if hs_timeout_ns > 0 {
         net_set_deadline_q($&nc, time.now() + hs_timeout_ns)
     }
-    $tc := tls.server(nc, &cfg) >>>
+    $tc := tls.server(nc, &cfg) or >>
     if hs_timeout_ns > 0 {
         tls_set_deadline_q($&tc, 0)
     }
@@ -77,32 +77,32 @@ pub fn cc_set_sock_timeout(cc $&ClientConn, dur_ns int) {
         <<
     }
     if cc.fd >= 0 {
-        _ := os.set_sock_timeout(cc.fd, dur_ns) >>> (err) { << }
+        _ := os.set_sock_timeout(cc.fd, dur_ns) or (err) { << }
     }
 }
 
 pub fn cc_read(cc $&ClientConn, max int) string {
     if cc.is_tls {
-        << tls_read_q($&cc.tc, max) >>>
+        << tls_read_q($&cc.tc, max) or >>
     }
-    << net.conn_read(cc.fd, max) >>>
+    << net.conn_read(cc.fd, max) or >>
 }
 
 pub fn cc_write(cc $&ClientConn, data &string) int {
     if cc.is_tls {
-        << tls_write_q($&cc.tc, data) >>> (err) { << -1 }
+        << tls_write_q($&cc.tc, data) or (err) { << -1 }
     }
-    << net.conn_write(cc.fd, data) >>> (err) { << -1 }
+    << net.conn_write(cc.fd, data) or (err) { << -1 }
 }
 
 pub fn cc_disable_sigpipe(fd int) {
     if fd < 0 { << }
-    _ := os.setsockopt_int(fd, 65535, 4130, 1) >>> (err) { << }
+    _ := os.setsockopt_int(fd, 65535, 4130, 1) or (err) { << }
 }
 
 pub fn cc_peer_closed(cc &ClientConn) bool {
     if cc.fd < 0 { << true }
-    mask := os.socket_wait(cc.fd, 1, -1) >>> (err) { << true }
+    mask := os.socket_wait(cc.fd, 1, -1) or (err) { << true }
     if cc.is_tls {
         << (mask & 12) != 0
     }
@@ -116,7 +116,7 @@ pub fn cc_close(cc $&ClientConn) {
         <<
     }
     if cc.fd >= 0 {
-        _ := net.conn_close(cc.fd) >>> (err) { << }
+        _ := net.conn_close(cc.fd) or (err) { << }
         cc.fd = -1
     }
 }
@@ -207,7 +207,7 @@ pub fn format_http_resp(r &HttpResp) string {
 
 pub fn write_http_resp_ka(cc $&ClientConn, r &HttpResp, keep_alive bool) int {
     wire := format_http_resp_ka(r, keep_alive)
-    << cc_write(cc, &wire) >>> (err) { << -1 }
+    << cc_write(cc, &wire) or (err) { << -1 }
 }
 
 pub fn write_http_resp(cc $&ClientConn, r &HttpResp) int {
@@ -222,14 +222,14 @@ pub fn wants_keep_alive(req &HttpReq) bool {
 
 pub fn write_sse_open(cc $&ClientConn) int {
     hdr := "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nX-Accel-Buffering: no\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n: connected\n\n"
-    << cc_write(cc, &hdr) >>> (err) { << -1 }
+    << cc_write(cc, &hdr) or (err) { << -1 }
 }
 
 fn parse_content_length_hdr(names &[]string, vals &[]string) int {
     for i in 0:names.len {
         if names[i] == "content-length" {
             v := strings.trim_space(&vals[i])
-            n := strconv.atoi(&v) >>> (err) { << -1 }
+            n := strconv.atoi(&v) or (err) { << -1 }
             << n
         }
     }
@@ -246,16 +246,16 @@ pub fn read_http_request_timeout(cc $&ClientConn, timeout_ns int) HttpReq {
             <-
         }
         if cc.buf.len > 16384 {
-            >>> errors.new("header too large")
+            >> errors.new("header too large")
         }
-        chunk := cc_read(cc, 4096) >>>
+        chunk := cc_read(cc, 4096) or >>
         if chunk.len == 0 {
-            >>> errors.new("eof reading request")
+            >> errors.new("eof reading request")
         }
         cc.buf = cc.buf + chunk
     }
     if hdr_end > 16384 {
-        >>> errors.new("header too large")
+        >> errors.new("header too large")
     }
     head_s := cc.buf[0:hdr_end]
     $rest := ""
@@ -266,11 +266,11 @@ pub fn read_http_request_timeout(cc $&ClientConn, timeout_ns int) HttpReq {
 
     lines := strings.split(&head_s, "\r\n")
     if lines.len == 0 {
-        >>> errors.new("empty request")
+        >> errors.new("empty request")
     }
     req_parts := strings.split(&lines[0], " ")
     if req_parts.len < 2 {
-        >>> errors.new("malformed request line")
+        >> errors.new("malformed request line")
     }
     meth := strings.to_upper(&strings.trim_space(&req_parts[0]))
     rpath := req_parts[1] + ""
@@ -293,15 +293,15 @@ pub fn read_http_request_timeout(cc $&ClientConn, timeout_ns int) HttpReq {
 
     clen := parse_content_length_hdr(&hnames, &hvals)
     if clen < 0 || clen > 262144 {
-        >>> errors.new("invalid or oversized content-length")
+        >> errors.new("invalid or oversized content-length")
     }
     while rest.len < clen {
         need := clen - rest.len
         $rmax := 8192
         if need < rmax { rmax = need }
-        chunk := cc_read(cc, rmax) >>>
+        chunk := cc_read(cc, rmax) or >>
         if chunk.len == 0 {
-            >>> errors.new("unexpected eof reading body")
+            >> errors.new("unexpected eof reading body")
         }
         rest = rest + chunk
     }
@@ -325,11 +325,11 @@ pub fn read_http_request_timeout(cc $&ClientConn, timeout_ns int) HttpReq {
 }
 
 pub fn read_http_request(cc $&ClientConn) HttpReq {
-    << read_http_request_timeout(cc, 10000000000) >>>
+    << read_http_request_timeout(cc, 10000000000) or >>
 }
 
 pub fn read_req_into(cc $&ClientConn, timeout_ns int, out_errs $&[]string) HttpReq {
-    << read_http_request_timeout(cc, timeout_ns) >>> (err) {
+    << read_http_request_timeout(cc, timeout_ns) or (err) {
         out_errs.push(err.msg())
         << HttpReq{req_method: "", req_path: "", hdr_names: []string{}, hdr_vals: []string{}, req_body: "", remote_ip: ""}
     }
