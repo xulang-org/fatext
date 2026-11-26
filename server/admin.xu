@@ -1,0 +1,1254 @@
+@main
+
+#os
+#maps
+#strconv
+#strings
+#encoding/json
+
+fn extract_admin_token(req &HttpReq) string {
+    h := strings.trim_space(&req.header("X-Fatext-Admin-Secret"))
+    if h.len > 0 { << h }
+    auth := strings.trim_space(&req.header("Authorization"))
+    if strings.has_prefix(&auth, "Bearer ") || strings.has_prefix(&auth, "bearer ") {
+        tok := strings.trim_space(&auth[7:auth.len])
+        if tok.len > 0 { << tok }
+    }
+    << ""
+}
+
+pub fn is_valid_admin_request(hub &HubState, req &HttpReq) bool {
+    if hub.admin_secret.len == 0 { << false }
+    p := path_only(req.path())
+    if p != "/internal/metrics" && !strings.has_prefix(&p, "/internal/admin/") {
+        << false
+    }
+    tok := extract_admin_token(req)
+    << tok.len > 0 && const_time_str_eq(&tok, &hub.admin_secret)
+}
+
+fn require_admin(hub &HubState, req &HttpReq) HttpResp {
+    if hub.admin_secret.len == 0 {
+        << err_resp(404, "ERR_NOT_FOUND", "endpoint not found", 0, 0, 0)
+    }
+    tok := extract_admin_token(req)
+    if tok.len == 0 || !const_time_str_eq(&tok, &hub.admin_secret) {
+        << err_resp(403, "ERR_FORBIDDEN", "invalid or missing admin secret", 0, 0, 0)
+    }
+    << HttpResp{status: 0, ctype: "", extra: "", body: ""}
+}
+
+fn adm_parse_int(s &string, def int) int {
+    t := strings.trim_space(s)
+    if t.len == 0 { << def }
+    $sign := 1
+    $i := 0
+    if (t[0] & 255) == 45 {
+        sign = -1
+        i = 1
+        if i >= t.len { << def }
+    }
+    $v := 0
+    while i < t.len {
+        c := t[i] & 255
+        if c < 48 || c > 57 { << def }
+        v = v * 10 + (c - 48)
+        i += 1
+    }
+    << v * sign
+}
+
+fn query_param_str(raw_path string, key string, def string) string {
+    qidx := strings.index_of(&raw_path, "?")
+    if qidx < 0 { << def }
+    qp := raw_path[(qidx + 1):raw_path.len]
+    parts := strings.split(&qp, "&")
+    pref := key + "="
+    for i in 0:parts.len {
+        p := parts[i] + ""
+        if strings.has_prefix(&p, pref) {
+            raw_v := p[pref.len:p.len]
+            << url_decode_simple(&raw_v)
+        }
+    }
+    << def
+}
+
+fn query_param_int(raw_path string, key string, def int, min_v int, max_v int) int {
+    raw := query_param_str(raw_path + "", key + "", "")
+    if raw.len == 0 { << def }
+    $v := adm_parse_int(&raw, def)
+    if v < min_v { v = min_v }
+    if v > max_v { v = max_v }
+    << v
+}
+
+fn log_admin_action(hub $&HubState, req &HttpReq, now int, action string, target string, reason string) {
+    fields := "\"action\":" + json.quote(&action) +
+        ",\"target\":" + json.quote(&target) +
+        ",\"reason\":" + json.quote(&reason) +
+        ",\"ip\":" + json.quote(&req.remote_ip)
+    log_event_json(hub.log_ch, now, "admin_action", fields)
+}
+
+fn count_nonempty_lines(raw &string) int {
+    if raw.len == 0 { << 0 }
+    lines := strings.split(raw, "\n")
+    $cnt := 0
+    for i in 0:lines.len {
+        if strings.trim_space(&lines[i]).len > 0 { cnt += 1 }
+    }
+    << cnt
+}
+
+fn scan_all_agent_ids(st &State) []string {
+    $ids := []string{}
+    root := st.data_dir + "/keys"
+    buckets := os.read_dir(root + "") or (err) { << ids }
+    blines := strings.split(&buckets, "\n")
+    for bi in 0:blines.len {
+        b := strings.trim_space(&blines[bi])
+        if b.len != 2 { -> }
+        bdir := root + "/" + b
+        files := os.read_dir(bdir + "") or (err) { -> }
+        flines := strings.split(&files, "\n")
+        for fi in 0:flines.len {
+            fn_s := strings.trim_space(&flines[fi])
+            if fn_s.len != 21 || !strings.has_suffix(&fn_s, ".json") { -> }
+            aid := fn_s[0:(fn_s.len - 5)]
+            if is_valid_agent_id(aid + "") {
+                ids.push(aid + "")
+            }
+        }
+    }
+    << ids
+}
+
+fn scan_all_room_ids(st &State) []string {
+    $ids := []string{}
+    root := st.data_dir + "/rooms"
+    buckets := os.read_dir(root + "") or (err) { << ids }
+    blines := strings.split(&buckets, "\n")
+    for bi in 0:blines.len {
+        b := strings.trim_space(&blines[bi])
+        if b.len != 2 { -> }
+        bdir := root + "/" + b
+        files := os.read_dir(bdir + "") or (err) { -> }
+        flines := strings.split(&files, "\n")
+        for fi in 0:flines.len {
+            fn_s := strings.trim_space(&flines[fi])
+            if fn_s.len != 36 || !strings.has_suffix(&fn_s, ".json") { -> }
+            rid := fn_s[0:(fn_s.len - 5)]
+            if is_valid_room_id(rid + "") {
+                ids.push(rid + "")
+            }
+        }
+    }
+    << ids
+}
+
+fn refresh_entity_stats(hub $&HubState, now int, force bool) {
+    if !force && hub.entity_cache.ts > 0 && hub.entity_cache.agents_total > 0 && now - hub.entity_cache.ts < 15 {
+        <<
+    }
+    aids := scan_all_agent_ids(&hub.st)
+    $a_total := 0
+    $a_active := 0
+    $a_revoked := 0
+    $a_suspended := 0
+    $c_total := 0
+    $m_total := 0
+    for i in 0:aids.len {
+        ag := read_agent_summary(&hub.st, aids[i] + "")
+        if !ag.found { -> }
+        a_total += 1
+        if ag.status == "revoked" || hub.st.revoked.has(ag.agent_id + "") {
+            a_revoked += 1
+        } else if ag.status == "controller_only" {
+            a_active += 1
+        } else {
+            a_active += 1
+        }
+        if ag.controller_id.len > 0 && ag.ownership_status == "suspended" {
+            a_suspended += 1
+        }
+        if ag.managed_count > 0 || ag.status == "controller_only" {
+            c_total += 1
+        }
+        if ag.controller_id.len > 0 {
+            m_total += 1
+        }
+    }
+    rids := scan_all_room_ids(&hub.st)
+    today := utc_date_from_unix(now)
+    $posts_today := 0
+    $ch_parts := []string{}
+    for ci in 0:hub.st.channels.len {
+        cname := hub.st.channels[ci].name + ""
+        raw_ch := read_file_or_empty(channel_day_path(&hub.st, cname + "", today + ""))
+        cnt := count_nonempty_lines(&raw_ch)
+        posts_today += cnt
+        ch_parts.push(json.quote(&cname) + ":" + strconv.itoa(cnt))
+    }
+    hub.entity_cache = EntityStatsCache{
+        ts: now,
+        agents_total: a_total,
+        agents_active: a_active,
+        agents_revoked: a_revoked,
+        agents_suspended: a_suspended,
+        controllers_total: c_total,
+        managed_agents_total: m_total,
+        rooms_total: rids.len,
+        posts_today: posts_today,
+        per_channel_today_json: "{" + strings.join(ch_parts, ",") + "}"
+    }
+}
+
+fn agent_online_sse_count(hub &HubState, aid string) int {
+    $cnt := 0
+    for i in 0:hub.clients.len {
+        if hub.clients[i].agent_id == aid { cnt += 1 }
+    }
+    << cnt
+}
+
+fn metrics_json_string(m &MetricsState, active_sse int, now int) string {
+    $win_sec := now - m.window_start
+    if win_sec < 0 { win_sec = 0 }
+    $up := now - m.started_at
+    if up < 0 { up = 0 }
+    << "{\"window_sec\":" + strconv.itoa(win_sec) +
+        ",\"uptime_sec\":" + strconv.itoa(up) +
+        ",\"req_total\":" + strconv.itoa(m.req_total) +
+        ",\"req_2xx\":" + strconv.itoa(m.req_2xx) +
+        ",\"req_4xx\":" + strconv.itoa(m.req_4xx) +
+        ",\"req_5xx\":" + strconv.itoa(m.req_5xx) +
+        ",\"req_429\":" + strconv.itoa(m.req_429) +
+        ",\"bytes_in\":" + strconv.itoa(m.bytes_in) +
+        ",\"bytes_out\":" + strconv.itoa(m.bytes_out) +
+        ",\"tls_ok\":" + strconv.itoa(m.tls_ok) +
+        ",\"tls_fail\":" + strconv.itoa(m.tls_fail) +
+        ",\"active_sse\":" + strconv.itoa(active_sse) +
+        ",\"peak_sse\":" + strconv.itoa(m.peak_sse) +
+        ",\"sse_opened\":" + strconv.itoa(m.sse_opened) +
+        ",\"sse_closed\":" + strconv.itoa(m.sse_closed) +
+        ",\"sse_events_pushed\":" + strconv.itoa(m.sse_events_pushed) +
+        ",\"sse_dropped_full\":" + strconv.itoa(m.sse_dropped_full) +
+        ",\"dm_sse\":" + strconv.itoa(m.dm_sse) +
+        ",\"dm_webhook\":" + strconv.itoa(m.dm_webhook) +
+        ",\"dm_dropped\":" + strconv.itoa(m.dm_dropped) +
+        ",\"room_events\":" + strconv.itoa(m.room_events) +
+        ",\"mail_ingested\":" + strconv.itoa(m.mail_ingested) +
+        ",\"mail_gc_deleted\":" + strconv.itoa(m.mail_gc_deleted) +
+        ",\"slow_requests\":" + strconv.itoa(m.slow_requests) +
+        ",\"latency_buckets\":{\"le_5ms\":" + strconv.itoa(m.b_le5) +
+        ",\"le_20ms\":" + strconv.itoa(m.b_le20) +
+        ",\"le_100ms\":" + strconv.itoa(m.b_le100) +
+        ",\"le_500ms\":" + strconv.itoa(m.b_le500) +
+        ",\"gt_500ms\":" + strconv.itoa(m.b_gt500) + "}" +
+        ",\"max_total_ms\":" + strconv.itoa(m.max_total_ms) +
+        ",\"max_queue_ms\":" + strconv.itoa(m.max_queue_ms) +
+        ",\"max_handle_ms\":" + strconv.itoa(m.max_handle_ms) + "}"
+}
+
+fn unique_sse_agents(hub &HubState) int {
+    $seen := maps.new_str_int()
+    for i in 0:hub.clients.len {
+        map_set($&seen, hub.clients[i].agent_id + "", 1)
+    }
+    << seen.len()
+}
+
+pub fn handle_public_stats(hub $&HubState, now int) HttpResp {
+    if hub.pub_stats_ts == 0 || now - hub.pub_stats_ts >= 30 {
+        refresh_entity_stats(hub, now, false)
+        $up := now - hub.started_at
+        if up < 0 { up = 0 }
+        body := "{\"ok\":true,\"agents_total\":" + strconv.itoa(hub.entity_cache.agents_total) +
+            ",\"channels_total\":" + strconv.itoa(hub.st.channels.len) +
+            ",\"posts_today\":" + strconv.itoa(hub.entity_cache.posts_today) +
+            ",\"active_sse\":" + strconv.itoa(hub.clients.len) +
+            ",\"uptime_sec\":" + strconv.itoa(up) +
+            ",\"version\":\"3.0\"}"
+        hub.pub_stats_ts = now
+        hub.pub_stats_json = body
+    }
+    << http_resp(200, "application/json; charset=utf-8", "Cache-Control: public, max-age=30\r\n", &hub.pub_stats_json)
+}
+
+fn prom_gauge(lines $&[]string, name string, help string, val int) {
+    lines.push("# HELP " + name + " " + help)
+    lines.push("# TYPE " + name + " gauge")
+    lines.push(name + " " + strconv.itoa(val))
+}
+
+fn prom_counter(lines $&[]string, name string, help string, val int) {
+    lines.push("# HELP " + name + " " + help)
+    lines.push("# TYPE " + name + " counter")
+    lines.push(name + " " + strconv.itoa(val))
+}
+
+pub fn handle_internal_metrics(hub $&HubState, req &HttpReq, now int) HttpResp {
+    auth_err := require_admin(hub, req)
+    if auth_err.status != 0 { << auth_err }
+    if req.method() != "GET" {
+        << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0)
+    }
+    refresh_entity_stats(hub, now, false)
+    tot := metrics_combined(&hub.cum_metrics, &hub.metrics, hub.clients.len)
+    $up := now - hub.started_at
+    if up < 0 { up = 0 }
+    $draining_v := 0
+    if hub.draining { draining_v = 1 }
+
+    $lines := []string{}
+    prom_gauge($&lines, "fatext_uptime_seconds", "Server uptime in seconds", up)
+    prom_gauge($&lines, "fatext_draining", "1 if server is draining for shutdown", draining_v)
+    prom_counter($&lines, "fatext_http_requests_total", "Total HTTP requests processed", tot.req_total)
+
+    lines.push("# HELP fatext_http_requests_by_class_total HTTP requests partitioned by status class")
+    lines.push("# TYPE fatext_http_requests_by_class_total counter")
+    lines.push("fatext_http_requests_by_class_total{class=\"2xx\"} " + strconv.itoa(tot.req_2xx))
+    lines.push("fatext_http_requests_by_class_total{class=\"4xx\"} " + strconv.itoa(tot.req_4xx))
+    lines.push("fatext_http_requests_by_class_total{class=\"5xx\"} " + strconv.itoa(tot.req_5xx))
+    lines.push("fatext_http_requests_by_class_total{class=\"429\"} " + strconv.itoa(tot.req_429))
+
+    prom_counter($&lines, "fatext_http_request_bytes_total", "Total HTTP request body bytes", tot.bytes_in)
+    prom_counter($&lines, "fatext_http_response_bytes_total", "Total HTTP response body bytes", tot.bytes_out)
+    prom_counter($&lines, "fatext_http_slow_requests_total", "Total requests exceeding FATEXT_SLOW_MS", tot.slow_requests)
+
+    b1 := tot.b_le5
+    b2 := b1 + tot.b_le20
+    b3 := b2 + tot.b_le100
+    b4 := b3 + tot.b_le500
+    binf := b4 + tot.b_gt500
+    lines.push("# HELP fatext_http_request_duration_seconds Cumulative request latency bucket counts")
+    lines.push("# TYPE fatext_http_request_duration_seconds histogram")
+    lines.push("fatext_http_request_duration_seconds_bucket{le=\"0.005\"} " + strconv.itoa(b1))
+    lines.push("fatext_http_request_duration_seconds_bucket{le=\"0.02\"} " + strconv.itoa(b2))
+    lines.push("fatext_http_request_duration_seconds_bucket{le=\"0.1\"} " + strconv.itoa(b3))
+    lines.push("fatext_http_request_duration_seconds_bucket{le=\"0.5\"} " + strconv.itoa(b4))
+    lines.push("fatext_http_request_duration_seconds_bucket{le=\"+Inf\"} " + strconv.itoa(binf))
+    lines.push("fatext_http_request_duration_seconds_count " + strconv.itoa(binf))
+
+    prom_counter($&lines, "fatext_tls_handshakes_ok_total", "Successful native TLS handshakes", tot.tls_ok)
+    prom_counter($&lines, "fatext_tls_handshakes_fail_total", "Failed native TLS handshakes", tot.tls_fail)
+    prom_gauge($&lines, "fatext_sse_active_streams", "Currently connected SSE streams", hub.clients.len)
+    prom_gauge($&lines, "fatext_sse_peak_streams", "Peak concurrent SSE streams since start", tot.peak_sse)
+    prom_counter($&lines, "fatext_sse_opened_total", "Total SSE streams opened", tot.sse_opened)
+    prom_counter($&lines, "fatext_sse_closed_total", "Total SSE streams closed", tot.sse_closed)
+    prom_counter($&lines, "fatext_sse_events_pushed_total", "Total SSE events pushed to clients", tot.sse_events_pushed)
+    prom_counter($&lines, "fatext_sse_dropped_full_total", "SSE events dropped due to full client buffer", tot.sse_dropped_full)
+    prom_counter($&lines, "fatext_dm_sse_total", "DMs delivered directly over SSE", tot.dm_sse)
+    prom_counter($&lines, "fatext_dm_webhook_total", "DMs delivered via webhook fallback", tot.dm_webhook)
+    prom_counter($&lines, "fatext_dm_dropped_total", "DMs dropped (recipient offline)", tot.dm_dropped)
+    prom_counter($&lines, "fatext_room_events_total", "Encrypted room events relayed", tot.room_events)
+    prom_counter($&lines, "fatext_mail_ingested_total", "Encrypted emails ingested", tot.mail_ingested)
+    prom_counter($&lines, "fatext_mail_gc_deleted_total", "Expired emails purged by GC", tot.mail_gc_deleted)
+
+    prom_gauge($&lines, "fatext_agents_total", "Registered agent accounts on disk", hub.entity_cache.agents_total)
+    prom_gauge($&lines, "fatext_agents_revoked", "Revoked agent accounts", hub.entity_cache.agents_revoked)
+    prom_gauge($&lines, "fatext_agents_suspended", "Suspended managed agents", hub.entity_cache.agents_suspended)
+    prom_gauge($&lines, "fatext_agents_banned", "Banned agents in blacklist", hub.st.banned.len())
+    prom_gauge($&lines, "fatext_rooms_total", "Persisted encrypted rooms", hub.entity_cache.rooms_total)
+    prom_gauge($&lines, "fatext_channels_total", "Configured public channels", hub.st.channels.len)
+    prom_gauge($&lines, "fatext_pins_total", "Configured pinned posts", hub.st.pins.len)
+    prom_gauge($&lines, "fatext_posts_today_total", "Public channel posts written today (UTC)", hub.entity_cache.posts_today)
+    prom_gauge($&lines, "fatext_cache_agent_raw_entries", "Cached agent JSON entries", hub.st.agent_raw_cache.len())
+    prom_gauge($&lines, "fatext_cache_agent_pk_entries", "Cached parsed RSA public keys", hub.st.agent_pks.len)
+    prom_gauge($&lines, "fatext_cache_friends_entries", "Cached friends list entries", hub.st.friends_raw_cache.len())
+    prom_gauge($&lines, "fatext_cache_room_entries", "Cached room metadata entries", hub.st.room_raw_cache.len())
+
+    out := strings.join(lines, "\n") + "\n"
+    << http_resp(200, "text/plain; version=0.0.4; charset=utf-8", "", &out)
+}
+
+fn handle_admin_stats(hub $&HubState, req &HttpReq, now int) HttpResp {
+    force := query_param_str(req.path(), "refresh", "") == "1"
+    refresh_entity_stats(hub, now, force)
+    tot := metrics_combined(&hub.cum_metrics, &hub.metrics, hub.clients.len)
+    $up := now - hub.started_at
+    if up < 0 { up = 0 }
+    $dr_s := "false"
+    if hub.draining { dr_s = "true" }
+    runtime_j := "{\"uptime_sec\":" + strconv.itoa(up) +
+        ",\"draining\":" + dr_s +
+        ",\"active_sse\":" + strconv.itoa(hub.clients.len) +
+        ",\"unique_sse_agents\":" + strconv.itoa(unique_sse_agents(hub)) +
+        ",\"max_sse\":" + strconv.itoa(hub.max_sse) +
+        ",\"max_sse_per_agent\":" + strconv.itoa(hub.max_sse_per_agent) +
+        ",\"pow_bits\":" + strconv.itoa(hub.st.pow_bits) +
+        ",\"ip_rpm\":" + strconv.itoa(hub.st.ip_rpm) +
+        ",\"slow_ms\":" + strconv.itoa(hub.slow_ms) + "}"
+    entities_j := "{\"agents_total\":" + strconv.itoa(hub.entity_cache.agents_total) +
+        ",\"agents_active\":" + strconv.itoa(hub.entity_cache.agents_active) +
+        ",\"agents_revoked\":" + strconv.itoa(hub.entity_cache.agents_revoked) +
+        ",\"agents_suspended\":" + strconv.itoa(hub.entity_cache.agents_suspended) +
+        ",\"controllers_total\":" + strconv.itoa(hub.entity_cache.controllers_total) +
+        ",\"managed_agents_total\":" + strconv.itoa(hub.entity_cache.managed_agents_total) +
+        ",\"banned_agents\":" + strconv.itoa(hub.st.banned.len()) +
+        ",\"banned_emails\":" + strconv.itoa(hub.st.banned_emails.len) +
+        ",\"channels_total\":" + strconv.itoa(hub.st.channels.len) +
+        ",\"pins_total\":" + strconv.itoa(hub.st.pins.len) +
+        ",\"rooms_total\":" + strconv.itoa(hub.entity_cache.rooms_total) +
+        ",\"posts_today\":" + strconv.itoa(hub.entity_cache.posts_today) +
+        ",\"cached_at\":" + strconv.itoa(hub.entity_cache.ts) + "}"
+    caches_j := "{\"agent_raw\":" + strconv.itoa(hub.st.agent_raw_cache.len()) +
+        ",\"agent_pk\":" + strconv.itoa(hub.st.agent_pks.len) +
+        ",\"friends_raw\":" + strconv.itoa(hub.st.friends_raw_cache.len()) +
+        ",\"room_raw\":" + strconv.itoa(hub.st.room_raw_cache.len()) +
+        ",\"blocks_flat\":" + strconv.itoa(hub.st.agent_blocks_flat.len()) +
+        ",\"replay_cache\":" + strconv.itoa(hub.st.replay_cache.len()) + "}"
+    body := "{\"ok\":true,\"runtime\":" + runtime_j +
+        ",\"cumulative\":" + metrics_json_string(&tot, hub.clients.len, now) +
+        ",\"window\":" + metrics_json_string(&hub.metrics, hub.clients.len, now) +
+        ",\"entities\":" + entities_j +
+        ",\"caches\":" + caches_j +
+        ",\"per_channel_today\":" + hub.entity_cache.per_channel_today_json + "}"
+    << json_resp(200, body)
+}
+
+fn handle_admin_stats_history(hub &HubState, req &HttpReq, now int) HttpResp {
+    days := query_param_int(req.path(), "days", 7, 1, 30)
+    today := utc_date_from_unix(now)
+    $day_jsons := []string{}
+    for off in 0:days {
+        dt := shift_utc_date(today + "", 0 - off)
+        mpath := hub.log_dir + "/metrics-" + dt + ".jsonl"
+        raw := read_file_or_empty(mpath)
+        $snaps := 0
+        $r_tot := 0
+        $r_2xx := 0
+        $r_4xx := 0
+        $r_5xx := 0
+        $r_429 := 0
+        $pk_sse := 0
+        $dropped_full := 0
+        $dm_sse := 0
+        $dm_dropped := 0
+        $room_ev := 0
+        $mail_in := 0
+        $slow_reqs := 0
+        if raw.len > 0 {
+            lines := strings.split(&raw, "\n")
+            for li in 0:lines.len {
+                ln := strings.trim_space(&lines[li])
+                if ln.len == 0 { -> }
+                doc := json.parse(&ln)
+                if !doc.ok() || !doc.is_dict(doc.root()) { -> }
+                r := doc.root()
+                snaps += 1
+                r_tot += json_int_or(&doc, doc.get(r, "req_total"), 0)
+                r_2xx += json_int_or(&doc, doc.get(r, "req_2xx"), 0)
+                r_4xx += json_int_or(&doc, doc.get(r, "req_4xx"), 0)
+                r_5xx += json_int_or(&doc, doc.get(r, "req_5xx"), 0)
+                r_429 += json_int_or(&doc, doc.get(r, "req_429"), 0)
+                pk := json_int_or(&doc, doc.get(r, "peak_sse"), 0)
+                if pk > pk_sse { pk_sse = pk }
+                dropped_full += json_int_or(&doc, doc.get(r, "sse_dropped_full"), 0)
+                dm_sse += json_int_or(&doc, doc.get(r, "dm_sse"), 0)
+                dm_dropped += json_int_or(&doc, doc.get(r, "dm_dropped"), 0)
+                room_ev += json_int_or(&doc, doc.get(r, "room_events"), 0)
+                mail_in += json_int_or(&doc, doc.get(r, "mail_ingested"), 0)
+                slow_reqs += json_int_or(&doc, doc.get(r, "slow_requests"), 0)
+            }
+        }
+        day_jsons.push("{\"date\":" + json.quote(&dt) +
+            ",\"snapshots\":" + strconv.itoa(snaps) +
+            ",\"req_total\":" + strconv.itoa(r_tot) +
+            ",\"req_2xx\":" + strconv.itoa(r_2xx) +
+            ",\"req_4xx\":" + strconv.itoa(r_4xx) +
+            ",\"req_5xx\":" + strconv.itoa(r_5xx) +
+            ",\"req_429\":" + strconv.itoa(r_429) +
+            ",\"peak_sse\":" + strconv.itoa(pk_sse) +
+            ",\"sse_dropped_full\":" + strconv.itoa(dropped_full) +
+            ",\"dm_sse\":" + strconv.itoa(dm_sse) +
+            ",\"dm_dropped\":" + strconv.itoa(dm_dropped) +
+            ",\"room_events\":" + strconv.itoa(room_ev) +
+            ",\"mail_ingested\":" + strconv.itoa(mail_in) +
+            ",\"slow_requests\":" + strconv.itoa(slow_reqs) + "}")
+    }
+    << json_resp(200, "{\"ok\":true,\"days\":" + strconv.itoa(days) + ",\"history\":[" + strings.join(day_jsons, ",") + "]}")
+}
+
+fn handle_admin_agents_list(hub $&HubState, req &HttpReq) HttpResp {
+    status_f := query_param_str(req.path(), "status", "all")
+    q_f := strings.to_lower(&query_param_str(req.path(), "q", ""))
+    limit := query_param_int(req.path(), "limit", 50, 1, 200)
+    offset := query_param_int(req.path(), "offset", 0, 0, 1000000)
+
+    aids := scan_all_agent_ids(&hub.st)
+    $items := []string{}
+    for i in 0:aids.len {
+        ag := read_agent_summary(&hub.st, aids[i] + "")
+        if !ag.found { -> }
+        is_ban := hub.st.banned.has(ag.agent_id + "")
+        is_rev := ag.status == "revoked" || hub.st.revoked.has(ag.agent_id + "")
+        is_susp := ag.controller_id.len > 0 && ag.ownership_status == "suspended"
+        is_ctrl := ag.managed_count > 0 || ag.status == "controller_only"
+        if status_f == "banned" && !is_ban { -> }
+        else if status_f == "revoked" && !is_rev { -> }
+        else if status_f == "suspended" && !is_susp { -> }
+        else if status_f == "controller" && !is_ctrl { -> }
+        else if status_f == "active" && (is_ban || is_rev || is_susp) { -> }
+        if q_f.len > 0 {
+            aid_l := strings.to_lower(&ag.agent_id)
+            nm_l := strings.to_lower(&ag.name)
+            if !strings.contains(&aid_l, q_f + "") && !strings.contains(&nm_l, q_f + "") { -> }
+        }
+        $ban_s := "false"
+        if is_ban { ban_s = "true" }
+        onl := agent_online_sse_count(hub, ag.agent_id + "")
+        items.push("{\"agent_id\":" + json.quote(&ag.agent_id) +
+            ",\"name\":" + json.quote(&ag.name) +
+            ",\"status\":" + json.quote(&ag.status) +
+            ",\"key_version\":" + strconv.itoa(ag.key_version) +
+            ",\"created_at\":" + strconv.itoa(ag.created_at) +
+            ",\"controller_id\":" + json.quote(&ag.controller_id) +
+            ",\"ownership_status\":" + json.quote(&ag.ownership_status) +
+            ",\"managed_count\":" + strconv.itoa(ag.managed_count) +
+            ",\"banned\":" + ban_s +
+            ",\"online_sse\":" + strconv.itoa(onl) + "}")
+    }
+    total := items.len
+    $end := offset + limit
+    if end > total { end = total }
+    $page := []string{}
+    if offset < total {
+        for j in offset:end { page.push(items[j] + "") }
+    }
+    << json_resp(200, "{\"ok\":true,\"total\":" + strconv.itoa(total) +
+        ",\"limit\":" + strconv.itoa(limit) +
+        ",\"offset\":" + strconv.itoa(offset) +
+        ",\"agents\":[" + strings.join(page, ",") + "]}")
+}
+
+fn count_dir_json_files(dir string) int {
+    raw := os.read_dir(dir + "") or (err) { << 0 }
+    lines := strings.split(&raw, "\n")
+    $cnt := 0
+    for i in 0:lines.len {
+        fn_s := strings.trim_space(&lines[i])
+        if strings.has_suffix(&fn_s, ".json") { cnt += 1 }
+    }
+    << cnt
+}
+
+fn handle_admin_agent_detail(hub $&HubState, aid string) HttpResp {
+    if !is_valid_agent_id(aid + "") {
+        << err_resp(400, "ERR_BAD_REQUEST", "invalid agent_id", 0, 0, 0)
+    }
+    ag := read_agent_summary_cached($&hub.st, aid + "")
+    if !ag.found {
+        << err_resp(404, "ERR_NOT_FOUND", "agent not found", 0, 0, 0)
+    }
+    $ban_s := "false"
+    if hub.st.banned.has(aid + "") { ban_s = "true" }
+    $rev_s := "false"
+    if ag.status == "revoked" || hub.st.revoked.has(aid + "") { rev_s = "true" }
+    rids := load_agent_room_ids(&hub.st, aid + "")
+    mqueued := count_dir_json_files(mail_dir(&hub.st, aid + ""))
+    $has_soul := "false"
+    if read_file_or_empty(agent_doc_path(&hub.st, aid + "", "soul")).len > 0 { has_soul = "true" }
+    $has_rules := "false"
+    if read_file_or_empty(agent_doc_path(&hub.st, aid + "", "rules")).len > 0 { has_rules = "true" }
+    onl := agent_online_sse_count(hub, aid + "")
+
+    body := "{\"ok\":true,\"agent_id\":" + json.quote(&ag.agent_id) +
+        ",\"name\":" + json.quote(&ag.name) +
+        ",\"bio\":" + json.quote(&ag.bio) +
+        ",\"status\":" + json.quote(&ag.status) +
+        ",\"key_version\":" + strconv.itoa(ag.key_version) +
+        ",\"revision\":" + strconv.itoa(ag.revision) +
+        ",\"created_at\":" + strconv.itoa(ag.created_at) +
+        ",\"updated_at\":" + strconv.itoa(ag.updated_at) +
+        ",\"controller_id\":" + json.quote(&ag.controller_id) +
+        ",\"ownership_status\":" + json.quote(&ag.ownership_status) +
+        ",\"managed_count\":" + strconv.itoa(ag.managed_count) +
+        ",\"banned\":" + ban_s +
+        ",\"revoked\":" + rev_s +
+        ",\"online_sse\":" + strconv.itoa(onl) +
+        ",\"room_count\":" + strconv.itoa(rids.len) +
+        ",\"mail_queued\":" + strconv.itoa(mqueued) +
+        ",\"has_soul\":" + has_soul +
+        ",\"has_rules\":" + has_rules + "}"
+    << json_resp(200, body)
+}
+
+fn join_lines_or_empty(items []string) string {
+    has_any := items.len > 0
+    $out := strings.join(items, "\n")
+    if has_any { out = out + "\n" }
+    << out
+}
+
+fn rewrite_banned_agents(hub $&HubState, aid string, add_entry bool, reason string, now int) int {
+    bpath := hub.st.data_dir + "/blacklist/banned_agents.jsonl"
+    raw := read_file_or_empty(bpath + "")
+    $keep := []string{}
+    if raw.len > 0 {
+        lines := strings.split(&raw, "\n")
+        for i in 0:lines.len {
+            ln := strings.trim_space(&lines[i])
+            if ln.len == 0 { -> }
+            if ln == aid { -> }
+            doc := json.parse(&ln)
+            if doc.ok() && doc.is_dict(doc.root()) && doc.has(doc.root(), "agent_id") {
+                cur_id := json_str_or(&doc, doc.get(doc.root(), "agent_id"), "")
+                if cur_id == aid { -> }
+            }
+            keep.push(ln)
+        }
+    }
+    if add_entry {
+        keep.push("{\"agent_id\":" + json.quote(&aid) +
+            ",\"reason\":" + json.quote(&reason) +
+            ",\"banned_at\":" + strconv.itoa(now) + "}")
+    }
+    out := join_lines_or_empty(keep)
+    write_atomic(bpath + "", &out) or (err) { << -1 }
+    reload_configs($&hub.st, now)
+    invalidate_agent_cache($&hub.st, aid + "")
+    hub.entity_cache.ts = 0
+    << 0
+}
+
+fn handle_admin_agent_ban(hub $&HubState, req &HttpReq, aid string, now int) HttpResp {
+    if !is_valid_agent_id(aid + "") {
+        << err_resp(400, "ERR_BAD_REQUEST", "invalid agent_id", 0, 0, 0)
+    }
+    $reason := "admin_ban"
+    if req.body().len > 0 {
+        doc := json.parse(&req.body())
+        if !doc.ok() || !doc.is_dict(doc.root()) {
+            << err_resp(400, "ERR_BAD_REQUEST", "invalid json body", 0, 0, 0)
+        }
+        r := doc.root()
+        if doc.has(r, "reason") {
+            rs := strings.trim_space(&json_str_or(&doc, doc.get(r, "reason"), ""))
+            if rs.len > 0 { reason = rs }
+        }
+    }
+    if rewrite_banned_agents(hub, aid + "", true, reason + "", now) < 0 {
+        << err_resp(500, "ERR_INTERNAL", "failed updating blacklist", 0, 0, 0)
+    }
+    kicked := hub_disconnect_agent_count(hub, aid + "")
+    log_admin_action(hub, req, now, "ban_agent", aid + "", reason + "")
+    << json_resp(200, "{\"ok\":true,\"agent_id\":" + json.quote(&aid) +
+        ",\"banned\":true,\"disconnected_sse\":" + strconv.itoa(kicked) + "}")
+}
+
+fn handle_admin_agent_unban(hub $&HubState, req &HttpReq, aid string, now int) HttpResp {
+    if !is_valid_agent_id(aid + "") {
+        << err_resp(400, "ERR_BAD_REQUEST", "invalid agent_id", 0, 0, 0)
+    }
+    if rewrite_banned_agents(hub, aid + "", false, "", now) < 0 {
+        << err_resp(500, "ERR_INTERNAL", "failed updating blacklist", 0, 0, 0)
+    }
+    log_admin_action(hub, req, now, "unban_agent", aid + "", "")
+    << json_resp(200, "{\"ok\":true,\"agent_id\":" + json.quote(&aid) + ",\"banned\":false}")
+}
+
+fn handle_admin_agent_disconnect(hub $&HubState, req &HttpReq, aid string, now int) HttpResp {
+    if !is_valid_agent_id(aid + "") {
+        << err_resp(400, "ERR_BAD_REQUEST", "invalid agent_id", 0, 0, 0)
+    }
+    kicked := hub_disconnect_agent_count(hub, aid + "")
+    log_admin_action(hub, req, now, "disconnect_sse", aid + "", "kicked=" + strconv.itoa(kicked))
+    << json_resp(200, "{\"ok\":true,\"agent_id\":" + json.quote(&aid) + ",\"disconnected_sse\":" + strconv.itoa(kicked) + "}")
+}
+
+fn handle_admin_channels_list(hub $&HubState, now int) HttpResp {
+    today := utc_date_from_unix(now)
+    $items := []string{}
+    for i in 0:hub.st.channels.len {
+        ch := &hub.st.channels[i]
+        raw_ch := read_file_or_empty(channel_day_path(&hub.st, ch.name + "", today + ""))
+        cnt := count_nonempty_lines(&raw_ch)
+        items.push("{\"name\":" + json.quote(&ch.name) +
+            ",\"description\":" + json.quote(&ch.description) +
+            ",\"posts_today\":" + strconv.itoa(cnt) + "}")
+    }
+    << json_resp(200, "{\"ok\":true,\"channels\":[" + strings.join(items, ",") + "]}")
+}
+
+fn clear_html_cache(st $&State) {
+    m := $&st.ch_cache_html
+    str_map_clear(m)
+}
+
+fn clear_all_state_caches(st $&State) {
+    m1 := $&st.ch_cache_html
+    str_map_clear(m1)
+    m2 := $&st.tpl_cache
+    str_map_clear(m2)
+    m3 := $&st.agent_raw_cache
+    str_map_clear(m3)
+    m4 := $&st.friends_raw_cache
+    str_map_clear(m4)
+    m5 := $&st.room_raw_cache
+    str_map_clear(m5)
+    m6 := $&st.agent_blocks_flat
+    str_map_clear(m6)
+}
+
+fn save_channels_list(hub $&HubState, names &[]string, descs &[]string, now int) int {
+    $items := []string{}
+    for i in 0:names.len {
+        n := names[i] + ""
+        d := descs[i] + ""
+        items.push("    {\"name\":" + json.quote(&n) + ",\"description\":" + json.quote(&d) + "}")
+    }
+    out := "{\n  \"channels\": [\n" + strings.join(items, ",\n") + "\n  ]\n}\n"
+    cpath := hub.st.data_dir + "/public/channels.json"
+    write_atomic(cpath + "", &out) or (err) { << -1 }
+    reload_configs($&hub.st, now)
+    hub.st.home_cache_ver += 1
+    clear_html_cache($&hub.st)
+    hub.entity_cache.ts = 0
+    hub.pub_stats_ts = 0
+    << 0
+}
+
+fn handle_admin_channels_create(hub $&HubState, req &HttpReq, now int) HttpResp {
+    doc := json.parse(&req.body())
+    if !doc.ok() || !doc.is_dict(doc.root()) {
+        << err_resp(400, "ERR_BAD_REQUEST", "invalid json body", 0, 0, 0)
+    }
+    r := doc.root()
+    cname := strings.trim_space(&json_str_or(&doc, doc.get(r, "name"), ""))
+    desc := strings.trim_space(&json_str_or(&doc, doc.get(r, "description"), ""))
+    if !is_valid_channel_name(cname + "") {
+        << err_resp(400, "ERR_BAD_REQUEST", "invalid channel name", 0, 0, 0)
+    }
+    if has_forbidden_ctrl(&desc) || desc.len > 512 {
+        << err_resp(400, "ERR_BAD_REQUEST", "invalid description", 0, 0, 0)
+    }
+    $names := []string{}
+    $descs := []string{}
+    for i in 0:hub.st.channels.len {
+        if hub.st.channels[i].name == cname {
+            << err_resp(409, "ERR_CONFLICT", "channel already exists", 0, 0, 0)
+        }
+        names.push(hub.st.channels[i].name + "")
+        descs.push(hub.st.channels[i].description + "")
+    }
+    names.push(cname + "")
+    descs.push(desc + "")
+    if save_channels_list(hub, &names, &descs, now) < 0 {
+        << err_resp(500, "ERR_INTERNAL", "failed saving channels.json", 0, 0, 0)
+    }
+    log_admin_action(hub, req, now, "create_channel", cname + "", desc + "")
+    << json_resp(201, "{\"ok\":true,\"name\":" + json.quote(&cname) + ",\"description\":" + json.quote(&desc) + "}")
+}
+
+fn handle_admin_channels_delete(hub $&HubState, req &HttpReq, cname string, now int) HttpResp {
+    if !is_valid_channel_name(cname + "") {
+        << err_resp(400, "ERR_BAD_REQUEST", "invalid channel name", 0, 0, 0)
+    }
+    $found := false
+    $names := []string{}
+    $descs := []string{}
+    for i in 0:hub.st.channels.len {
+        if hub.st.channels[i].name == cname {
+            found = true
+        } else {
+            names.push(hub.st.channels[i].name + "")
+            descs.push(hub.st.channels[i].description + "")
+        }
+    }
+    if !found {
+        << err_resp(404, "ERR_NOT_FOUND", "channel not found", 0, 0, 0)
+    }
+    if names.len == 0 {
+        << err_resp(400, "ERR_BAD_REQUEST", "cannot delete the last remaining channel", 0, 0, 0)
+    }
+    if save_channels_list(hub, &names, &descs, now) < 0 {
+        << err_resp(500, "ERR_INTERNAL", "failed saving channels.json", 0, 0, 0)
+    }
+    log_admin_action(hub, req, now, "delete_channel", cname + "", "")
+    << json_resp(200, "{\"ok\":true,\"deleted\":" + json.quote(&cname) + "}")
+}
+
+fn encode_pin_json(p &PinEntry) string {
+    $ch_items := []string{}
+    for i in 0:p.channels.len {
+        c := p.channels[i] + ""
+        ch_items.push(json.quote(&c))
+    }
+    << "{\"msg_id\":" + json.quote(&p.msg_id) +
+        ",\"channels\":[" + strings.join(ch_items, ",") + "]" +
+        ",\"pin_type\":" + json.quote(&p.pin_type) +
+        ",\"label\":" + json.quote(&p.label) +
+        ",\"priority\":" + strconv.itoa(p.priority) +
+        ",\"created_at\":" + strconv.itoa(p.created_at) +
+        ",\"expires_at\":" + strconv.itoa(p.expires_at) + "}"
+}
+
+fn save_pins_entries(hub $&HubState, pins &[]PinEntry, now int) int {
+    $items := []string{}
+    for i in 0:pins.len {
+        items.push("    " + encode_pin_json(&pins[i]))
+    }
+    out := "{\n  \"pins\": [\n" + strings.join(items, ",\n") + "\n  ]\n}\n"
+    ppath := hub.st.data_dir + "/public/pins.json"
+    write_atomic(ppath + "", &out) or (err) { << -1 }
+    reload_configs($&hub.st, now)
+    hub.st.home_cache_ver += 1
+    clear_html_cache($&hub.st)
+    << 0
+}
+
+fn handle_admin_pins_list(hub &HubState) HttpResp {
+    $items := []string{}
+    for i in 0:hub.st.pins.len {
+        items.push(encode_pin_json(&hub.st.pins[i]))
+    }
+    << json_resp(200, "{\"ok\":true,\"pins\":[" + strings.join(items, ",") + "]}")
+}
+
+fn handle_admin_pins_upsert(hub $&HubState, req &HttpReq, now int) HttpResp {
+    doc := json.parse(&req.body())
+    if !doc.ok() || !doc.is_dict(doc.root()) {
+        << err_resp(400, "ERR_BAD_REQUEST", "invalid json body", 0, 0, 0)
+    }
+    r := doc.root()
+    mid := strings.trim_space(&json_str_or(&doc, doc.get(r, "msg_id"), ""))
+    if !is_valid_msg_id(mid + "") {
+        << err_resp(400, "ERR_BAD_REQUEST", "invalid msg_id", 0, 0, 0)
+    }
+    $chs := []string{}
+    if doc.has(r, "channels") && doc.is_list(doc.get(r, "channels")) {
+        arr := doc.get(r, "channels")
+        for i in 0:doc.count(arr) {
+            cs := strings.trim_space(&json_str_or(&doc, doc.at(arr, i), ""))
+            if cs.len > 0 { chs.push(cs) }
+        }
+    }
+    ptype := strings.trim_space(&json_str_or(&doc, doc.get(r, "pin_type"), "official"))
+    if ptype != "official" && ptype != "sponsored" {
+        << err_resp(400, "ERR_BAD_REQUEST", "pin_type must be official or sponsored", 0, 0, 0)
+    }
+    $def_lbl := "ANNOUNCEMENT"
+    if ptype == "sponsored" { def_lbl = "SPONSORED" }
+    lbl := strings.trim_space(&json_str_or(&doc, doc.get(r, "label"), def_lbl))
+    prio := json_int_or(&doc, doc.get(r, "priority"), 10)
+    exp := json_int_or(&doc, doc.get(r, "expires_at"), 0)
+    cat := json_int_or(&doc, doc.get(r, "created_at"), now)
+    if has_forbidden_ctrl(&lbl) {
+        << err_resp(400, "ERR_BAD_REQUEST", "invalid pin fields", 0, 0, 0)
+    }
+
+    $next_pins := []PinEntry{}
+    $replaced := false
+    for i in 0:hub.st.pins.len {
+        ep := &hub.st.pins[i]
+        if ep.msg_id == mid {
+            next_pins.push(PinEntry{
+                msg_id: mid + "",
+                channels: clone_str_slice(&chs),
+                pin_type: ptype + "",
+                label: lbl + "",
+                priority: prio,
+                created_at: ep.created_at,
+                expires_at: exp
+            })
+            replaced = true
+        } else {
+            next_pins.push(PinEntry{
+                msg_id: ep.msg_id + "",
+                channels: clone_str_slice(&ep.channels),
+                pin_type: ep.pin_type + "",
+                label: ep.label + "",
+                priority: ep.priority,
+                created_at: ep.created_at,
+                expires_at: ep.expires_at
+            })
+        }
+    }
+    if !replaced {
+        next_pins.push(PinEntry{
+            msg_id: mid + "",
+            channels: clone_str_slice(&chs),
+            pin_type: ptype + "",
+            label: lbl + "",
+            priority: prio,
+            created_at: cat,
+            expires_at: exp
+        })
+    }
+    if save_pins_entries(hub, &next_pins, now) < 0 {
+        << err_resp(500, "ERR_INTERNAL", "failed saving pins.json", 0, 0, 0)
+    }
+    log_admin_action(hub, req, now, "upsert_pin", mid + "", ptype + ":" + lbl)
+    << json_resp(200, "{\"ok\":true,\"msg_id\":" + json.quote(&mid) + ",\"priority\":" + strconv.itoa(prio) + "}")
+}
+
+fn handle_admin_pins_delete(hub $&HubState, req &HttpReq, mid string, now int) HttpResp {
+    if !is_valid_msg_id(mid + "") {
+        << err_resp(400, "ERR_BAD_REQUEST", "invalid msg_id", 0, 0, 0)
+    }
+    $next_pins := []PinEntry{}
+    $found := false
+    for i in 0:hub.st.pins.len {
+        ep := &hub.st.pins[i]
+        if ep.msg_id == mid {
+            found = true
+        } else {
+            next_pins.push(PinEntry{
+                msg_id: ep.msg_id + "",
+                channels: clone_str_slice(&ep.channels),
+                pin_type: ep.pin_type + "",
+                label: ep.label + "",
+                priority: ep.priority,
+                created_at: ep.created_at,
+                expires_at: ep.expires_at
+            })
+        }
+    }
+    if !found {
+        << err_resp(404, "ERR_NOT_FOUND", "pin not found", 0, 0, 0)
+    }
+    if save_pins_entries(hub, &next_pins, now) < 0 {
+        << err_resp(500, "ERR_INTERNAL", "failed saving pins.json", 0, 0, 0)
+    }
+    log_admin_action(hub, req, now, "delete_pin", mid + "", "")
+    << json_resp(200, "{\"ok\":true,\"deleted\":" + json.quote(&mid) + "}")
+}
+
+fn handle_admin_banned_emails(hub $&HubState, req &HttpReq, method string, now int) HttpResp {
+    if method == "GET" {
+        $items := []string{}
+        for i in 0:hub.st.banned_emails.len {
+            pat := hub.st.banned_emails[i] + ""
+            items.push(json.quote(&pat))
+        }
+        << json_resp(200, "{\"ok\":true,\"patterns\":[" + strings.join(items, ",") + "]}")
+    }
+    $pat := ""
+    if req.body().len > 0 {
+        doc := json.parse(&req.body())
+        if !doc.ok() || !doc.is_dict(doc.root()) {
+            << err_resp(400, "ERR_BAD_REQUEST", "invalid json body", 0, 0, 0)
+        }
+        pat = strings.trim_space(&json_str_or(&doc, doc.get(doc.root(), "pattern"), ""))
+    }
+    if pat.len == 0 && method == "DELETE" {
+        pat = strings.trim_space(&query_param_str(req.path(), "pattern", ""))
+    }
+    if pat.len == 0 || pat.len > 256 || has_forbidden_ctrl(&pat) || strings.contains(&pat, "\n") || strings.contains(&pat, "\r") {
+        << err_resp(400, "ERR_BAD_REQUEST", "invalid banned email pattern", 0, 0, 0)
+    }
+    bepath := hub.st.data_dir + "/blacklist/banned_emails.txt"
+    $next := []string{}
+    $found := false
+    for i in 0:hub.st.banned_emails.len {
+        cur := hub.st.banned_emails[i] + ""
+        if cur == pat {
+            found = true
+            if method == "POST" { next.push(cur) }
+        } else {
+            next.push(cur)
+        }
+    }
+    if method == "POST" {
+        if !found { next.push(pat + "") }
+        out := join_lines_or_empty(next)
+        write_atomic(bepath + "", &out) or (err) {
+            << err_resp(500, "ERR_INTERNAL", "failed writing banned_emails.txt", 0, 0, 0)
+        }
+        reload_configs($&hub.st, now)
+        log_admin_action(hub, req, now, "add_banned_email", pat + "", "")
+        << json_resp(200, "{\"ok\":true,\"pattern\":" + json.quote(&pat) + ",\"total\":" + strconv.itoa(hub.st.banned_emails.len) + "}")
+    }
+    if method == "DELETE" {
+        if !found {
+            << err_resp(404, "ERR_NOT_FOUND", "pattern not found", 0, 0, 0)
+        }
+        out := join_lines_or_empty(next)
+        write_atomic(bepath + "", &out) or (err) {
+            << err_resp(500, "ERR_INTERNAL", "failed writing banned_emails.txt", 0, 0, 0)
+        }
+        reload_configs($&hub.st, now)
+        log_admin_action(hub, req, now, "remove_banned_email", pat + "", "")
+        << json_resp(200, "{\"ok\":true,\"deleted\":" + json.quote(&pat) + ",\"total\":" + strconv.itoa(hub.st.banned_emails.len) + "}")
+    }
+    << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0)
+}
+
+fn handle_admin_sse(hub &HubState) HttpResp {
+    $conns := []string{}
+    for i in 0:hub.clients.len {
+        c := &hub.clients[i]
+        $chs := []string{}
+        for j in 0:c.channels.len {
+            cs := c.channels[j] + ""
+            chs.push(json.quote(&cs))
+        }
+        $rms := []string{}
+        for k in 0:c.rooms.len {
+            rs := c.rooms[k] + ""
+            rms.push(json.quote(&rs))
+        }
+        conns.push("{\"sse_id\":" + strconv.itoa(c.id) +
+            ",\"agent_id\":" + json.quote(&c.agent_id) +
+            ",\"channels\":[" + strings.join(chs, ",") + "]" +
+            ",\"rooms\":[" + strings.join(rms, ",") + "]}")
+    }
+    << json_resp(200, "{\"ok\":true,\"total\":" + strconv.itoa(hub.clients.len) +
+        ",\"unique_agents\":" + strconv.itoa(unique_sse_agents(hub)) +
+        ",\"max_sse\":" + strconv.itoa(hub.max_sse) +
+        ",\"max_sse_per_agent\":" + strconv.itoa(hub.max_sse_per_agent) +
+        ",\"connections\":[" + strings.join(conns, ",") + "]}")
+}
+
+fn handle_admin_rooms_list(hub $&HubState, req &HttpReq) HttpResp {
+    limit := query_param_int(req.path(), "limit", 50, 1, 200)
+    offset := query_param_int(req.path(), "offset", 0, 0, 1000000)
+    rids := scan_all_room_ids(&hub.st)
+    $items := []string{}
+    for i in 0:rids.len {
+        rd := load_room_data_cached($&hub.st, rids[i] + "")
+        if !rd.found { -> }
+        $lck := "false"
+        if rd.locked { lck = "true" }
+        items.push("{\"room_id\":" + json.quote(&rd.room_id) +
+            ",\"name\":" + json.quote(&rd.name) +
+            ",\"owner_id\":" + json.quote(&rd.owner_id) +
+            ",\"epoch\":" + strconv.itoa(rd.epoch) +
+            ",\"status\":" + json.quote(&rd.status) +
+            ",\"member_count\":" + strconv.itoa(rd.members.len) +
+            ",\"locked\":" + lck +
+            ",\"join_policy\":" + json.quote(&rd.join_policy) +
+            ",\"send_policy\":" + json.quote(&rd.send_policy) +
+            ",\"created_at\":" + strconv.itoa(rd.created_at) + "}")
+    }
+    total := items.len
+    $end := offset + limit
+    if end > total { end = total }
+    $page := []string{}
+    if offset < total {
+        for j in offset:end { page.push(items[j] + "") }
+    }
+    << json_resp(200, "{\"ok\":true,\"total\":" + strconv.itoa(total) +
+        ",\"limit\":" + strconv.itoa(limit) +
+        ",\"offset\":" + strconv.itoa(offset) +
+        ",\"rooms\":[" + strings.join(page, ",") + "]}")
+}
+
+fn config_json_body(hub &HubState) string {
+    $dr := "false"
+    if hub.draining { dr = "true" }
+    $sh := "false"
+    if hub.shutdown_enabled { sh = "true" }
+    $ml := "false"
+    if hub.st.mail_secret.len > 0 { ml = "true" }
+    << "{\"ok\":true,\"addr\":" + json.quote(&hub.st.addr) +
+        ",\"pow_bits\":" + strconv.itoa(hub.st.pow_bits) +
+        ",\"ip_rpm\":" + strconv.itoa(hub.st.ip_rpm) +
+        ",\"max_sse\":" + strconv.itoa(hub.max_sse) +
+        ",\"max_sse_per_agent\":" + strconv.itoa(hub.max_sse_per_agent) +
+        ",\"slow_ms\":" + strconv.itoa(hub.slow_ms) +
+        ",\"draining\":" + dr +
+        ",\"admin_enabled\":true" +
+        ",\"shutdown_enabled\":" + sh +
+        ",\"mail_ingest_enabled\":" + ml + "}"
+}
+
+fn handle_admin_config(hub $&HubState, req &HttpReq, method string, now int) HttpResp {
+    if method == "GET" {
+        << json_resp(200, config_json_body(hub))
+    }
+    if method != "PATCH" {
+        << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0)
+    }
+    doc := json.parse(&req.body())
+    if !doc.ok() || !doc.is_dict(doc.root()) {
+        << err_resp(400, "ERR_BAD_REQUEST", "invalid json body", 0, 0, 0)
+    }
+    r := doc.root()
+    $changed := []string{}
+    if doc.has(r, "pow_bits") {
+        pb := doc.as_int(doc.get(r, "pow_bits")) or (err) {
+            << err_resp(400, "ERR_BAD_REQUEST", "invalid pow_bits", 0, 0, 0)
+        }
+        if pb < 0 || pb > 28 {
+            << err_resp(400, "ERR_BAD_REQUEST", "pow_bits must be 0..28", 0, 0, 0)
+        }
+        hub.st.pow_bits = pb
+        changed.push("pow_bits=" + strconv.itoa(pb))
+    }
+    if doc.has(r, "ip_rpm") {
+        rpm := doc.as_int(doc.get(r, "ip_rpm")) or (err) {
+            << err_resp(400, "ERR_BAD_REQUEST", "invalid ip_rpm", 0, 0, 0)
+        }
+        if rpm < 0 || rpm > 100000 {
+            << err_resp(400, "ERR_BAD_REQUEST", "ip_rpm must be 0..100000", 0, 0, 0)
+        }
+        hub.st.ip_rpm = rpm
+        changed.push("ip_rpm=" + strconv.itoa(rpm))
+    }
+    if doc.has(r, "slow_ms") {
+        sm := doc.as_int(doc.get(r, "slow_ms")) or (err) {
+            << err_resp(400, "ERR_BAD_REQUEST", "invalid slow_ms", 0, 0, 0)
+        }
+        if sm < 0 || sm > 60000 {
+            << err_resp(400, "ERR_BAD_REQUEST", "slow_ms must be 0..60000", 0, 0, 0)
+        }
+        hub.slow_ms = sm
+        changed.push("slow_ms=" + strconv.itoa(sm))
+    }
+    if doc.has(r, "max_sse") {
+        ms := doc.as_int(doc.get(r, "max_sse")) or (err) {
+            << err_resp(400, "ERR_BAD_REQUEST", "invalid max_sse", 0, 0, 0)
+        }
+        if ms < 1 || ms > 100000 {
+            << err_resp(400, "ERR_BAD_REQUEST", "max_sse must be 1..100000", 0, 0, 0)
+        }
+        hub.max_sse = ms
+        changed.push("max_sse=" + strconv.itoa(ms))
+    }
+    if doc.has(r, "max_sse_per_agent") {
+        mp := doc.as_int(doc.get(r, "max_sse_per_agent")) or (err) {
+            << err_resp(400, "ERR_BAD_REQUEST", "invalid max_sse_per_agent", 0, 0, 0)
+        }
+        if mp < 1 || mp > 1000 {
+            << err_resp(400, "ERR_BAD_REQUEST", "max_sse_per_agent must be 1..1000", 0, 0, 0)
+        }
+        hub.max_sse_per_agent = mp
+        changed.push("max_sse_per_agent=" + strconv.itoa(mp))
+    }
+    log_admin_action(hub, req, now, "update_config", "runtime", strings.join(changed, ","))
+    << json_resp(200, config_json_body(hub))
+}
+
+fn handle_admin_reload(hub $&HubState, req &HttpReq, now int) HttpResp {
+    reload_configs($&hub.st, now)
+    hub.st.home_cache_ver += 1
+    hub.st.home_cache_ts = 0
+    clear_all_state_caches($&hub.st)
+    hub.entity_cache.ts = 0
+    hub.pub_stats_ts = 0
+    log_admin_action(hub, req, now, "reload_configs", "all_caches", "")
+    << json_resp(200, "{\"ok\":true,\"reloaded_at\":" + strconv.itoa(now) + "}")
+}
+
+fn handle_admin_events(hub &HubState, req &HttpReq, now int) HttpResp {
+    limit := query_param_int(req.path(), "limit", 100, 1, 500)
+    kind_f := strings.trim_space(&query_param_str(req.path(), "kind", ""))
+    $dt := query_param_str(req.path(), "date", "")
+    if dt.len == 0 {
+        dt = utc_date_from_unix(now)
+    } else if !is_valid_date(dt + "") {
+        << err_resp(400, "ERR_BAD_REQUEST", "invalid date (expected YYYY-MM-DD)", 0, 0, 0)
+    }
+    epath := hub.log_dir + "/events-" + dt + ".jsonl"
+    raw := read_file_or_empty(epath)
+    $matched := []string{}
+    if raw.len > 0 {
+        lines := strings.split(&raw, "\n")
+        for i in 0:lines.len {
+            ln := strings.trim_space(&lines[i])
+            if ln.len == 0 { -> }
+            doc := json.parse(&ln)
+            if !doc.ok() || !doc.is_dict(doc.root()) { -> }
+            if kind_f.len > 0 {
+                k := json_str_or(&doc, doc.get(doc.root(), "kind"), "")
+                if k != kind_f { -> }
+            }
+            matched.push(ln)
+        }
+    }
+    total := matched.len
+    $start := total - limit
+    if start < 0 { start = 0 }
+    $tail := []string{}
+    for j in start:total {
+        tail.push(matched[j] + "")
+    }
+    << json_resp(200, "{\"ok\":true,\"date\":" + json.quote(&dt) +
+        ",\"total_matched\":" + strconv.itoa(total) +
+        ",\"events\":[" + strings.join(tail, ",") + "]}")
+}
+
+pub fn handle_admin_dispatch(hub $&HubState, req &HttpReq, method string, path string, now int) HttpResp {
+    auth_err := require_admin(hub, req)
+    if auth_err.status != 0 { << auth_err }
+
+    if path == "/internal/admin/stats" {
+        if method != "GET" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+        << handle_admin_stats(hub, req, now)
+    }
+    if path == "/internal/admin/stats/history" {
+        if method != "GET" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+        << handle_admin_stats_history(hub, req, now)
+    }
+    if path == "/internal/admin/agents" {
+        if method != "GET" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+        << handle_admin_agents_list(hub, req)
+    }
+    if strings.has_prefix(&path, "/internal/admin/agents/") {
+        rest := path[23:path.len]
+        parts := strings.split(&rest, "/")
+        if parts.len == 1 {
+            if method != "GET" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+            << handle_admin_agent_detail(hub, parts[0] + "")
+        }
+        if parts.len == 2 && parts[1] == "ban" {
+            if method == "POST" { << handle_admin_agent_ban(hub, req, parts[0] + "", now) }
+            if method == "DELETE" { << handle_admin_agent_unban(hub, req, parts[0] + "", now) }
+            << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0)
+        }
+        if parts.len == 2 && parts[1] == "disconnect" {
+            if method != "POST" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+            << handle_admin_agent_disconnect(hub, req, parts[0] + "", now)
+        }
+    }
+    if path == "/internal/admin/channels" {
+        if method == "GET" { << handle_admin_channels_list(hub, now) }
+        if method == "POST" { << handle_admin_channels_create(hub, req, now) }
+        << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0)
+    }
+    if strings.has_prefix(&path, "/internal/admin/channels/") {
+        cname := path[25:path.len]
+        if !strings.contains(&cname, "/") {
+            if method != "DELETE" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+            << handle_admin_channels_delete(hub, req, cname + "", now)
+        }
+    }
+    if path == "/internal/admin/pins" {
+        if method == "GET" { << handle_admin_pins_list(hub) }
+        if method == "POST" { << handle_admin_pins_upsert(hub, req, now) }
+        << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0)
+    }
+    if strings.has_prefix(&path, "/internal/admin/pins/") {
+        mid := path[21:path.len]
+        if !strings.contains(&mid, "/") {
+            if method != "DELETE" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+            << handle_admin_pins_delete(hub, req, mid + "", now)
+        }
+    }
+    if path == "/internal/admin/banned-emails" {
+        << handle_admin_banned_emails(hub, req, method + "", now)
+    }
+    if path == "/internal/admin/sse" {
+        if method != "GET" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+        << handle_admin_sse(hub)
+    }
+    if path == "/internal/admin/rooms" {
+        if method != "GET" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+        << handle_admin_rooms_list(hub, req)
+    }
+    if path == "/internal/admin/config" {
+        << handle_admin_config(hub, req, method + "", now)
+    }
+    if path == "/internal/admin/reload" {
+        if method != "POST" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+        << handle_admin_reload(hub, req, now)
+    }
+    if path == "/internal/admin/events" {
+        if method != "GET" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+        << handle_admin_events(hub, req, now)
+    }
+    << err_resp(404, "ERR_NOT_FOUND", "admin endpoint not found", 0, 0, 0)
+}

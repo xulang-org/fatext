@@ -47,6 +47,19 @@ pub struct HubJob {
     pub reply_ch chan HubReply
 }
 
+pub struct EntityStatsCache {
+    pub ts int
+    pub agents_total int
+    pub agents_active int
+    pub agents_revoked int
+    pub agents_suspended int
+    pub controllers_total int
+    pub managed_agents_total int
+    pub rooms_total int
+    pub posts_today int
+    pub per_channel_today_json string
+}
+
 pub struct HubState {
     pub st State
     pub clients []SseClient
@@ -54,15 +67,37 @@ pub struct HubState {
     pub ip_hits maps.StrInt
     pub ip_window int
     pub log_ch chan string
+    pub log_dir string
     pub slow_ms int
     pub draining bool
     pub started_at int
     pub max_sse int
     pub max_sse_per_agent int
+    pub admin_secret string
+    pub shutdown_enabled bool
     pub metrics MetricsState
+    pub cum_metrics MetricsState
+    pub entity_cache EntityStatsCache
+    pub pub_stats_ts int
+    pub pub_stats_json string
 }
 
-pub fn new_hub_state(st State, log_ch chan string, slow_ms int, now int, max_sse int, max_sse_per_agent int) HubState {
+pub fn empty_entity_stats_cache() EntityStatsCache {
+    << EntityStatsCache{
+        ts: 0,
+        agents_total: 0,
+        agents_active: 0,
+        agents_revoked: 0,
+        agents_suspended: 0,
+        controllers_total: 0,
+        managed_agents_total: 0,
+        rooms_total: 0,
+        posts_today: 0,
+        per_channel_today_json: "{}"
+    }
+}
+
+pub fn new_hub_state(st State, log_ch chan string, log_dir string, slow_ms int, now int, max_sse int, max_sse_per_agent int, admin_secret string, shutdown_enabled bool) HubState {
     << HubState{
         st: st,
         clients: []SseClient{},
@@ -70,12 +105,19 @@ pub fn new_hub_state(st State, log_ch chan string, slow_ms int, now int, max_sse
         ip_hits: maps.new_str_int(),
         ip_window: 0,
         log_ch: log_ch,
+        log_dir: log_dir,
         slow_ms: slow_ms,
         draining: false,
         started_at: now,
         max_sse: max_sse,
         max_sse_per_agent: max_sse_per_agent,
-        metrics: new_metrics_state(now)
+        admin_secret: admin_secret,
+        shutdown_enabled: shutdown_enabled,
+        metrics: new_metrics_state(now),
+        cum_metrics: new_metrics_state(now),
+        entity_cache: empty_entity_stats_cache(),
+        pub_stats_ts: 0,
+        pub_stats_json: ""
     }
 }
 
@@ -114,11 +156,13 @@ pub fn hub_push_to_agent(hub $&HubState, agent_id string, event_type string, dat
     << sent
 }
 
-pub fn hub_disconnect_agent(hub $&HubState, agent_id string) {
+pub fn hub_disconnect_agent_count(hub $&HubState, agent_id string) int {
+    $cnt := 0
     $next_clients := []SseClient{}
     for i in 0:hub.clients.len {
         c := &hub.clients[i]
         if c.agent_id == agent_id {
+            cnt += 1
             _ := send_sse_msg(c, SSE_CTRL_CLOSE)
         } else {
             next_clients.push(SseClient{
@@ -131,6 +175,11 @@ pub fn hub_disconnect_agent(hub $&HubState, agent_id string) {
         }
     }
     hub.clients = next_clients
+    << cnt
+}
+
+pub fn hub_disconnect_agent(hub $&HubState, agent_id string) {
+    _ := hub_disconnect_agent_count(hub, agent_id + "")
 }
 
 pub fn hub_push_dm(hub $&HubState, to_id string, data_json &string) int {
@@ -240,7 +289,7 @@ fn parse_csv_query_param(raw_path string, key string) []string {
     << out
 }
 
-fn url_decode_simple(s &string) string {
+pub fn url_decode_simple(s &string) string {
     $out := ""
     $i := 0
     while i < s.len {
@@ -391,6 +440,16 @@ fn dispatch_http(hub $&HubState, req &HttpReq, now int) HttpResp {
     if path == "/internal/mail/ingest" {
         if method != "POST" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
         << handle_mail_ingest(hub, req, now)
+    }
+    if path == "/internal/metrics" {
+        << handle_internal_metrics(hub, req, now)
+    }
+    if strings.has_prefix(&path, "/internal/admin/") {
+        << handle_admin_dispatch(hub, req, method + "", path + "", now)
+    }
+    if path == "/v1/stats" {
+        if method != "GET" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+        << handle_public_stats(hub, now)
     }
 
     if path == "/v1/agents/register" {
@@ -627,7 +686,7 @@ fn dispatch_http(hub $&HubState, req &HttpReq, now int) HttpResp {
         << serve_home($&hub.st, now)
     }
 
-    if strings.has_prefix(&path, "/v1/") {
+    if strings.has_prefix(&path, "/v1/") || strings.has_prefix(&path, "/internal/") {
         << err_resp(404, "ERR_NOT_FOUND", "endpoint not found", 0, 0, 0)
     }
     << serve_error_html(&hub.st, 404, "ERR_NOT_FOUND", "No page or data resource exists at " + path)
@@ -641,6 +700,13 @@ pub struct ActorPair {
 fn resolve_actor_type_id(req &HttpReq, resp &HttpResp) ActorPair {
     aid := strings.trim_space(&req.header("X-Agent-Id"))
     if aid.len > 0 { << ActorPair{actor_type: "agent", actor_id: aid} }
+    asec := strings.trim_space(&req.header("X-Fatext-Admin-Secret"))
+    if asec.len > 0 { << ActorPair{actor_type: "admin", actor_id: ""} }
+    auth_h := strings.trim_space(&req.header("Authorization"))
+    p_only := path_only(req.path())
+    if auth_h.len > 0 && (p_only == "/internal/metrics" || strings.has_prefix(&p_only, "/internal/admin/")) {
+        << ActorPair{actor_type: "admin", actor_id: ""}
+    }
     sec := strings.trim_space(&req.header("X-Internal-Secret"))
     if sec.len > 0 { << ActorPair{actor_type: "internal", actor_id: ""} }
     if resp.status == 201 && resp.body.len > 0 {
@@ -667,7 +733,8 @@ pub fn hub_loop(hub_init HubState, jobs chan HubJob) {
         if job.kind == HUB_METRIC_FLUSH {
             acl := hub.clients.len
             lch := hub.log_ch
-            metrics_flush_and_reset($&hub.metrics, acl, now, lch)
+            flushed := metrics_flush_and_reset($&hub.metrics, acl, now, lch)
+            metrics_add_into($&hub.cum_metrics, &flushed)
             if job.flag == 1 {
                 job.reply_ch <- reply_http(json_resp(200, "{}"), 0, 0, "", "internal", "")
             }
@@ -718,7 +785,8 @@ pub fn hub_loop(hub_init HubState, jobs chan HubJob) {
             ->
         }
 
-        if !check_ip_rate_limit($&hub, job.req.remote_ip + "", now) {
+        admin_req := is_valid_admin_request(&hub, &job.req)
+        if !admin_req && !check_ip_rate_limit($&hub, job.req.remote_ip + "", now) {
             r429 := err_resp(429, "ERR_RATE_LIMITED", "IP rate limit exceeded", 60, now + 60, 0)
             slow := hub.slow_ms
             metrics_record_http($&hub.metrics, 429, job.req.req_body.len, r429.body.len, q_ms, 0, q_ms, slow)

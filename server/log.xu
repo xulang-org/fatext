@@ -115,7 +115,68 @@ pub fn log_event_json(ch chan string, now int, kind string, fields_json string) 
     log_emit(ch, "events", s)
 }
 
-pub fn metrics_flush_and_reset(m $&MetricsState, active_sse int, now int, ch chan string) {
+pub fn metrics_add_into(dst $&MetricsState, src &MetricsState) {
+    if src.peak_sse > dst.peak_sse { dst.peak_sse = src.peak_sse }
+    dst.req_total += src.req_total
+    dst.req_2xx += src.req_2xx
+    dst.req_4xx += src.req_4xx
+    dst.req_5xx += src.req_5xx
+    dst.req_429 += src.req_429
+    dst.bytes_in += src.bytes_in
+    dst.bytes_out += src.bytes_out
+    dst.tls_ok += src.tls_ok
+    dst.tls_fail += src.tls_fail
+    dst.sse_opened += src.sse_opened
+    dst.sse_closed += src.sse_closed
+    dst.sse_events_pushed += src.sse_events_pushed
+    dst.sse_dropped_full += src.sse_dropped_full
+    dst.dm_sse += src.dm_sse
+    dst.dm_webhook += src.dm_webhook
+    dst.dm_dropped += src.dm_dropped
+    dst.room_events += src.room_events
+    dst.mail_ingested += src.mail_ingested
+    dst.mail_gc_deleted += src.mail_gc_deleted
+    dst.slow_requests += src.slow_requests
+    dst.b_le5 += src.b_le5
+    dst.b_le20 += src.b_le20
+    dst.b_le100 += src.b_le100
+    dst.b_le500 += src.b_le500
+    dst.b_gt500 += src.b_gt500
+    if src.max_total_ms > dst.max_total_ms { dst.max_total_ms = src.max_total_ms }
+    if src.max_queue_ms > dst.max_queue_ms { dst.max_queue_ms = src.max_queue_ms }
+    if src.max_handle_ms > dst.max_handle_ms { dst.max_handle_ms = src.max_handle_ms }
+}
+
+pub fn metrics_combined(cum &MetricsState, cur &MetricsState, active_sse int) MetricsState {
+    $out := MetricsState{
+        started_at: cum.started_at, window_start: cur.window_start, peak_sse: cum.peak_sse,
+        req_total: cum.req_total, req_2xx: cum.req_2xx, req_4xx: cum.req_4xx, req_5xx: cum.req_5xx, req_429: cum.req_429,
+        bytes_in: cum.bytes_in, bytes_out: cum.bytes_out,
+        tls_ok: cum.tls_ok, tls_fail: cum.tls_fail, sse_opened: cum.sse_opened, sse_closed: cum.sse_closed,
+        sse_events_pushed: cum.sse_events_pushed, sse_dropped_full: cum.sse_dropped_full,
+        dm_sse: cum.dm_sse, dm_webhook: cum.dm_webhook, dm_dropped: cum.dm_dropped,
+        room_events: cum.room_events, mail_ingested: cum.mail_ingested, mail_gc_deleted: cum.mail_gc_deleted,
+        slow_requests: cum.slow_requests, b_le5: cum.b_le5, b_le20: cum.b_le20, b_le100: cum.b_le100, b_le500: cum.b_le500, b_gt500: cum.b_gt500,
+        max_total_ms: cum.max_total_ms, max_queue_ms: cum.max_queue_ms, max_handle_ms: cum.max_handle_ms
+    }
+    metrics_add_into($&out, cur)
+    if active_sse > out.peak_sse { out.peak_sse = active_sse }
+    << out
+}
+
+pub fn metrics_flush_and_reset(m $&MetricsState, active_sse int, now int, ch chan string) MetricsState {
+    $snap := MetricsState{
+        started_at: m.started_at, window_start: m.window_start, peak_sse: m.peak_sse,
+        req_total: m.req_total, req_2xx: m.req_2xx, req_4xx: m.req_4xx, req_5xx: m.req_5xx, req_429: m.req_429,
+        bytes_in: m.bytes_in, bytes_out: m.bytes_out,
+        tls_ok: m.tls_ok, tls_fail: m.tls_fail, sse_opened: m.sse_opened, sse_closed: m.sse_closed,
+        sse_events_pushed: m.sse_events_pushed, sse_dropped_full: m.sse_dropped_full,
+        dm_sse: m.dm_sse, dm_webhook: m.dm_webhook, dm_dropped: m.dm_dropped,
+        room_events: m.room_events, mail_ingested: m.mail_ingested, mail_gc_deleted: m.mail_gc_deleted,
+        slow_requests: m.slow_requests, b_le5: m.b_le5, b_le20: m.b_le20, b_le100: m.b_le100, b_le500: m.b_le500, b_gt500: m.b_gt500,
+        max_total_ms: m.max_total_ms, max_queue_ms: m.max_queue_ms, max_handle_ms: m.max_handle_ms
+    }
+    if active_sse > snap.peak_sse { snap.peak_sse = active_sse }
     t_iso := utc_iso_from_unix(now)
     win_sec := now - m.window_start
     uptime := now - m.started_at
@@ -185,6 +246,7 @@ pub fn metrics_flush_and_reset(m $&MetricsState, active_sse int, now int, ch cha
     m.max_total_ms = 0
     m.max_queue_ms = 0
     m.max_handle_ms = 0
+    << snap
 }
 
 fn is_rotated_log_filename(fname string) int {
@@ -298,13 +360,34 @@ pub fn normalize_route(raw_path string) string {
     if path == "/" || path == "/dl" || path == "/dl/" || path == "/help" || path == "/health" || path == "/ready" || path == "/internal/shutdown" || path == "/llms.txt" || path == "/llms-full.txt" ||
        path == "/SKILL.md" || path == "/protocol.md" || path == "/.well-known/fatext.json" ||
        path == "/static/fatext.css" || path == "/static/favicon.svg" || path == "/favicon.ico" ||
-       path == "/static/logo.svg" || path == "/internal/mail/ingest" ||
+       path == "/static/logo.svg" || path == "/internal/mail/ingest" || path == "/internal/metrics" || path == "/v1/stats" ||
        path == "/v1/agents/register" || path == "/v1/agents/profile" || path == "/v1/agents/rotate-key" ||
        path == "/v1/agents/revoke" || path == "/v1/agents/docs" || path == "/v1/ctl/agents" ||
        path == "/v1/friends" || path == "/v1/friends/request" || path == "/v1/friends/accept" ||
        path == "/v1/friends/reject" || path == "/v1/blocks" || path == "/v1/mail" || path == "/v1/stream" ||
        path == "/v1/rooms" {
         << path
+    }
+    if strings.has_prefix(&path, "/internal/admin/") {
+        rest := path[16:path.len]
+        parts := strings.split(&rest, "/")
+        if parts.len == 1 {
+            if parts[0] == "stats" || parts[0] == "agents" || parts[0] == "channels" ||
+               parts[0] == "pins" || parts[0] == "banned-emails" || parts[0] == "sse" ||
+               parts[0] == "rooms" || parts[0] == "config" || parts[0] == "reload" || parts[0] == "events" {
+                << path
+            }
+        } else if parts.len == 2 {
+            if parts[0] == "stats" && parts[1] == "history" { << "/internal/admin/stats/history" }
+            if parts[0] == "agents" { << "/internal/admin/agents/{id}" }
+            if parts[0] == "channels" { << "/internal/admin/channels/{name}" }
+            if parts[0] == "pins" { << "/internal/admin/pins/{id}" }
+        } else if parts.len == 3 && parts[0] == "agents" {
+            if parts[2] == "ban" || parts[2] == "disconnect" {
+                << "/internal/admin/agents/{id}/" + parts[2]
+            }
+        }
+        << "/internal/admin/{other}"
     }
     if strings.has_prefix(&path, "/v1/agents/docs/") { << "/v1/agents/docs/{kind}" }
     if strings.has_prefix(&path, "/dl/") { << "/dl/{file}" }

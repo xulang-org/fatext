@@ -34,6 +34,7 @@ fi
 if [[ ! -f /etc/fatext/fatext.env ]]; then
   SECRET="$(openssl rand -hex 32)"
   SHUTDOWN_SECRET="$(openssl rand -hex 32)"
+  ADMIN_SECRET="$(openssl rand -hex 32)"
   cat >/etc/fatext/fatext.env <<EOF
 FATEXT_ADDR=0.0.0.0:443
 FATEXT_HTTP_REDIRECT_ADDR=0.0.0.0:80
@@ -59,9 +60,10 @@ FATEXT_LOG_STDOUT=1
 FATEXT_TRUST_PROXY=0
 FATEXT_MAIL_INTERNAL_SECRET=${SECRET}
 FATEXT_SHUTDOWN_SECRET=${SHUTDOWN_SECRET}
+FATEXT_ADMIN_SECRET=${ADMIN_SECRET}
 EOF
   chmod 0600 /etc/fatext/fatext.env
-  echo "Created /etc/fatext/fatext.env (generated FATEXT_MAIL_INTERNAL_SECRET & FATEXT_SHUTDOWN_SECRET)."
+  echo "Created /etc/fatext/fatext.env (generated mail, shutdown & admin secrets)."
 fi
 
 cp /opt/fatext/config/channels.json /var/lib/fatext/public/channels.json

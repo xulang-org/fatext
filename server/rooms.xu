@@ -157,7 +157,7 @@ fn load_room_data(st &State, room_id string) RoomData {
     << parse_room_raw(room_id + "", &raw)
 }
 
-fn load_room_data_cached(st $&State, room_id string) RoomData {
+pub fn load_room_data_cached(st $&State, room_id string) RoomData {
     if st.room_raw_cache.has(room_id + "") {
         cached := str_map_get_or(&st.room_raw_cache, room_id + "", "")
         << parse_room_raw(room_id + "", &cached)
@@ -298,7 +298,7 @@ fn delete_room_keybox_file(st &State, rid string) {
     os.remove(room_keybox_path(st, rid + "")) or (err) { << }
 }
 
-fn load_agent_room_ids(st &State, aid string) []string {
+pub fn load_agent_room_ids(st &State, aid string) []string {
     $out := []string{}
     raw := os.read(agent_rooms_path(st, aid + "")) or (err) { << out }
     doc := json.parse(&raw)

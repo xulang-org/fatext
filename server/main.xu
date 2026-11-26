@@ -89,7 +89,7 @@ fn is_static_or_dl_path(p &string) bool {
         (strings.has_prefix(p, "/dl/") && p.len > 4)
 }
 
-fn const_time_str_eq(a &string, b &string) bool {
+pub fn const_time_str_eq(a &string, b &string) bool {
     if a.len != b.len { << false }
     $diff := 0
     for i in 0:a.len {
@@ -451,6 +451,7 @@ fn main() int {
     pow_bits := getenv_int_or("FATEXT_POW_BITS", 20)
     mail_secret := os.getenv("FATEXT_MAIL_INTERNAL_SECRET")
     shutdown_secret := os.getenv("FATEXT_SHUTDOWN_SECRET")
+    admin_secret := os.getenv("FATEXT_ADMIN_SECRET")
     ip_rpm := getenv_int_or("FATEXT_IP_RPM", 600)
     tls_cert_path := os.getenv("FATEXT_TLS_CERT")
     tls_key_path := os.getenv("FATEXT_TLS_KEY")
@@ -498,7 +499,7 @@ fn main() int {
     xu logger_loop(log_dir + "", retain_days, stdout_mirror, log_ch, flush_done)
 
     now0 := time.now_time().unix()
-    hub := new_hub_state(st, log_ch, slow_ms, now0, max_sse, max_sse_per_agent)
+    hub := new_hub_state(st, log_ch, log_dir + "", slow_ms, now0, max_sse, max_sse_per_agent, admin_secret + "", shutdown_secret.len > 0)
     jobs := chan HubJob{cap: 128}
     xu hub_loop(hub, jobs)
     xu maintenance_loop(data_dir + "", ch_names, log_ch, jobs)
@@ -533,8 +534,11 @@ fn main() int {
         scheme = "https"
         tls_s = "true"
     }
+    $adm_s := "false"
+    if admin_secret.len > 0 { adm_s = "true" }
     log_event_json(log_ch, now0, "server_start",
         "\"addr\":" + json.quote(&addr) + ",\"tls\":" + tls_s +
+        ",\"admin_enabled\":" + adm_s +
         ",\"pow_bits\":" + strconv.itoa(pow_bits) + ",\"ip_rpm\":" + strconv.itoa(ip_rpm) +
         ",\"max_conns\":" + strconv.itoa(max_conns) + ",\"max_conns_per_ip\":" + strconv.itoa(max_conns_per_ip) +
         ",\"tls_handshake_ms\":" + strconv.itoa(tls_handshake_ms) +
