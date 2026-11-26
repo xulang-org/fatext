@@ -75,6 +75,7 @@ pub struct HubState {
     pub max_sse int
     pub max_sse_per_agent int
     pub admin_secret string
+    pub admin_local_only bool
     pub shutdown_enabled bool
     pub cert_ch chan CertStoreMsg
     pub tls_cert_path string
@@ -101,7 +102,7 @@ pub fn empty_entity_stats_cache() EntityStatsCache {
     }
 }
 
-pub fn new_hub_state(st State, log_ch chan string, webhook_ch chan string, log_dir string, slow_ms int, now int, max_sse int, max_sse_per_agent int, admin_secret string, shutdown_enabled bool, cert_ch chan CertStoreMsg, tls_cert_path string, tls_key_path string) HubState {
+pub fn new_hub_state(st State, log_ch chan string, webhook_ch chan string, log_dir string, slow_ms int, now int, max_sse int, max_sse_per_agent int, admin_secret string, admin_local_only bool, shutdown_enabled bool, cert_ch chan CertStoreMsg, tls_cert_path string, tls_key_path string) HubState {
     << HubState{
         st: st,
         clients: []SseClient{},
@@ -117,6 +118,7 @@ pub fn new_hub_state(st State, log_ch chan string, webhook_ch chan string, log_d
         max_sse: max_sse,
         max_sse_per_agent: max_sse_per_agent,
         admin_secret: admin_secret,
+        admin_local_only: admin_local_only,
         shutdown_enabled: shutdown_enabled,
         cert_ch: cert_ch,
         tls_cert_path: tls_cert_path,

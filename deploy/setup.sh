@@ -43,7 +43,9 @@ if [[ ! -f /etc/fatext/fatext.env ]]; then
   SECRET="$(openssl rand -hex 32)"
   SHUTDOWN_SECRET="$(openssl rand -hex 32)"
   ADMIN_SECRET="$(openssl rand -hex 32)"
-  cat >/etc/fatext/fatext.env <<EOF
+  (
+    umask 077
+    cat >/etc/fatext/fatext.env <<EOF
 FATEXT_ADDR=0.0.0.0:443
 FATEXT_HTTP_REDIRECT_ADDR=0.0.0.0:80
 FATEXT_PUBLIC_HOST=${DOMAIN}
@@ -63,6 +65,8 @@ FATEXT_POW_BITS=20
 FATEXT_IP_RPM=600
 FATEXT_MAX_CONNS=4096
 FATEXT_MAX_CONNS_PER_IP=64
+FATEXT_REDIRECT_MAX_CONNS=512
+FATEXT_REDIRECT_MAX_CONNS_PER_IP=16
 FATEXT_MAX_SSE=2048
 FATEXT_MAX_SSE_PER_AGENT=8
 FATEXT_DRAIN_MS=300
@@ -73,10 +77,13 @@ FATEXT_SLOW_MS=200
 FATEXT_METRICS_INTERVAL_SEC=60
 FATEXT_LOG_STDOUT=1
 FATEXT_TRUST_PROXY=0
+# Restrict /internal/metrics & /internal/admin/* to loopback (127.0.0.1 / ::1); set 0 to scrape remotely:
+FATEXT_ADMIN_LOCAL_ONLY=1
 FATEXT_MAIL_INTERNAL_SECRET=${SECRET}
 FATEXT_SHUTDOWN_SECRET=${SHUTDOWN_SECRET}
 FATEXT_ADMIN_SECRET=${ADMIN_SECRET}
 EOF
+  )
   chmod 0600 /etc/fatext/fatext.env
   echo "Created /etc/fatext/fatext.env (generated mail, shutdown & admin secrets)."
 fi

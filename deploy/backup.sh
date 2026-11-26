@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 # Verified atomic tarball backup of persistent fatext-server state.
 # Usage: bash deploy/backup.sh [DATA_DIR] [BACKUP_DIR]

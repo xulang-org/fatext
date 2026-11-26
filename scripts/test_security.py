@@ -8,6 +8,7 @@ import hashlib
 import http.client
 import json
 import os
+import shutil
 import socket
 import ssl
 import subprocess
@@ -161,7 +162,7 @@ def generate_san_cert(workdir: Path) -> tuple[Path, Path]:
 
 
 def test_tls_redirect_and_headers(td_p: Path) -> None:
-    print("[1/5] Port-80 redirect host/path sanitization + TLS/HTML security headers...")
+    print("[1/7] Port-80 redirect host/path sanitization + TLS/HTML security headers...")
     cert_p, key_p = generate_san_cert(td_p)
     tls_port = free_tcp_port()
     redir_port = free_tcp_port()
@@ -224,7 +225,7 @@ def test_tls_redirect_and_headers(td_p: Path) -> None:
 
 
 def test_http_smuggling_and_slowloris(host: str, port: int) -> None:
-    print("[2/5] HTTP CL/TE smuggling, malformed headers, and Slowloris cumulative deadline...")
+    print("[2/7] HTTP CL/TE smuggling, malformed headers, and Slowloris cumulative deadline...")
     smuggle_payloads = [
         b"POST /health HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nContent-Length: 0\r\n\r\n0\r\n\r\n",
         b"POST /health HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello",
@@ -271,7 +272,7 @@ def test_http_smuggling_and_slowloris(host: str, port: int) -> None:
 
 
 def test_restore_rejects_symlinks(td_p: Path) -> None:
-    print("[3/5] deploy/restore.sh rejects symlinks in backup archive...")
+    print("[3/7] deploy/restore.sh rejects symlinks in backup archive...")
     src_dir = td_p / "bad_backup_src"
     (src_dir / "keys").mkdir(parents=True, exist_ok=True)
     evil_link = src_dir / "keys" / "evil_link"
@@ -297,7 +298,7 @@ def main() -> int:
         test_tls_redirect_and_headers(td_p)
         test_restore_rejects_symlinks(td_p)
 
-        print("[4/5] Testing SSRF, SSR single-pass, XFF right-to-left, SSE compaction, room/post/mail bounds...")
+        print("[4/7] Testing SSRF, SSR single-pass, XFF right-to-left, SSE compaction, room/post/mail bounds...")
         port = free_tcp_port()
         api_url = f"http://{HOST}:{port}"
         data_dir = td_p / "main_data"
@@ -490,14 +491,223 @@ def main() -> int:
             assert_true("198.51.100.9" in ips_logged, f"expected rightmost XFF IP 198.51.100.9 in {ips_logged}")
             assert_true("1.2.3.4" not in ips_logged, f"spoofed leftmost XFF IP 1.2.3.4 must not be logged: {ips_logged}")
 
-            print("[5/5] Running HTTP smuggling & Slowloris test...")
+            # Friend reject must still succeed cleanly
+            st_rej, _ = signed_http(HOST, port, aid_b, home_b / "private.pem", "POST", "/v1/friends/reject", json.dumps({"agent_id": aid_a}).encode("utf-8"))
+            assert_eq(st_rej, 200, "friend reject should return 200")
+
+            # SSR /a/{id} must redact webhook_url path/query tokens
+            rc, _, err = run_cli(
+                ["--json", "profile", "set", "--webhook-url", "https://example.com/hooks/secret-token-99?k=1"],
+                home=str(home_b), api_url=api_url,
+            )
+            assert_eq(rc, 0, f"set B webhook failed: {err}")
+            with urllib.request.urlopen(f"{api_url}/a/{aid_b}", timeout=5.0) as ar:
+                a_html = ar.read().decode("utf-8")
+            assert_true("https://example.com/" in a_html, "redacted webhook host missing from /a/{id}")
+            assert_true("secret-token-99" not in a_html and "k=1" not in a_html, f"webhook path/query leaked on /a/{aid_b}")
+
+            print("[5/7] Running HTTP smuggling & Slowloris test...")
             test_http_smuggling_and_slowloris(HOST, port)
         finally:
             if srv.poll() is None:
                 srv.terminate()
                 srv.wait(timeout=5)
 
-    print("ALL 5 SERVER SECURITY REGRESSION TESTS PASSED.")
+        print("[6/7] Testing admin local-only, shutdown audit, static/dl rate limit, and banned transfer/credential guards...")
+        p6_port = free_tcp_port()
+        p6_url = f"http://{HOST}:{p6_port}"
+        p6_data = td_p / "p6_data"
+        p6_logs = td_p / "p6_logs"
+        p6_dl = td_p / "p6_dl"
+        p6_data.mkdir(parents=True, exist_ok=True)
+        p6_logs.mkdir(parents=True, exist_ok=True)
+        p6_dl.mkdir(parents=True, exist_ok=True)
+        (p6_dl / "test.bin").write_text("fatext-dl-payload", encoding="utf-8")
+
+        adm_sec = "adm-sec-r2-9182"
+        sd_sec = "sd-sec-r2-7741"
+        p6_env = os.environ.copy()
+        p6_env.update({
+            "FATEXT_ADDR": f"{HOST}:{p6_port}",
+            "FATEXT_DATA_DIR": str(p6_data),
+            "FATEXT_LOG_DIR": str(p6_logs),
+            "FATEXT_WWW_DIR": str(WWW_DIR),
+            "FATEXT_TEMPLATES_DIR": str(TPL_DIR),
+            "FATEXT_DL_DIR": str(p6_dl),
+            "FATEXT_POW_BITS": "8",
+            "FATEXT_TRUST_PROXY": "1",
+            "FATEXT_ADMIN_SECRET": adm_sec,
+            "FATEXT_ADMIN_LOCAL_ONLY": "1",
+            "FATEXT_SHUTDOWN_SECRET": sd_sec,
+            "FATEXT_IP_RPM": "25",
+        })
+        srv6 = subprocess.Popen([str(SERVER_BIN)], env=p6_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            wait_http_ok(f"{p6_url}/health")
+
+            # Wrong admin secret -> 403 and logged (never logging wrong secret value)
+            bad_tok = "wrong-secret-never-log-me"
+            req_bad_adm = urllib.request.Request(
+                f"{p6_url}/internal/admin/stats",
+                headers={"X-Fatext-Admin-Secret": bad_tok, "X-Forwarded-For": "203.0.113.55"},
+            )
+            try:
+                urllib.request.urlopen(req_bad_adm, timeout=5.0)
+                raise AssertionError("expected 403 on bad admin secret")
+            except urllib.error.HTTPError as e:
+                assert_eq(e.code, 403, "bad admin secret 403")
+
+            # Valid admin secret from loopback succeeds even with X-Forwarded-For external IP when FATEXT_ADMIN_LOCAL_ONLY=1
+            req_ok_adm = urllib.request.Request(
+                f"{p6_url}/internal/admin/stats",
+                headers={"X-Fatext-Admin-Secret": adm_sec, "X-Forwarded-For": "203.0.113.55"},
+            )
+            with urllib.request.urlopen(req_ok_adm, timeout=5.0) as r:
+                assert_eq(r.status, 200, "loopback admin allowed despite XFF")
+
+            # Register Controller C2, Agent M1, Agent M2; invite M2 to room; then admin-ban M2
+            h_c2, h_m1, h_m2 = td_p / "h_c2", td_p / "h_m1", td_p / "h_m2"
+            assert_eq(run_cli(["--json", "init", "--name", "C2"], home=str(h_c2), api_url=p6_url)[0], 0, "init C2")
+            _, out1, _ = run_cli(["--json", "init", "--name", "M1"], home=str(h_m1), api_url=p6_url)
+            _, out2, _ = run_cli(["--json", "init", "--name", "M2"], home=str(h_m2), api_url=p6_url)
+            id_m1 = json.loads(out1.strip())["agent_id"]
+            id_m2 = json.loads(out2.strip())["agent_id"]
+
+            assert_eq(run_cli(["friend", "add", id_m2], home=str(h_m1), api_url=p6_url)[0], 0, "m1->m2")
+            assert_eq(run_cli(["friend", "accept", id_m1], home=str(h_m2), api_url=p6_url)[0], 0, "m2 accept")
+            _, r_out, _ = run_cli(["--json", "room", "create", "--name", "BanTransRoom"], home=str(h_m1), api_url=p6_url)
+            rid2 = json.loads(r_out.strip()).get("room_id") or json.loads(r_out.strip())["room"]["room_id"]
+            assert_eq(run_cli(["room", "invite", rid2, id_m2], home=str(h_m1), api_url=p6_url)[0], 0, "invite m2")
+
+            # Admin ban M2
+            ban_req = urllib.request.Request(
+                f"{p6_url}/internal/admin/agents/{id_m2}/ban",
+                data=b'{"reason":"sec-test"}',
+                method="POST",
+                headers={"Content-Type": "application/json", "X-Fatext-Admin-Secret": adm_sec},
+            )
+            with urllib.request.urlopen(ban_req, timeout=5.0) as br:
+                assert_eq(br.status, 200, "admin ban m2 200")
+
+            # Transferring room ownership to banned M2 -> 403 ERR_AGENT_BANNED
+            st_tr, tr_j = signed_http(HOST, p6_port, id_m1, h_m1 / "private.pem", "POST", f"/v1/rooms/{rid2}/transfer", json.dumps({"agent_id": id_m2}).encode("utf-8"))
+            assert_eq(st_tr, 403, f"transfer to banned agent rejected: {tr_j}")
+            assert_eq(tr_j.get("error", {}).get("code"), "ERR_AGENT_BANNED", f"unexpected error code: {tr_j}")
+
+            # Granting controller credential to banned M2 -> 403 ERR_AGENT_BANNED
+            _, cid_out, _ = run_cli(["--json", "whoami"], home=str(h_c2), api_url=p6_url)
+            id_c2 = json.loads(cid_out.strip())["agent_id"]
+            ts_g = int(time.time())
+            grant_body = json.dumps({"payload": {"kind": "agent_cert", "agent_id": id_m2, "agent_key_version": 1, "agent_pub_fp": "sha256:00", "cred_id": "crd_banned", "controller_id": id_c2, "controller_key_version": 1, "issued_at": ts_g, "expires_at": ts_g + 3600, "scopes": ["all"], "label": "x"}, "controller_sig": "ZmFrZQ=="}).encode("utf-8")
+            st_gr, gr_j = signed_http(HOST, p6_port, id_c2, h_c2 / "private.pem", "POST", f"/v1/ctl/agents/{id_m2}/credential", grant_body)
+            assert_eq(st_gr, 403, f"credential grant to banned agent rejected: {gr_j}")
+            assert_eq(gr_j.get("error", {}).get("code"), "ERR_AGENT_BANNED", f"unexpected error code: {gr_j}")
+
+            # /dl/ and /llms.txt share static IP_RPM rate limit (use distinct XFF IP to start from 0/25)
+            hit_429 = False
+            for i in range(30):
+                st_req = urllib.request.Request(
+                    f"{p6_url}/dl/test.bin" if i % 2 == 0 else f"{p6_url}/llms.txt",
+                    headers={"X-Forwarded-For": "198.51.100.77"},
+                )
+                try:
+                    with urllib.request.urlopen(st_req, timeout=5.0) as sr:
+                        assert_eq(sr.status, 200, "static pre-limit 200")
+                except urllib.error.HTTPError as e:
+                    assert_eq(e.code, 429, f"expected 429 on static rate limit, got {e.code}")
+                    hit_429 = True
+                    break
+            assert_true(hit_429, "static /dl/ route bypassed FATEXT_IP_RPM")
+
+            # Shutdown wrong secret -> 403 + logged; right secret -> 200 + clean exit
+            bad_sd_tok = "wrong-sd-never-log"
+            try:
+                urllib.request.urlopen(urllib.request.Request(f"{p6_url}/internal/shutdown", data=b"", method="POST", headers={"X-Fatext-Shutdown-Secret": bad_sd_tok}), timeout=5.0)
+                raise AssertionError("expected 403 on bad shutdown secret")
+            except urllib.error.HTTPError as e:
+                assert_eq(e.code, 403, "bad shutdown secret 403")
+
+            with urllib.request.urlopen(urllib.request.Request(f"{p6_url}/internal/shutdown", data=b"", method="POST", headers={"X-Fatext-Shutdown-Secret": sd_sec}), timeout=5.0) as sdr:
+                assert_eq(sdr.status, 200, "valid loopback shutdown 200")
+            rc_exit = srv6.wait(timeout=8.0)
+            assert_eq(rc_exit, 0, f"server shutdown exit code {rc_exit}")
+
+            ev6 = "\n".join(p.read_text(encoding="utf-8") for p in p6_logs.glob("events-*.jsonl"))
+            assert_true('"kind":"admin_auth_fail"' in ev6, "missing admin_auth_fail audit event")
+            assert_true('"kind":"shutdown_auth_fail"' in ev6, "missing shutdown_auth_fail audit event")
+            assert_true('"kind":"shutdown_requested"' in ev6, "missing shutdown_requested audit event")
+            assert_true(bad_tok not in ev6 and adm_sec not in ev6 and sd_sec not in ev6 and bad_sd_tok not in ev6, "secrets leaked into events log!")
+        finally:
+            if srv6.poll() is None:
+                srv6.terminate()
+                srv6.wait(timeout=5)
+
+        print("[7/7] Testing Cloudflare Email Worker spoofing resistance & deploy script hardening...")
+        for sh_file in sorted((ROOT / "deploy").glob("*.sh")):
+            r_sh = subprocess.run(["bash", "-n", str(sh_file)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            assert_eq(r_sh.returncode, 0, f"bash -n failed on {sh_file}: {r_sh.stderr}")
+        gs_txt = (ROOT / "deploy" / "graceful_stop.sh").read_text(encoding="utf-8")
+        assert_true("FATEXT_ACME_DOMAINS" in gs_txt, "graceful_stop.sh must detect FATEXT_ACME_DOMAINS")
+        sync_bad = subprocess.run(
+            ["bash", str(ROOT / "deploy" / "sync_dl.sh"), "latest", str(td_p / "dl_out"), "http://127.0.0.1/key.pem"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5.0,
+        )
+        assert_true(sync_bad.returncode != 0 and "http://" in sync_bad.stderr, f"sync_dl.sh must reject http:// OFFICIAL_PEM: {sync_bad.stderr}")
+
+        node_bin = shutil.which("node") or next(
+            (p for p in ("/opt/homebrew/bin/node", "/usr/local/bin/node") if Path(p).is_file()),
+            None,
+        )
+        for js_rel in ("deploy/email-worker/worker.js", "workers/email-worker/src/index.js"):
+            js_txt = (ROOT / js_rel).read_text(encoding="utf-8")
+            assert_true("const first = parts[0] || \"\";" in js_txt, f"{js_rel} must inspect only topmost auth-results header")
+            assert_true("for (const part of parts)" not in js_txt, f"{js_rel} still scans all comma-separated auth-results parts")
+            assert_true(r"/^(?:[a-z0-9-]+\.)*cloudflare\.(?:net|com)$/" in js_txt, f"{js_rel} missing strict CLOUDFLARE_AUTHSERV_RE")
+        if node_bin is not None:
+            for js_rel in ("deploy/email-worker/worker.js", "workers/email-worker/src/index.js"):
+                js_path = ROOT / js_rel
+                r_chk = subprocess.run([node_bin, "--check", str(js_path)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                assert_eq(r_chk.returncode, 0, f"node --check failed on {js_rel}: {r_chk.stderr}")
+            js_test = r'''
+import * as w1 from "./deploy/email-worker/worker.js";
+import * as w2 from "./workers/email-worker/src/index.js";
+function assert(cond, msg) { if (!cond) throw new Error(msg); }
+const okHdr = "mx.cloudflare.net; spf=pass smtp.mailfrom=a@b.com; dkim=pass; dmarc=pass";
+assert(w1.parseAuthResults(okHdr).spf_pass === true, "w1 legit spf");
+assert(w1.parseAuthResults(okHdr).dkim_pass === true, "w1 legit dkim");
+assert(w2.parseAuthResult(okHdr, "spf") === true, "w2 legit spf");
+assert(w2.parseAuthResult(okHdr, "dmarc") === true, "w2 legit dmarc");
+for (const spoof of [
+  "evil-cloudflare.com; spf=pass; dkim=pass; dmarc=pass",
+  "notcloudflare.net; spf=pass; dkim=pass",
+  "mx.cloudflare.org; spf=pass",
+  "mx.attacker.example; spf=fail, mx.cloudflare.net; spf=pass; dkim=pass"
+]) {
+  const r1 = w1.parseAuthResults(spoof);
+  assert(!r1.spf_pass && !r1.dkim_pass && !r1.dmarc_pass, "w1 accepted spoof: " + spoof);
+  assert(!w2.parseAuthResult(spoof, "spf") && !w2.parseAuthResult(spoof, "dkim"), "w2 accepted spoof: " + spoof);
+}
+'''
+            r_js = subprocess.run([node_bin, "--input-type=module", "-e", js_test], cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            assert_eq(r_js.returncode, 0, f"email worker security check failed: {r_js.stderr}")
+        elif sys.platform == "darwin" and shutil.which("osascript"):
+            for js_rel, fn_check in [
+                ("deploy/email-worker/worker.js", "parseAuthResults(okHdr).spf_pass === true && !parseAuthResults(spoof).spf_pass"),
+                ("workers/email-worker/src/index.js", "parseAuthResult(okHdr, 'spf') === true && !parseAuthResult(spoof, 'spf')"),
+            ]:
+                src_raw = (ROOT / js_rel).read_text(encoding="utf-8")
+                src_stripped = src_raw.split("export {")[0]
+                jxa = (
+                    src_stripped
+                    + "\nconst okHdr = 'mx.cloudflare.net; spf=pass; dkim=pass; dmarc=pass';"
+                    + "\nconst spoofs = ['evil-cloudflare.com; spf=pass', 'notcloudflare.net; spf=pass', 'mx.cloudflare.org; spf=pass', 'mx.attacker.example; spf=fail, mx.cloudflare.net; spf=pass'];"
+                    + f"\nfor (var i = 0; i < spoofs.length; i++) {{ var spoof = spoofs[i]; if (!({fn_check})) throw new Error('failed ' + spoof); }}"
+                    + "\n'ok';"
+                )
+                r_jxa = subprocess.run(["osascript", "-l", "JavaScript", "-e", jxa], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                assert_eq(r_jxa.returncode, 0, f"JXA worker check failed for {js_rel}: {r_jxa.stderr}")
+
+    print("ALL 7 SERVER SECURITY REGRESSION TESTS PASSED.")
     return 0
 
 

@@ -501,7 +501,35 @@ pub fn is_valid_ip_literal(s &string) bool {
     << net.parse_ip(s).len > 0
 }
 
-fn host_has_numeric_ip_obfuscation(host &string) bool {
+pub fn is_loopback_ip_str(ip_str &string) bool {
+    if ip_str.len == 0 || ip_str.len > 64 { << false }
+    ip := net.parse_ip(ip_str)
+    if ip.len == 4 {
+        << (ip[0] & 255) == 127
+    }
+    if ip.len == 16 {
+        $v4_mapped := (ip[10] & 255) == 255 && (ip[11] & 255) == 255
+        if v4_mapped {
+            for i in 0:10 {
+                if (ip[i] & 255) != 0 {
+                    v4_mapped = false
+                    <-
+                }
+            }
+        }
+        if v4_mapped {
+            << (ip[12] & 255) == 127
+        }
+        if (ip[15] & 255) != 1 { << false }
+        for i in 0:15 {
+            if (ip[i] & 255) != 0 { << false }
+        }
+        << true
+    }
+    << false
+}
+
+pub fn host_has_numeric_ip_obfuscation(host &string) bool {
     // Reject decimal integer hosts (e.g. 2130706433) and hex/octal IPv4 labels (0x7f..., 0177.0.0.1)
     $all_digits := host.len > 0
     for i in 0:host.len {

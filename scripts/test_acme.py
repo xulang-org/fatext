@@ -487,6 +487,14 @@ def make_acme_handler(state: MockACMEState):
                 tok = ch["token"]
                 expected_key_auth = f"{tok}.{thumb}"
 
+                # Wrong Host on active ACME token MUST be rejected (404)
+                bad_conn = http.client.HTTPConnection(HOST, state.http_challenge_port, timeout=5.0)
+                bad_conn.request("GET", f"/.well-known/acme-challenge/{tok}", headers={"Host": "evil.attacker.com"})
+                bad_resp = bad_conn.getresponse()
+                bad_resp.read()
+                bad_conn.close()
+                assert_eq(bad_resp.status, 404, f"HTTP-01 callback with mismatched Host must return 404 for {tok}")
+
                 # Real HTTP-01 callback to fatext-server's port-80 listener!
                 conn = http.client.HTTPConnection(HOST, state.http_challenge_port, timeout=5.0)
                 conn.request("GET", f"/.well-known/acme-challenge/{tok}", headers={"Host": "app.fatext.test"})
@@ -1039,11 +1047,122 @@ def main() -> int:
 
                 _, _, _, ts_b = sni_https_request(st_https_port, "static.fatext.test", ca.root_crt, "GET", "/health")
                 assert_eq(int(ts_b["serial_hex"], 16), sb_serial, "hot-reloaded static TLS must serve Cert B immediately")
+
+                # Append a corrupted intermediate certificate block -> reload must fail with 400 and keep Cert B
+                corrupt_chain = sb_crt + "\n-----BEGIN CERTIFICATE-----\naW52YWxpZC1jZXJ0\n-----END CERTIFICATE-----\n"
+                st_crt_p.write_text(corrupt_chain, encoding="utf-8")
+                rc_corrupt, _, _, _ = sni_https_request(
+                    st_https_port, "static.fatext.test", ca.root_crt, "POST", "/internal/admin/reload", b"",
+                    {"X-Fatext-Admin-Secret": ADMIN_SECRET},
+                )
+                assert_eq(rc_corrupt, 400, "corrupted intermediate certificate reload must return 400")
+                _, _, _, ts_still_b = sni_https_request(st_https_port, "static.fatext.test", ca.root_crt, "GET", "/health")
+                assert_eq(int(ts_still_b["serial_hex"], 16), sb_serial, "failed chain reload must leave active Cert B untouched")
             finally:
                 stop_proc(proc4)
 
             st_ev_text = "\n".join(f.read_text(encoding="utf-8") for f in (st_data_dir / "logs").glob("events-*.jsonl"))
             assert_true('"kind":"tls_cert_reloaded"' in st_ev_text, "missing tls_cert_reloaded event")
+
+            # --- Phase 9: ACME SSRF/redirect guards & port-80/port-443 connection isolation ---
+            print("[9/9] Testing ACME 302/cross-origin rejection & port-80/443 conn isolation...")
+
+            class BadAcmeHandler(BaseHTTPRequestHandler):
+                protocol_version = "HTTP/1.1"
+                mode = "redirect"
+
+                def log_message(self, format, *args):
+                    return
+
+                def do_GET(self):
+                    if BadAcmeHandler.mode == "redirect":
+                        self.send_response(302)
+                        self.send_header("Location", f"{acme_base}/directory")
+                        self.send_header("Content-Length", "0")
+                        self.send_header("Connection", "close")
+                        self.end_headers()
+                    else:
+                        payload = json.dumps({
+                            "newNonce": f"{acme_base}/new-nonce",
+                            "newAccount": f"{acme_base}/new-account",
+                            "newOrder": f"{acme_base}/new-order",
+                        }).encode("utf-8")
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", str(len(payload)))
+                        self.send_header("Connection", "close")
+                        self.end_headers()
+                        self.wfile.write(payload)
+
+            bad_acme_port = free_tcp_port()
+            bad_acme_srv = ThreadingHTTPServer((HOST, bad_acme_port), BadAcmeHandler)
+            bad_thr = threading.Thread(target=bad_acme_srv.serve_forever, daemon=True)
+            bad_thr.start()
+            try:
+                for test_mode, expect_substr in [("redirect", "directory http 302"), ("cross_origin", "cross-origin")]:
+                    BadAcmeHandler.mode = test_mode
+                    bad_tdir = work / f"bad_acme_{test_mode}"
+                    bad_https = free_tcp_port()
+                    bad_http = free_tcp_port()
+                    bad_aenv = os.environ.copy()
+                    bad_aenv.update({
+                        "FATEXT_ADDR": f"{HOST}:{bad_https}",
+                        "FATEXT_HTTP_REDIRECT_ADDR": f"{HOST}:{bad_http}",
+                        "FATEXT_ACME_DOMAINS": "app.fatext.test",
+                        "FATEXT_ACME_DIR": str(bad_tdir / "acme"),
+                        "FATEXT_ACME_DIRECTORY_URL": f"http://127.0.0.1:{bad_acme_port}/directory",
+                        "FATEXT_DATA_DIR": str(bad_tdir),
+                        "FATEXT_WWW_DIR": str(WWW_DIR),
+                        "FATEXT_TEMPLATES_DIR": str(TPL_DIR),
+                    })
+                    r_bad = subprocess.run([str(SERVER_BIN)], env=bad_aenv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=15.0)
+                    assert_true(r_bad.returncode != 0, f"ACME mode={test_mode} must fail closed")
+                    comb = (r_bad.stdout + r_bad.stderr).lower()
+                    assert_true(expect_substr in comb, f"ACME mode={test_mode} expected {expect_substr!r} in output: {comb!r}")
+            finally:
+                bad_acme_srv.shutdown()
+
+            # Port-80 connection limit must NOT starve HTTPS port-443
+            iso_https = free_tcp_port()
+            iso_http = free_tcp_port()
+            iso_dir = work / "iso_data"
+            st_crt_p.write_text(sa_crt, encoding="utf-8")
+            st_key_p.write_text(sa_key, encoding="utf-8")
+            iso_env = dict(st_env)
+            iso_env.update({
+                "FATEXT_ADDR": f"{HOST}:{iso_https}",
+                "FATEXT_HTTP_REDIRECT_ADDR": f"{HOST}:{iso_http}",
+                "FATEXT_DATA_DIR": str(iso_dir),
+                "FATEXT_MAX_CONNS": "32",
+                "FATEXT_MAX_CONNS_PER_IP": "32",
+                "FATEXT_REDIRECT_MAX_CONNS": "2",
+                "FATEXT_REDIRECT_MAX_CONNS_PER_IP": "2",
+            })
+            proc5 = subprocess.Popen([str(SERVER_BIN)], env=iso_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            held_socks = []
+            try:
+                wait_https_ready(iso_https, "static.fatext.test", ca.root_crt, proc5)
+                for _ in range(2):
+                    held_socks.append(socket.create_connection((HOST, iso_http), timeout=5.0))
+                time.sleep(0.1)
+                with socket.create_connection((HOST, iso_http), timeout=2.0) as s3:
+                    s3.sendall(b"GET /health HTTP/1.1\r\nHost: static.fatext.test\r\nConnection: close\r\n\r\n")
+                    s3.settimeout(1.5)
+                    extra_r = b""
+                    try:
+                        extra_r = s3.recv(1024)
+                    except OSError:
+                        pass
+                    assert_eq(extra_r, b"", f"3rd port-80 socket should be rejected at FATEXT_REDIRECT_MAX_CONNS=2, got {extra_r!r}")
+                st_iso, _, _, _ = sni_https_request(iso_https, "static.fatext.test", ca.root_crt, "GET", "/health")
+                assert_eq(st_iso, 200, "HTTPS port-443 must remain healthy when port-80 slots are full")
+            finally:
+                for hs in held_socks:
+                    try:
+                        hs.close()
+                    except OSError:
+                        pass
+                stop_proc(proc5)
 
             print("ALL ACME v2 & ZERO-DOWNTIME TLS TESTS PASSED!")
             return 0

@@ -360,6 +360,7 @@ fn emit_room_event(hub $&HubState, rd &RoomData, kind string, actor string, extr
 fn room_agent_usable_error(st &State, tag &AgentSummary) string {
     if !tag.found { << "ERR_NOT_FOUND" }
     if tag.status == "revoked" { << "ERR_REVOKED" }
+    if st.banned.has(tag.agent_id + "") { << "ERR_AGENT_BANNED" }
     if tag.controller_id.len > 0 && st.revoked.has(tag.controller_id + "") { << "ERR_CONTROLLER_REVOKED" }
     if tag.controller_id.len > 0 && st.banned.has(tag.controller_id + "") { << "ERR_CONTROLLER_BANNED" }
     if tag.ownership_status == "suspended" { << "ERR_AGENT_SUSPENDED" }
@@ -916,6 +917,15 @@ fn handle_room_transfer(hub $&HubState, req &HttpReq, rid string, now int) HttpR
     nidx := room_find_member_idx(&rd, new_owner + "")
     if nidx < 0 {
         << err_resp(404, "ERR_NOT_FOUND", "new owner must already be a room member", 0, 0, 0)
+    }
+    ntag := read_agent_summary(&hub.st, new_owner + "")
+    uerr := room_agent_usable_error(&hub.st, &ntag)
+    if uerr.len > 0 { << room_target_err_resp(uerr + "") }
+    if rd.join_policy == "controller_only" {
+        same_ctl := (new_owner == rd.controller_id) || (ntag.controller_id.len > 0 && ntag.controller_id == rd.controller_id)
+        if !same_ctl {
+            << err_resp(403, "ERR_FORBIDDEN", "room join_policy requires same controller chain", 0, 0, 0)
+        }
     }
     if oidx >= 0 { rd.members[oidx].role = "admin" }
     rd.members[nidx].role = "owner"

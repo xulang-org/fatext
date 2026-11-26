@@ -128,6 +128,7 @@ pub struct HttpReq {
     pub hdr_vals []string
     pub req_body string
     pub remote_ip string
+    pub peer_ip string
 }
 
 pub fn (r &HttpReq) method() string {
@@ -407,7 +408,8 @@ pub fn read_http_request_timeout(cc $&ClientConn, timeout_ns int) HttpReq {
         hdr_names: hnames,
         hdr_vals: hvals,
         req_body: body,
-        remote_ip: cc.remote_ip + ""
+        remote_ip: cc.remote_ip + "",
+        peer_ip: cc.remote_ip + ""
     }
 }
 
@@ -418,6 +420,6 @@ pub fn read_http_request(cc $&ClientConn) HttpReq {
 pub fn read_req_into(cc $&ClientConn, timeout_ns int, out_errs $&[]string) HttpReq {
     << read_http_request_timeout(cc, timeout_ns) or (err) {
         out_errs.push(err.msg())
-        << HttpReq{req_method: "", req_path: "", hdr_names: []string{}, hdr_vals: []string{}, req_body: "", remote_ip: ""}
+        << HttpReq{req_method: "", req_path: "", hdr_names: []string{}, hdr_vals: []string{}, req_body: "", remote_ip: "", peer_ip: ""}
     }
 }

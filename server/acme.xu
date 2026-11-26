@@ -13,6 +13,7 @@
 #encoding/base64
 #encoding/json
 #encoding/pem
+#net
 #net/http
 #net/url
 
@@ -98,8 +99,14 @@ pub struct CertMeta {
     pub domains_csv string
 }
 
+fn truncate_acme_str(s &string, max_len int) string {
+    if max_len <= 0 { << "" }
+    if s.len <= max_len { << *s + "" }
+    << s[0:max_len] + "...(truncated)"
+}
+
 pub fn parse_and_validate_cert_pair(cert_pem &string, key_pem &string) CertMeta {
-    $leaf_der := ""
+    $cert_ders := []string{}
     $rem := cert_pem + ""
     while rem.len > 0 {
         blk := pem.decode(&rem)
@@ -107,19 +114,34 @@ pub fn parse_and_validate_cert_pair(cert_pem &string, key_pem &string) CertMeta 
             <-
         }
         if blk.typ == "CERTIFICATE" && blk.bytes.len > 0 {
-            leaf_der = blk.bytes + ""
-            <-
+            cert_ders.push(blk.bytes + "")
+            if cert_ders.len > 8 {
+                >> errors.new("tls: certificate chain exceeds 8 certificates")
+            }
         }
         rem = blk.rest + ""
     }
-    if leaf_der.len == 0 {
+    if cert_ders.len == 0 {
         >> errors.new("tls: no CERTIFICATE PEM block found")
     }
-    cert := x509.parse_certificate(leaf_der + "") or >>
+    cert := x509.parse_certificate(cert_ders[0] + "") or >>
+    for ci in 1:cert_ders.len {
+        _ := x509.parse_certificate(cert_ders[ci] + "") or >>
+    }
     priv := decode_rsa_private_pem(key_pem) or >>
     want_spki := encode_rsa_spki_der(&priv.public) or >>
     if cert.raw_subject_public_key_info != want_spki {
         >> errors.new("tls: certificate public key does not match private key")
+    }
+
+    now_v := time.now_time().unix()
+    nb := cert.not_before.unix()
+    na := cert.not_after.unix()
+    if na <= nb {
+        >> errors.new("tls: certificate has invalid validity window")
+    }
+    if nb > now_v + 300 {
+        >> errors.new("tls: certificate is not yet valid")
     }
 
     $dns_list := []string{}
@@ -142,8 +164,6 @@ pub fn parse_and_validate_cert_pair(cert_pem &string, key_pem &string) CertMeta 
         for_csv.push(dns_list[i] + "")
     }
     csv := strings.join(for_csv, ",")
-    nb := cert.not_before.unix()
-    na := cert.not_after.unix()
     << CertMeta{not_before: nb, not_after: na, dns_names: dns_list, domains_csv: csv}
 }
 
@@ -298,6 +318,59 @@ pub fn parse_acme_domains(raw &string) []string {
     << out
 }
 
+pub fn strip_host_port(host &string) string {
+    h := strings.to_lower(&strings.trim_space(host))
+    if h.len == 0 { << "" }
+    if (h[0] & 255) == 91 {
+        rb := strings.index_of(&h, "]")
+        if rb <= 1 { << "" }
+        << h[1:rb]
+    }
+    col := strings.index_of(&h, ":")
+    if col > 0 {
+        rest := h[(col + 1):h.len]
+        if !strings.contains(&rest, ":") {
+            << h[0:col]
+        }
+    }
+    << h
+}
+
+fn acme_authority_has_userinfo(raw_url &string) bool {
+    sep := strings.index_of(raw_url, "://")
+    if sep < 0 { << true }
+    $start := sep + 3
+    $end := raw_url.len
+    for i in start:raw_url.len {
+        c := raw_url[i] & 255
+        if c == 47 || c == 63 || c == 35 {
+            end = i
+            <-
+        }
+    }
+    auth := raw_url[start:end]
+    << strings.contains(&auth, "@") || strings.contains(&auth, "\\")
+}
+
+pub fn acme_url_origin(raw_url &string) string {
+    if acme_authority_has_userinfo(raw_url) {
+        >> errors.new("acme: URL contains invalid authority")
+    }
+    $u := url.new_url()
+    u.parse(raw_url + "") or >>
+    sch := strings.to_lower(&u.scheme())
+    $host := strings.to_lower(&strings.trim_space(&u.host()))
+    if host.len == 0 {
+        >> errors.new("acme: URL missing host")
+    }
+    if sch == "https" && strings.has_suffix(&host, ":443") && host.len > 4 {
+        host = host[0:(host.len - 4)]
+    } else if sch == "http" && strings.has_suffix(&host, ":80") && host.len > 3 {
+        host = host[0:(host.len - 3)]
+    }
+    << sch + "://" + host
+}
+
 fn is_loopback_host(host &string) bool {
     $h := strings.to_lower(&strings.trim_space(host))
     if h == "127.0.0.1" || h == "localhost" || h == "[::1]" || h == "::1" {
@@ -310,20 +383,61 @@ fn is_loopback_host(host &string) bool {
 }
 
 pub fn validate_acme_url(raw_url &string, allow_loopback_http bool) int {
+    if raw_url.len > 1024 || acme_authority_has_userinfo(raw_url) {
+        >> errors.new("acme: disallowed URL format")
+    }
     $u := url.new_url()
     u.parse(raw_url + "") or >>
     sch := strings.to_lower(&u.scheme())
-    host := u.host()
+    host := strings.to_lower(&strings.trim_space(&u.host()))
     if host.len == 0 {
-        >> errors.new("acme: URL missing host: " + *raw_url)
+        >> errors.new("acme: URL missing host: " + truncate_acme_str(raw_url, 128))
     }
-    if sch == "https" {
-        << 0
+    if sch == "http" {
+        if allow_loopback_http && is_loopback_host(&host) {
+            << 0
+        }
+        >> errors.new("acme: disallowed http URL: " + truncate_acme_str(raw_url, 128))
     }
-    if sch == "http" && allow_loopback_http && is_loopback_host(&host) {
-        << 0
+    if sch != "https" {
+        >> errors.new("acme: disallowed URL scheme: " + truncate_acme_str(raw_url, 128))
     }
-    >> errors.new("acme: disallowed URL scheme/host: " + *raw_url)
+    bare := strip_host_port(&host)
+    if bare.len == 0 {
+        >> errors.new("acme: URL invalid host")
+    }
+    if !allow_loopback_http {
+        if bare == "localhost" || strings.has_suffix(&bare, ".localhost") ||
+           strings.has_suffix(&bare, ".local") || strings.has_suffix(&bare, ".internal") ||
+           strings.has_suffix(&bare, ".localdomain") || strings.has_suffix(&bare, ".home.arpa") {
+            >> errors.new("acme: disallowed private/local host: " + bare)
+        }
+        ip := net.parse_ip(&bare)
+        if ip.len > 0 {
+            if !is_public_ip_bytes(&ip) {
+                >> errors.new("acme: disallowed non-public IP: " + bare)
+            }
+            << 0
+        }
+        if !strings.contains(&bare, ".") {
+            >> errors.new("acme: disallowed non-FQDN host: " + bare)
+        }
+        if host_has_numeric_ip_obfuscation(&bare) {
+            >> errors.new("acme: disallowed obfuscated host: " + bare)
+        }
+    }
+    << 0
+}
+
+pub fn validate_acme_url_origin(raw_url &string, expected_origin &string, allow_loopback_http bool) int {
+    validate_acme_url(raw_url, allow_loopback_http) or >>
+    if expected_origin.len > 0 {
+        orig := acme_url_origin(raw_url) or >>
+        if orig != *expected_origin {
+            >> errors.new("acme: cross-origin URL rejected: " + truncate_acme_str(&orig, 128))
+        }
+    }
+    << 0
 }
 
 fn load_or_create_account_key(acme_dir string) string {
@@ -380,10 +494,12 @@ fn parse_retry_after_sec(raw &string) int {
     << n
 }
 
-fn acme_http_do(method string, target_url string, extra string, body &string, insecure_tls bool, allow_loopback_http bool) AcmeHttpResp {
-    validate_acme_url(&target_url, allow_loopback_http) or >>
+fn acme_http_do(method string, target_url string, expected_origin string, extra string, body &string, insecure_tls bool, allow_loopback_http bool) AcmeHttpResp {
+    validate_acme_url_origin(&target_url, &expected_origin, allow_loopback_http) or >>
     $cl := http.new_client()
     cl.set_timeout(30000000000)
+    cl.max_redirects = -1
+    cl.max_response_bytes = 262144
     cl.insecure_skip_verify = insecure_tls
     $full_extra := extra + "User-Agent: fatext-server/3.0\r\nConnection: close\r\n"
     resp := cl.do_extra(method, target_url, full_extra, body) or >>
@@ -397,11 +513,11 @@ fn acme_http_do(method string, target_url string, extra string, body &string, in
     }
 }
 
-fn acme_fetch_nonce(new_nonce_url string, insecure_tls bool, allow_loopback_http bool) string {
+fn acme_fetch_nonce(new_nonce_url string, expected_origin string, insecure_tls bool, allow_loopback_http bool) string {
     empty := ""
-    r := acme_http_do("HEAD", new_nonce_url + "", "", &empty, insecure_tls, allow_loopback_http) or >>
+    r := acme_http_do("HEAD", new_nonce_url + "", expected_origin + "", "", &empty, insecure_tls, allow_loopback_http) or >>
     if r.nonce.len > 0 { << r.nonce }
-    r2 := acme_http_do("GET", new_nonce_url + "", "", &empty, insecure_tls, allow_loopback_http) or >>
+    r2 := acme_http_do("GET", new_nonce_url + "", expected_origin + "", "", &empty, insecure_tls, allow_loopback_http) or >>
     if r2.nonce.len > 0 { << r2.nonce }
     >> errors.new("acme: server did not return Replay-Nonce")
 }
@@ -440,16 +556,19 @@ fn is_bad_nonce_resp(status int, body &string) bool {
 
 fn extract_acme_err_detail(body &string) string {
     doc := json.parse(body)
-    if !doc.ok() || !doc.is_dict(doc.root()) { << *body + "" }
+    if !doc.ok() || !doc.is_dict(doc.root()) { << truncate_acme_str(body, 512) }
     r := doc.root()
     $tp := ""
     $det := ""
     if doc.has(r, "type") { tp = json_str_or(&doc, doc.get(r, "type"), "") }
     if doc.has(r, "detail") { det = json_str_or(&doc, doc.get(r, "detail"), "") }
-    if tp.len > 0 && det.len > 0 { << tp + ": " + det }
-    if det.len > 0 { << det }
-    if tp.len > 0 { << tp }
-    << *body + ""
+    if tp.len > 0 && det.len > 0 {
+        comb := tp + ": " + det
+        << truncate_acme_str(&comb, 512)
+    }
+    if det.len > 0 { << truncate_acme_str(&det, 512) }
+    if tp.len > 0 { << truncate_acme_str(&tp, 512) }
+    << truncate_acme_str(body, 512)
 }
 
 fn set_nonce_box(box $&[]string, val string) {
@@ -460,7 +579,7 @@ fn set_nonce_box(box $&[]string, val string) {
     }
 }
 
-fn acme_jws_post(acct_priv &string, jwk_canon &string, kid string, new_nonce_url string, nonce_box $&[]string, target_url string, payload_json &string, extra_hdr string, insecure_tls bool, allow_loopback_http bool) AcmeHttpResp {
+fn acme_jws_post(acct_priv &string, jwk_canon &string, kid string, new_nonce_url string, expected_origin string, nonce_box $&[]string, target_url string, payload_json &string, extra_hdr string, insecure_tls bool, allow_loopback_http bool) AcmeHttpResp {
     $attempt := 0
     while attempt < 4 {
         attempt += 1
@@ -470,11 +589,11 @@ fn acme_jws_post(acct_priv &string, jwk_canon &string, kid string, new_nonce_url
             nonce_box[0] = ""
         }
         if nonce.len == 0 {
-            nonce = acme_fetch_nonce(new_nonce_url + "", insecure_tls, allow_loopback_http) or >>
+            nonce = acme_fetch_nonce(new_nonce_url + "", expected_origin + "", insecure_tls, allow_loopback_http) or >>
         }
         jws_body := acme_build_jws(acct_priv, jwk_canon, kid + "", nonce + "", target_url + "", payload_json) or >>
         hdr := "Content-Type: application/jose+json\r\n" + extra_hdr
-        r := acme_http_do("POST", target_url + "", hdr, &jws_body, insecure_tls, allow_loopback_http) or >>
+        r := acme_http_do("POST", target_url + "", expected_origin + "", hdr, &jws_body, insecure_tls, allow_loopback_http) or >>
         if r.nonce.len > 0 {
             set_nonce_box(nonce_box, r.nonce + "")
         }
@@ -516,8 +635,9 @@ pub fn acme_issue_and_install(cfg &AcmeConfig, chal_ch chan AcmeChalMsg, cert_ch
     jwk_canon := ec_p256_jwk_canon(&acct_priv) or >>
     thumb := jwk_thumbprint(&jwk_canon)
 
+    dir_origin := acme_url_origin(&cfg.directory_url) or >>
     empty := ""
-    dir_r := acme_http_do("GET", cfg.directory_url + "", "", &empty, cfg.insecure_tls, cfg.allow_loopback_http) or >>
+    dir_r := acme_http_do("GET", cfg.directory_url + "", dir_origin + "", "", &empty, cfg.insecure_tls, cfg.allow_loopback_http) or >>
     if dir_r.status != 200 {
         >> errors.new("acme: directory HTTP " + strconv.itoa(dir_r.status) + ": " + extract_acme_err_detail(&dir_r.body))
     }
@@ -532,11 +652,11 @@ pub fn acme_issue_and_install(cfg &AcmeConfig, chal_ch chan AcmeChalMsg, cert_ch
     new_nonce_url := json_str_or(&dir_doc, dir_doc.get(dr, "newNonce"), "")
     new_acct_url := json_str_or(&dir_doc, dir_doc.get(dr, "newAccount"), "")
     new_order_url := json_str_or(&dir_doc, dir_doc.get(dr, "newOrder"), "")
-    validate_acme_url(&new_nonce_url, cfg.allow_loopback_http) or >>
-    validate_acme_url(&new_acct_url, cfg.allow_loopback_http) or >>
-    validate_acme_url(&new_order_url, cfg.allow_loopback_http) or >>
+    validate_acme_url_origin(&new_nonce_url, &dir_origin, cfg.allow_loopback_http) or >>
+    validate_acme_url_origin(&new_acct_url, &dir_origin, cfg.allow_loopback_http) or >>
+    validate_acme_url_origin(&new_order_url, &dir_origin, cfg.allow_loopback_http) or >>
 
-    n0 := acme_fetch_nonce(new_nonce_url + "", cfg.insecure_tls, cfg.allow_loopback_http) or >>
+    n0 := acme_fetch_nonce(new_nonce_url + "", dir_origin + "", cfg.insecure_tls, cfg.allow_loopback_http) or >>
     $nonce_box := [n0]
 
     $acct_payload := "{\"termsOfServiceAgreed\":true"
@@ -545,7 +665,7 @@ pub fn acme_issue_and_install(cfg &AcmeConfig, chal_ch chan AcmeChalMsg, cert_ch
         acct_payload = acct_payload + ",\"contact\":[" + json.quote(&mailto) + "]"
     }
     acct_payload = acct_payload + "}"
-    acct_r := acme_jws_post(&acct_priv, &jwk_canon, "", new_nonce_url + "", $&nonce_box, new_acct_url + "", &acct_payload, "", cfg.insecure_tls, cfg.allow_loopback_http) or >>
+    acct_r := acme_jws_post(&acct_priv, &jwk_canon, "", new_nonce_url + "", dir_origin + "", $&nonce_box, new_acct_url + "", &acct_payload, "", cfg.insecure_tls, cfg.allow_loopback_http) or >>
     if acct_r.status != 200 && acct_r.status != 201 {
         >> errors.new("acme: newAccount HTTP " + strconv.itoa(acct_r.status) + ": " + extract_acme_err_detail(&acct_r.body))
     }
@@ -553,7 +673,7 @@ pub fn acme_issue_and_install(cfg &AcmeConfig, chal_ch chan AcmeChalMsg, cert_ch
     if kid.len == 0 {
         >> errors.new("acme: newAccount missing Location header")
     }
-    validate_acme_url(&kid, cfg.allow_loopback_http) or >>
+    validate_acme_url_origin(&kid, &dir_origin, cfg.allow_loopback_http) or >>
 
     $id_parts := []string{}
     for i in 0:cfg.domains.len {
@@ -561,7 +681,7 @@ pub fn acme_issue_and_install(cfg &AcmeConfig, chal_ch chan AcmeChalMsg, cert_ch
         id_parts.push("{\"type\":\"dns\",\"value\":" + json.quote(&dv) + "}")
     }
     order_payload := "{\"identifiers\":[" + strings.join(id_parts, ",") + "]}"
-    ord_r := acme_jws_post(&acct_priv, &jwk_canon, kid + "", new_nonce_url + "", $&nonce_box, new_order_url + "", &order_payload, "", cfg.insecure_tls, cfg.allow_loopback_http) or >>
+    ord_r := acme_jws_post(&acct_priv, &jwk_canon, kid + "", new_nonce_url + "", dir_origin + "", $&nonce_box, new_order_url + "", &order_payload, "", cfg.insecure_tls, cfg.allow_loopback_http) or >>
     if ord_r.status != 201 {
         >> errors.new("acme: newOrder HTTP " + strconv.itoa(ord_r.status) + ": " + extract_acme_err_detail(&ord_r.body))
     }
@@ -569,7 +689,7 @@ pub fn acme_issue_and_install(cfg &AcmeConfig, chal_ch chan AcmeChalMsg, cert_ch
     if order_url.len == 0 {
         >> errors.new("acme: newOrder missing Location header")
     }
-    validate_acme_url(&order_url, cfg.allow_loopback_http) or >>
+    validate_acme_url_origin(&order_url, &dir_origin, cfg.allow_loopback_http) or >>
 
     odoc := json.parse(&ord_r.body)
     if !odoc.ok() || !odoc.is_dict(odoc.root()) {
@@ -580,7 +700,7 @@ pub fn acme_issue_and_install(cfg &AcmeConfig, chal_ch chan AcmeChalMsg, cert_ch
         >> errors.new("acme: newOrder response missing finalize or authorizations")
     }
     finalize_url := json_str_or(&odoc, odoc.get(oroot, "finalize"), "")
-    validate_acme_url(&finalize_url, cfg.allow_loopback_http) or >>
+    validate_acme_url_origin(&finalize_url, &dir_origin, cfg.allow_loopback_http) or >>
     authz_node := odoc.get(oroot, "authorizations")
     if !odoc.is_list(authz_node) {
         >> errors.new("acme: authorizations is not a list")
@@ -589,7 +709,7 @@ pub fn acme_issue_and_install(cfg &AcmeConfig, chal_ch chan AcmeChalMsg, cert_ch
     for i in 0:odoc.count(authz_node) {
         au := json_str_or(&odoc, odoc.at(authz_node, i), "")
         if au.len > 0 {
-            validate_acme_url(&au, cfg.allow_loopback_http) or >>
+            validate_acme_url_origin(&au, &dir_origin, cfg.allow_loopback_http) or >>
             authz_urls.push(au)
         }
     }
@@ -597,7 +717,7 @@ pub fn acme_issue_and_install(cfg &AcmeConfig, chal_ch chan AcmeChalMsg, cert_ch
     $active_tokens := []string{}
     for ai in 0:authz_urls.len {
         aurl := authz_urls[ai] + ""
-        az_r := acme_jws_post(&acct_priv, &jwk_canon, kid + "", new_nonce_url + "", $&nonce_box, aurl + "", &empty, "", cfg.insecure_tls, cfg.allow_loopback_http) or (err) {
+        az_r := acme_jws_post(&acct_priv, &jwk_canon, kid + "", new_nonce_url + "", dir_origin + "", $&nonce_box, aurl + "", &empty, "", cfg.insecure_tls, cfg.allow_loopback_http) or (err) {
             cleanup_acme_tokens(chal_ch, &active_tokens)
             >> err
         }
@@ -639,7 +759,7 @@ pub fn acme_issue_and_install(cfg &AcmeConfig, chal_ch chan AcmeChalMsg, cert_ch
             cleanup_acme_tokens(chal_ch, &active_tokens)
             >> errors.new("acme: no valid http-01 challenge in authorization")
         }
-        validate_acme_url(&chal_url, cfg.allow_loopback_http) or (err) {
+        validate_acme_url_origin(&chal_url, &dir_origin, cfg.allow_loopback_http) or (err) {
             cleanup_acme_tokens(chal_ch, &active_tokens)
             >> err
         }
@@ -649,7 +769,7 @@ pub fn acme_issue_and_install(cfg &AcmeConfig, chal_ch chan AcmeChalMsg, cert_ch
         active_tokens.push(chal_tok + "")
 
         trig_body := "{}"
-        tr_r := acme_jws_post(&acct_priv, &jwk_canon, kid + "", new_nonce_url + "", $&nonce_box, chal_url + "", &trig_body, "", cfg.insecure_tls, cfg.allow_loopback_http) or (err) {
+        tr_r := acme_jws_post(&acct_priv, &jwk_canon, kid + "", new_nonce_url + "", dir_origin + "", $&nonce_box, chal_url + "", &trig_body, "", cfg.insecure_tls, cfg.allow_loopback_http) or (err) {
             cleanup_acme_tokens(chal_ch, &active_tokens)
             >> err
         }
@@ -663,7 +783,7 @@ pub fn acme_issue_and_install(cfg &AcmeConfig, chal_ch chan AcmeChalMsg, cert_ch
         while p < 90 {
             p += 1
             clamp_poll_sleep(tr_r.retry_after)
-            pr := acme_jws_post(&acct_priv, &jwk_canon, kid + "", new_nonce_url + "", $&nonce_box, aurl + "", &empty, "", cfg.insecure_tls, cfg.allow_loopback_http) or (err) {
+            pr := acme_jws_post(&acct_priv, &jwk_canon, kid + "", new_nonce_url + "", dir_origin + "", $&nonce_box, aurl + "", &empty, "", cfg.insecure_tls, cfg.allow_loopback_http) or (err) {
                 cleanup_acme_tokens(chal_ch, &active_tokens)
                 >> err
             }
@@ -683,7 +803,7 @@ pub fn acme_issue_and_install(cfg &AcmeConfig, chal_ch chan AcmeChalMsg, cert_ch
             }
             if pst == "invalid" || pst == "revoked" || pst == "expired" || pst == "deactivated" {
                 cleanup_acme_tokens(chal_ch, &active_tokens)
-                >> errors.new("acme: authorization failed (" + pst + "): " + pr.body)
+                >> errors.new("acme: authorization failed (" + pst + "): " + extract_acme_err_detail(&pr.body))
             }
         }
         if !poll_ok {
@@ -699,7 +819,7 @@ pub fn acme_issue_and_install(cfg &AcmeConfig, chal_ch chan AcmeChalMsg, cert_ch
     csr_b64 := base64.encode_raw_url(csr_der + "")
 
     fin_payload := "{\"csr\":" + json.quote(&csr_b64) + "}"
-    fin_r := acme_jws_post(&acct_priv, &jwk_canon, kid + "", new_nonce_url + "", $&nonce_box, finalize_url + "", &fin_payload, "", cfg.insecure_tls, cfg.allow_loopback_http) or >>
+    fin_r := acme_jws_post(&acct_priv, &jwk_canon, kid + "", new_nonce_url + "", dir_origin + "", $&nonce_box, finalize_url + "", &fin_payload, "", cfg.insecure_tls, cfg.allow_loopback_http) or >>
     if fin_r.status < 200 || fin_r.status >= 300 {
         >> errors.new("acme: finalize HTTP " + strconv.itoa(fin_r.status) + ": " + extract_acme_err_detail(&fin_r.body))
     }
@@ -720,7 +840,7 @@ pub fn acme_issue_and_install(cfg &AcmeConfig, chal_ch chan AcmeChalMsg, cert_ch
         }
         op += 1
         clamp_poll_sleep(last_ra)
-        or_r := acme_jws_post(&acct_priv, &jwk_canon, kid + "", new_nonce_url + "", $&nonce_box, order_url + "", &empty, "", cfg.insecure_tls, cfg.allow_loopback_http) or >>
+        or_r := acme_jws_post(&acct_priv, &jwk_canon, kid + "", new_nonce_url + "", dir_origin + "", $&nonce_box, order_url + "", &empty, "", cfg.insecure_tls, cfg.allow_loopback_http) or >>
         last_ra = or_r.retry_after
         if or_r.status != 200 {
             >> errors.new("acme: order poll HTTP " + strconv.itoa(or_r.status))
@@ -735,9 +855,9 @@ pub fn acme_issue_and_install(cfg &AcmeConfig, chal_ch chan AcmeChalMsg, cert_ch
     if ord_st != "valid" || cert_url.len == 0 {
         >> errors.new("acme: order finalization timed out without certificate URL")
     }
-    validate_acme_url(&cert_url, cfg.allow_loopback_http) or >>
+    validate_acme_url_origin(&cert_url, &dir_origin, cfg.allow_loopback_http) or >>
 
-    dl_r := acme_jws_post(&acct_priv, &jwk_canon, kid + "", new_nonce_url + "", $&nonce_box, cert_url + "", &empty, "Accept: application/pem-certificate-chain\r\n", cfg.insecure_tls, cfg.allow_loopback_http) or >>
+    dl_r := acme_jws_post(&acct_priv, &jwk_canon, kid + "", new_nonce_url + "", dir_origin + "", $&nonce_box, cert_url + "", &empty, "Accept: application/pem-certificate-chain\r\n", cfg.insecure_tls, cfg.allow_loopback_http) or >>
     if dl_r.status != 200 || dl_r.body.len == 0 {
         >> errors.new("acme: certificate download HTTP " + strconv.itoa(dl_r.status))
     }

@@ -35,7 +35,7 @@ fn close_raw_fd_quiet(fd int) {
 }
 
 fn empty_req() HttpReq {
-    << HttpReq{req_method: "", req_path: "", hdr_names: []string{}, hdr_vals: []string{}, req_body: "", remote_ip: ""}
+    << HttpReq{req_method: "", req_path: "", hdr_names: []string{}, hdr_vals: []string{}, req_body: "", remote_ip: "", peer_ip: ""}
 }
 
 pub struct ConnGateMsg {
@@ -302,14 +302,52 @@ fn handle_connection(fd int, req_seq int, peer_ip string, tls_on bool, tls_hs_ns
         ka := wants_keep_alive(&req) && req_n + 1 < 200
         req_p_only := path_only(raw_p + "")
         if meth == "POST" && req_p_only == "/internal/shutdown" && shutdown_secret.len > 0 {
+            now_sd := time.now_time().unix()
+            if !is_loopback_ip_str(&peer_ip) {
+                r := err_resp(403, "ERR_FORBIDDEN", "shutdown endpoint is loopback-only", 0, 0, 0)
+                t_w0 := time.now()
+                _ := write_http_resp_ka($&cc, &r, false)
+                $w_ms := (time.now() - t_w0) / 1000000
+                if w_ms < 0 { w_ms = 0 }
+                $tot_us := (time.now() - req_t0) / 1000
+                if tot_us < 0 { tot_us = 0 }
+                log_event_json(log_ch, now_sd, "shutdown_auth_fail",
+                    "\"ip\":" + json.quote(&client_ip) + ",\"peer_ip\":" + json.quote(&peer_ip) + ",\"reason\":\"non_loopback\"")
+                log_access_json(log_ch, slow_ms, now_sd, req_id + "", meth + "", route + "",
+                    403, "ERR_FORBIDDEN", tls_on, client_ip + "", "anon", "",
+                    req_bytes, r.body.len, req_tls_ms, read_ms, 0, 0, w_ms, tot_us / 1000, tot_us)
+                <-
+            }
             got_sec := req.header("X-Fatext-Shutdown-Secret")
             if !const_time_str_eq(&got_sec, &shutdown_secret) {
                 r := err_resp(403, "ERR_FORBIDDEN", "invalid shutdown secret", 0, 0, 0)
+                t_w0 := time.now()
                 _ := write_http_resp_ka($&cc, &r, false)
+                $w_ms := (time.now() - t_w0) / 1000000
+                if w_ms < 0 { w_ms = 0 }
+                $tot_us := (time.now() - req_t0) / 1000
+                if tot_us < 0 { tot_us = 0 }
+                $sd_reason := "bad_secret"
+                if got_sec.len == 0 { sd_reason = "missing_secret" }
+                log_event_json(log_ch, now_sd, "shutdown_auth_fail",
+                    "\"ip\":" + json.quote(&client_ip) + ",\"peer_ip\":" + json.quote(&peer_ip) + ",\"reason\":" + json.quote(&sd_reason))
+                log_access_json(log_ch, slow_ms, now_sd, req_id + "", meth + "", route + "",
+                    403, "ERR_FORBIDDEN", tls_on, client_ip + "", "anon", "",
+                    req_bytes, r.body.len, req_tls_ms, read_ms, 0, 0, w_ms, tot_us / 1000, tot_us)
                 <-
             }
             r := json_resp(200, "{\"ok\":true,\"stopping\":true}")
+            t_w0 := time.now()
             _ := write_http_resp_ka($&cc, &r, false)
+            $w_ms := (time.now() - t_w0) / 1000000
+            if w_ms < 0 { w_ms = 0 }
+            $tot_us := (time.now() - req_t0) / 1000
+            if tot_us < 0 { tot_us = 0 }
+            log_event_json(log_ch, now_sd, "shutdown_requested",
+                "\"peer_ip\":" + json.quote(&peer_ip))
+            log_access_json(log_ch, slow_ms, now_sd, req_id + "", meth + "", route + "",
+                200, "", tls_on, client_ip + "", "internal", "shutdown",
+                req_bytes, r.body.len, req_tls_ms, read_ms, 0, 0, w_ms, tot_us / 1000, tot_us)
             select {
                 sig_ch <- signal.SIGTERM {}
                 else {}
@@ -319,7 +357,7 @@ fn handle_connection(fd int, req_seq int, peer_ip string, tls_on bool, tls_hs_ns
         if meth == "GET" && is_static_or_dl_path(&req_p_only) {
             t_st0 := time.now()
             st_rch := chan HttpResp{cap: 1}
-            static_ch <- StaticJob{path: req_p_only, reply_ch: st_rch}
+            static_ch <- StaticJob{path: req_p_only, client_ip: client_ip + "", reply_ch: st_rch}
             sresp := <-st_rch
             if sresp.status != 0 {
                 $sh_ms := (time.now() - t_st0) / 1000000
@@ -331,7 +369,8 @@ fn handle_connection(fd int, req_seq int, peer_ip string, tls_on bool, tls_hs_ns
                 $tot_us := (time.now() - req_t0) / 1000
                 if tot_us < 0 { tot_us = 0 }
                 $secode := ""
-                if sresp.status >= 400 { secode = "ERR_NOT_FOUND" }
+                if sresp.status == 429 { secode = "ERR_RATE_LIMITED" }
+                else if sresp.status >= 400 { secode = "ERR_NOT_FOUND" }
                 log_access_json(log_ch, slow_ms, time.now_time().unix(), req_id + "", meth + "", route + "",
                     sresp.status, secode, tls_on, client_ip + "", "anon", "",
                     req_bytes, sresp.body.len, req_tls_ms, read_ms, 0, sh_ms, w_ms, tot_us / 1000, tot_us)
@@ -391,7 +430,7 @@ fn resolve_allowed_redirect_host(raw_host &string, https_host string, allowed_ho
 fn handle_redirect_conn(fd int, peer_ip string, https_host string, allowed_hosts &[]string, chal_ch chan AcmeChalMsg) {
     cc_disable_sigpipe(fd)
     $cc := cc_from_tcp(fd, peer_ip + "")
-    req := read_http_request_timeout($&cc, 3000000000) or (err) {
+    req := read_http_request_timeout($&cc, 2000000000) or (err) {
         r400 := err_resp(400, "ERR_BAD_REQUEST", err.msg(), 0, 0, 0)
         _ := write_http_resp($&cc, &r400)
         cc_close($&cc)
@@ -404,6 +443,14 @@ fn handle_redirect_conn(fd int, peer_ip string, https_host string, allowed_hosts
         if meth != "GET" && meth != "HEAD" {
             r405 := err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0)
             _ := write_http_resp($&cc, &r405)
+            cc_close($&cc)
+            <<
+        }
+        raw_ch_host := req.header("Host")
+        ch_host := strip_host_port(&raw_ch_host)
+        if ch_host.len == 0 || !str_list_contains(allowed_hosts, ch_host + "") {
+            r404h := http_resp(404, "text/plain; charset=utf-8", "", &"not found\n")
+            _ := write_http_resp($&cc, &r404h)
             cc_close($&cc)
             <<
         }
@@ -588,6 +635,9 @@ fn main() int {
     trust_proxy := getenv_int_or("FATEXT_TRUST_PROXY", 0) != 0
     max_conns := getenv_int_or("FATEXT_MAX_CONNS", 4096)
     max_conns_per_ip := getenv_int_or("FATEXT_MAX_CONNS_PER_IP", 64)
+    redir_max_conns := getenv_int_or("FATEXT_REDIRECT_MAX_CONNS", 512)
+    redir_max_conns_per_ip := getenv_int_or("FATEXT_REDIRECT_MAX_CONNS_PER_IP", 16)
+    admin_local_only := getenv_int_or("FATEXT_ADMIN_LOCAL_ONLY", 0) != 0
     max_sse := getenv_int_or("FATEXT_MAX_SSE", 2048)
     max_sse_per_agent := getenv_int_or("FATEXT_MAX_SSE_PER_AGENT", 8)
     drain_ms := getenv_int_or("FATEXT_DRAIN_MS", 150)
@@ -693,13 +743,13 @@ fn main() int {
     }
 
     now0 := time.now_time().unix()
-    hub := new_hub_state(st, log_ch, webhook_ch, log_dir + "", slow_ms, now0, max_sse, max_sse_per_agent, admin_secret + "", shutdown_secret.len > 0, cert_ch, tls_cert_path + "", tls_key_path + "")
+    hub := new_hub_state(st, log_ch, webhook_ch, log_dir + "", slow_ms, now0, max_sse, max_sse_per_agent, admin_secret + "", admin_local_only, shutdown_secret.len > 0, cert_ch, tls_cert_path + "", tls_key_path + "")
     jobs := chan HubJob{cap: 128}
     xu hub_loop(hub, jobs)
     xu maintenance_loop(data_dir + "", ch_names, log_ch, jobs)
 
     static_ch := chan StaticJob{cap: 64}
-    xu static_loop(www_dir + "", dl_dir + "", static_ch)
+    xu static_loop(www_dir + "", dl_dir + "", ip_rpm, static_ch)
 
     gate_ch := chan ConnGateMsg{cap: 128}
     xu conn_guard_loop(max_conns, max_conns_per_ip, gate_ch)
@@ -709,8 +759,10 @@ fn main() int {
     }
 
     if tls_on && redir_addr.len > 0 {
+        redir_gate_ch := chan ConnGateMsg{cap: 64}
+        xu conn_guard_loop(redir_max_conns, redir_max_conns_per_ip, redir_gate_ch)
         redir_ready := chan int{cap: 1}
-        xu redirect_loop(redir_addr + "", public_host + "", clone_str_slice(&allowed_hosts), chal_ch, gate_ch, log_ch, redir_ready)
+        xu redirect_loop(redir_addr + "", public_host + "", clone_str_slice(&allowed_hosts), chal_ch, redir_gate_ch, log_ch, redir_ready)
         rok := <-redir_ready
         if acme_on && rok == 0 {
             err_msg := "ACME HTTP-01 listener failed to bind " + redir_addr
@@ -791,10 +843,13 @@ fn main() int {
     }
     $adm_s := "false"
     if admin_secret.len > 0 { adm_s = "true" }
+    $adm_loc_s := "false"
+    if admin_local_only { adm_loc_s = "true" }
     log_event_json(log_ch, now0, "server_start",
         "\"addr\":" + json.quote(&addr) + ",\"tls\":" + tls_s +
         ",\"tls_mode\":" + json.quote(&tls_mode) +
         ",\"admin_enabled\":" + adm_s +
+        ",\"admin_local_only\":" + adm_loc_s +
         ",\"pow_bits\":" + strconv.itoa(pow_bits) + ",\"ip_rpm\":" + strconv.itoa(ip_rpm) +
         ",\"max_conns\":" + strconv.itoa(max_conns) + ",\"max_conns_per_ip\":" + strconv.itoa(max_conns_per_ip) +
         ",\"tls_handshake_ms\":" + strconv.itoa(tls_handshake_ms) +

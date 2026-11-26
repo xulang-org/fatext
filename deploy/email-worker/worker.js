@@ -60,17 +60,16 @@ function extractBodySnippet(rawEmail) {
   return new TextDecoder("utf-8", { fatal: false }).decode(bytes.subarray(0, MAX_SNIPPET_BYTES));
 }
 
+const CLOUDFLARE_AUTHSERV_RE = /^(?:[a-z0-9-]+\.)*cloudflare\.(?:net|com)$/;
+
 function extractTrustedAuthResults(headerVal) {
   if (!headerVal) return "";
   const parts = String(headerVal).split(/,\s*(?=[a-z0-9.-]+\s*;)/i);
-  for (const part of parts) {
-    const semi = part.indexOf(";");
-    const authserv = (semi >= 0 ? part.slice(0, semi) : part).trim().toLowerCase();
-    if (/^[a-z0-9.-]*cloudflare\.[a-z]+$/.test(authserv)) {
-      return part.toLowerCase();
-    }
-  }
-  return "";
+  const first = parts[0] || "";
+  const semi = first.indexOf(";");
+  if (semi <= 0) return "";
+  const authserv = first.slice(0, semi).trim().toLowerCase();
+  return CLOUDFLARE_AUTHSERV_RE.test(authserv) ? first.toLowerCase() : "";
 }
 
 function parseAuthResults(authHeader) {
@@ -81,6 +80,8 @@ function parseAuthResults(authHeader) {
     dmarc_pass: /\bdmarc=pass\b/.test(s),
   };
 }
+
+export { extractTrustedAuthResults, parseAuthResults };
 
 export default {
   async email(message, env, ctx) {

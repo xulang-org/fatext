@@ -25,7 +25,7 @@ if [[ -z "$PORT" || ! "$PORT" =~ ^[0-9]+$ ]]; then
 fi
 
 SCHEME="http"
-if [[ -n "${FATEXT_TLS_CERT:-}" && -n "${FATEXT_TLS_KEY:-}" ]]; then
+if [[ ( -n "${FATEXT_TLS_CERT:-}" && -n "${FATEXT_TLS_KEY:-}" ) || -n "${FATEXT_ACME_DOMAINS:-}" ]]; then
   SCHEME="https"
 fi
 

@@ -532,7 +532,12 @@ fn render_ext_rows(doc &json.Doc, agent_id string) string {
     if doc.has(en, "webhook_url") {
         v := json_str_or(doc, doc.get(en, "webhook_url"), "")
         if is_https_url(&v) {
-            rows = rows + "<tr><th>webhook_url</th><td><span class=\"ok\">configured</span> (<code>" + esc(&v) + "</code>)</td></tr>"
+            wh_host := extract_https_host(&v)
+            if wh_host.len > 0 {
+                rows = rows + "<tr><th>webhook_url</th><td><span class=\"ok\">configured</span> (<code>https://" + esc(&wh_host) + "/…</code>)</td></tr>"
+            } else {
+                rows = rows + "<tr><th>webhook_url</th><td><span class=\"ok\">configured</span></td></tr>"
+            }
         }
     }
     << rows
@@ -896,16 +901,19 @@ pub fn serve_dl_file(st &State, filename string) HttpResp {
 
 pub struct StaticJob {
     pub path string
+    pub client_ip string
     pub reply_ch chan HttpResp
 }
 
-pub fn static_loop(www_dir string, dl_dir string, ch chan StaticJob) {
+pub fn static_loop(www_dir string, dl_dir string, ip_rpm int, ch chan StaticJob) {
     $bodies := maps.new_str_str()
     $ctypes := maps.new_str_str()
     $dl_bodies := maps.new_str_str()
     $dl_meta := maps.new_str_str()
     $dl_ts := maps.new_str_int()
     $dl_total_bytes := 0
+    $ip_hits := maps.new_str_int()
+    $ip_window := 0
 
     static_paths := ["/llms.txt", "/llms-full.txt", "/SKILL.md", "/protocol.md", "/.well-known/fatext.json", "/static/fatext.css", "/static/favicon.svg", "/favicon.ico", "/static/logo.svg"]
     static_disk := ["/llms.txt", "/llms-full.txt", "/SKILL.md", "/protocol.md", "/.well-known/fatext.json", "/static/fatext.css", "/static/favicon.svg", "/static/favicon.svg", "/static/logo.svg"]
@@ -920,6 +928,20 @@ pub fn static_loop(www_dir string, dl_dir string, ch chan StaticJob) {
 
     while true {
         job := <-ch
+        if ip_rpm > 0 {
+            now_rl := time.now_time().unix()
+            win := now_rl / 60
+            if win != ip_window || ip_hits.len() > 16384 {
+                ip_hits.clear()
+                ip_window = win
+            }
+            cur := map_get_or(&ip_hits, job.client_ip + "", 0)
+            if cur >= ip_rpm {
+                job.reply_ch <- err_resp(429, "ERR_RATE_LIMITED", "IP rate limit exceeded", 60, now_rl + 60, 0)
+                ->
+            }
+            ip_hits.set(job.client_ip + "", cur + 1)
+        }
         p := job.path + ""
         if ctypes.has(p + "") {
             ct := str_map_get_or(&ctypes, p + "", "text/plain; charset=utf-8")

@@ -33,7 +33,11 @@ def main() -> int:
     keys_dir.mkdir(parents=True, exist_ok=True)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    subprocess.run(["openssl", "genrsa", "-out", str(priv_path), "2048"], check=True)
+    old_umask = os.umask(0o077)
+    try:
+        subprocess.run(["openssl", "genrsa", "-out", str(priv_path), "2048"], check=True)
+    finally:
+        os.umask(old_umask)
     os.chmod(priv_path, 0o600)
 
     pub = subprocess.check_output(

@@ -298,11 +298,12 @@ fn parse_pkcs1_private_der(der &string) rsa.PrivateKey {
     }
     $n := big.new_int(0)
     n.set_bytes(nv.bytes + "")
-    if n.bit_len() < 2048 {
-        >> errors.new("rsa: key size must be >= 2048 bits")
+    nbits := n.bit_len()
+    if nbits < 2048 || nbits > 4096 {
+        >> errors.new("rsa: key size must be 2048..4096 bits")
     }
     e := ev.as_int() or >>
-    if e < 3 {
+    if e < 3 || (e & 1) == 0 {
         >> errors.new("rsa: invalid public exponent")
     }
     $d_int := big.new_int(0)
@@ -328,8 +329,21 @@ pub fn decode_rsa_private_pem(pem_str &string) rsa.PrivateKey {
             >> errors.new("rsa: invalid PKCS#8 sequence")
         }
         $d := asn1.new_decoder(&p8.bytes)
-        _ := d.next() or >>
-        _ := d.next() or >>
+        verv := d.next() or >>
+        ver := verv.as_int() or >>
+        if ver != 0 {
+            >> errors.new("rsa: unsupported PKCS#8 version")
+        }
+        algv := d.next() or >>
+        if algv.tag != asn1.TAG_SEQUENCE {
+            >> errors.new("rsa: invalid PKCS#8 algorithm")
+        }
+        $ad := asn1.new_decoder(&algv.bytes)
+        oidv := ad.next() or >>
+        arcs := oidv.as_oid() or >>
+        if !oid_is_rsa(&arcs) {
+            >> errors.new("rsa: PKCS#8 key algorithm must be RSA")
+        }
         octv := d.next() or >>
         inner := octv.as_octet() or >>
         << parse_pkcs1_private_der(&inner) or >>

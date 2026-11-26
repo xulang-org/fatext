@@ -438,6 +438,7 @@ pub fn handle_ctl_grant_credential(hub $&HubState, req &HttpReq, aid string, now
     ag := read_agent_summary(&hub.st, aid + "")
     if !ag.found { << err_resp(404, "ERR_NOT_FOUND", "agent not found", 0, 0, 0) }
     if ag.status == "revoked" { << err_resp(403, "ERR_REVOKED", "agent is permanently revoked", 0, 0, 0) }
+    if hub.st.banned.has(aid + "") { << err_resp(403, "ERR_AGENT_BANNED", "agent is globally banned", 0, 0, 0) }
     if ag.managed_count > 0 {
         << err_resp(403, "ERR_NESTED_DELEGATION", "target agent already manages child agents and cannot become managed (1-hop hierarchy)", 0, 0, 0)
     }

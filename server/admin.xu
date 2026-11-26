@@ -19,6 +19,7 @@ fn extract_admin_token(req &HttpReq) string {
 
 pub fn is_valid_admin_request(hub &HubState, req &HttpReq) bool {
     if hub.admin_secret.len == 0 { << false }
+    if hub.admin_local_only && !is_loopback_ip_str(&req.peer_ip) { << false }
     p := path_only(req.path())
     if p != "/internal/metrics" && !strings.has_prefix(&p, "/internal/admin/") {
         << false
@@ -27,12 +28,28 @@ pub fn is_valid_admin_request(hub &HubState, req &HttpReq) bool {
     << tok.len > 0 && const_time_str_eq(&tok, &hub.admin_secret)
 }
 
-fn require_admin(hub &HubState, req &HttpReq) HttpResp {
+fn require_admin(hub &HubState, req &HttpReq, now int) HttpResp {
     if hub.admin_secret.len == 0 {
         << err_resp(404, "ERR_NOT_FOUND", "endpoint not found", 0, 0, 0)
     }
+    p := path_only(req.path())
+    if hub.admin_local_only && !is_loopback_ip_str(&req.peer_ip) {
+        log_event_json(hub.log_ch, now, "admin_auth_fail",
+            "\"ip\":" + json.quote(&req.remote_ip) +
+            ",\"peer_ip\":" + json.quote(&req.peer_ip) +
+            ",\"path\":" + json.quote(&p) +
+            ",\"reason\":\"non_loopback\"")
+        << err_resp(403, "ERR_FORBIDDEN", "admin endpoint is loopback-only", 0, 0, 0)
+    }
     tok := extract_admin_token(req)
     if tok.len == 0 || !const_time_str_eq(&tok, &hub.admin_secret) {
+        $reason := "bad_secret"
+        if tok.len == 0 { reason = "missing_secret" }
+        log_event_json(hub.log_ch, now, "admin_auth_fail",
+            "\"ip\":" + json.quote(&req.remote_ip) +
+            ",\"peer_ip\":" + json.quote(&req.peer_ip) +
+            ",\"path\":" + json.quote(&p) +
+            ",\"reason\":" + json.quote(&reason))
         << err_resp(403, "ERR_FORBIDDEN", "invalid or missing admin secret", 0, 0, 0)
     }
     << HttpResp{status: 0, ctype: "", extra: "", body: ""}
@@ -289,7 +306,7 @@ fn prom_counter(lines $&[]string, name string, help string, val int) {
 }
 
 pub fn handle_internal_metrics(hub $&HubState, req &HttpReq, now int) HttpResp {
-    auth_err := require_admin(hub, req)
+    auth_err := require_admin(hub, req, now)
     if auth_err.status != 0 { << auth_err }
     if req.method() != "GET" {
         << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0)
@@ -1221,7 +1238,7 @@ fn handle_admin_events(hub &HubState, req &HttpReq, now int) HttpResp {
 }
 
 pub fn handle_admin_dispatch(hub $&HubState, req &HttpReq, method string, path string, now int) HttpResp {
-    auth_err := require_admin(hub, req)
+    auth_err := require_admin(hub, req, now)
     if auth_err.status != 0 { << auth_err }
 
     if path == "/internal/admin/stats" {

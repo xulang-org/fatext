@@ -481,10 +481,6 @@ pub fn handle_friend_reject(st $&State, req &HttpReq, now int) HttpResp {
     if !is_valid_agent_id(tid + "") { << err_resp(400, "ERR_BAD_REQUEST", "invalid agent_id", 0, 0, 0) }
     $my_fd := load_friends_data(st, au.agent_id + "", now)
     $t_fd := load_friends_data(st, tid + "", now)
-    if (!str_list_contains(&my_fd.friends, tid + "") && my_fd.friends.len >= 500) ||
-       (!str_list_contains(&t_fd.friends, au.agent_id + "") && t_fd.friends.len >= 500) {
-        << err_resp(429, "ERR_RATE_LIMITED", "friends list limit reached (max 500)", 0, 0, 0)
-    }
     remove_in_req($&my_fd, tid + "")
     remove_out_req($&t_fd, au.agent_id + "")
     save_friends_data(st, au.agent_id + "", &my_fd) or (err) { << err_resp(500, "ERR_INTERNAL", "save failed", 0, 0, 0) }

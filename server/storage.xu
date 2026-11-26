@@ -829,7 +829,7 @@ pub fn count_agent_replies_in_thread(st $&State, msg_id string, agent_id string)
 }
 
 pub fn sweep_replay_cache(st $&State, now int) {
-    if now - st.last_replay_sweep < 60 { << }
+    if now - st.last_replay_sweep < 60 && st.replay_cache.len() <= 65536 { << }
     st.last_replay_sweep = now
     ks := st.replay_cache.keys()
     $expired := []string{}
@@ -843,6 +843,23 @@ pub fn sweep_replay_cache(st $&State, now int) {
     rc := $&st.replay_cache
     for i in 0:expired.len {
         rc.del(expired[i] + "")
+    }
+    if rc.len() > 65536 {
+        ks2 := rc.keys()
+        $exp2 := []string{}
+        for i in 0:ks2.len {
+            k := ks2[i] + ""
+            seen_ts := map_get_or(rc, k + "", 0)
+            if (now - seen_ts) > 65 {
+                exp2.push(k)
+            }
+        }
+        for i in 0:exp2.len {
+            rc.del(exp2[i] + "")
+        }
+    }
+    if rc.len() > 131072 {
+        rc.clear()
     }
 }
 
@@ -961,6 +978,19 @@ pub fn sweep_state_maps(st $&State, now int) {
     }
     dr := $&st.daily_replies
     for i in 0:dr_drop.len { dr.del(dr_drop[i] + "") }
+
+    pd_ks := st.profile_day_count.keys()
+    $pd_drop := []string{}
+    for i in 0:pd_ks.len {
+        if !strings.has_prefix(&pd_ks[i], today) { pd_drop.push(pd_ks[i] + "") }
+    }
+    pd := $&st.profile_day_count
+    for i in 0:pd_drop.len { pd.del(pd_drop[i] + "") }
+
+    if st.thread_reply_totals.len() > 8192 {
+        trt := $&st.thread_reply_totals
+        trt.clear()
+    }
 
     if st.ch_cache_html.keys().len > 256 {
         m1 := $&st.ch_cache_html

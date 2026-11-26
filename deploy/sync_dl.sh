@@ -14,6 +14,11 @@ DL_DIR="${2:-/var/lib/fatext/dl}"
 OFFICIAL_PEM="${3:-}"
 REPO="${FATEXT_CLI_REPO:-xulang-org/fatext-cli}"
 
+if [[ -n "$OFFICIAL_PEM" && "$OFFICIAL_PEM" == http://* ]]; then
+  echo "Error: refusing insecure http:// OFFICIAL_PEM URL (use https:// or a local file path)" >&2
+  exit 1
+fi
+
 if ! command -v gh >/dev/null 2>&1; then
   echo "Error: gh CLI is required to download from ${REPO}" >&2
   exit 1
@@ -45,12 +50,16 @@ echo "Verifying SHA256SUMS against downloaded archives..."
 )
 
 if [[ -n "$OFFICIAL_PEM" ]]; then
+  if [[ "$OFFICIAL_PEM" == http://* ]]; then
+    echo "Error: refusing insecure http:// OFFICIAL_PEM URL (use https:// or a local file path)" >&2
+    exit 1
+  fi
   if [[ ! -f "${TMP}/SHA256SUMS.sig" ]]; then
     echo "Error: OFFICIAL_PEM given, but SHA256SUMS.sig is missing" >&2
     exit 1
   fi
   PEM_PATH="${TMP}/official.pem"
-  if [[ "$OFFICIAL_PEM" == http://* || "$OFFICIAL_PEM" == https://* ]]; then
+  if [[ "$OFFICIAL_PEM" == https://* ]]; then
     curl -fsSL "$OFFICIAL_PEM" -o "$PEM_PATH"
   else
     cp "$OFFICIAL_PEM" "$PEM_PATH"
@@ -64,8 +73,32 @@ if [[ -n "$OFFICIAL_PEM" ]]; then
   echo "Verified SHA256SUMS.sig against official public key."
 fi
 
+VERIFIED_FILES=()
+while IFS= read -r line; do
+  [[ -z "$line" ]] && continue
+  fname="${line#* }"
+  fname="${fname# }"
+  fname="${fname#\*}"
+  if [[ "$fname" == */* ]]; then
+    echo "Error: unsafe path in SHA256SUMS: ${fname}" >&2
+    exit 1
+  fi
+  if [[ -f "${TMP}/${fname}" ]]; then
+    if [[ ! "$fname" =~ ^(fatext-[A-Za-z0-9._-]+\.(tar\.gz|zip)|install\.sh)$ ]]; then
+      echo "Error: unsupported artifact name in SHA256SUMS: ${fname}" >&2
+      exit 1
+    fi
+    VERIFIED_FILES+=("${TMP}/${fname}")
+  fi
+done < "${TMP}/SHA256SUMS"
+
+if [[ ${#VERIFIED_FILES[@]} -eq 0 ]]; then
+  echo "Error: no verified artifacts from SHA256SUMS found in release" >&2
+  exit 1
+fi
+
 install -d -m 0755 "$DL_DIR"
-for f in "${TMP}"/fatext-*.tar.gz "${TMP}"/fatext-*.zip "${TMP}/SHA256SUMS" "${TMP}/SHA256SUMS.sig" "${TMP}/install.sh"; do
+for f in "${VERIFIED_FILES[@]}" "${TMP}/SHA256SUMS" "${TMP}/SHA256SUMS.sig"; do
   if [[ -f "$f" ]]; then
     base="$(basename "$f")"
     install -m 0644 "$f" "${DL_DIR}/${base}.tmp"

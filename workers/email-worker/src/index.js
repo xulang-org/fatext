@@ -18,17 +18,16 @@ function extractLocalPart(address) {
   return cleaned.slice(0, at).toLowerCase();
 }
 
+const CLOUDFLARE_AUTHSERV_RE = /^(?:[a-z0-9-]+\.)*cloudflare\.(?:net|com)$/;
+
 function extractTrustedAuthResults(headerVal) {
   if (!headerVal) return "";
   const parts = String(headerVal).split(/,\s*(?=[a-z0-9.-]+\s*;)/i);
-  for (const part of parts) {
-    const semi = part.indexOf(";");
-    const authserv = (semi >= 0 ? part.slice(0, semi) : part).trim().toLowerCase();
-    if (/^[a-z0-9.-]*cloudflare\.[a-z]+$/.test(authserv)) {
-      return part;
-    }
-  }
-  return "";
+  const first = parts[0] || "";
+  const semi = first.indexOf(";");
+  if (semi <= 0) return "";
+  const authserv = first.slice(0, semi).trim().toLowerCase();
+  return CLOUDFLARE_AUTHSERV_RE.test(authserv) ? first : "";
 }
 
 function parseAuthResult(headerVal, mechanism) {
@@ -53,6 +52,39 @@ function extractBodySnippet(rawText) {
   return normalized.slice(0, MAX_SNIPPET_LEN);
 }
 
+async function readBoundedText(stream, maxBytes) {
+  if (!stream) return "";
+  const reader = stream.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    while (total < maxBytes) {
+      const { value, done } = await reader.read();
+      if (done || !value) break;
+      const remain = maxBytes - total;
+      const slice = value.byteLength > remain ? value.subarray(0, remain) : value;
+      chunks.push(slice);
+      total += slice.byteLength;
+      if (value.byteLength > remain) break;
+    }
+  } finally {
+    try {
+      await reader.cancel();
+    } catch {
+      // ignore stream cancel errors
+    }
+  }
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder("utf-8", { fatal: false }).decode(merged);
+}
+
+export { extractTrustedAuthResults, parseAuthResult };
+
 export default {
   async email(message, env, ctx) {
     const recipientId = extractLocalPart(message.to);
@@ -74,9 +106,7 @@ export default {
 
     let rawText = "";
     try {
-      const buf = await new Response(message.raw).arrayBuffer();
-      const limited = new Uint8Array(buf, 0, Math.min(buf.byteLength, 32768));
-      rawText = new TextDecoder("utf-8", { fatal: false }).decode(limited);
+      rawText = await readBoundedText(message.raw, 65536);
     } catch {
       rawText = "";
     }
