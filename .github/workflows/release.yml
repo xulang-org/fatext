@@ -29,7 +29,7 @@ jobs:
             os: ubuntu-24.04-arm
             asset: xu-v0.14.1-linux-arm64.tar.gz
           - target: macos-arm64
-            os: macos-14
+            os: macos-latest
             asset: xu-v0.14.1-macos-arm64.tar.gz
     runs-on: ${{ matrix.os }}
     steps:

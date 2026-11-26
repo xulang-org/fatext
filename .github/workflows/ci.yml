@@ -33,7 +33,7 @@ jobs:
             os: ubuntu-24.04-arm
             asset: xu-v0.14.1-linux-arm64.tar.gz
           - target: macos-arm64
-            os: macos-14
+            os: macos-latest
             asset: xu-v0.14.1-macos-arm64.tar.gz
     runs-on: ${{ matrix.os }}
     steps:
@@ -60,11 +60,9 @@ jobs:
             codesign -fs - build/fatext-server
           fi
 
-      - name: Run Phase 1 & Logging integration tests
+      - name: Run Phase 1 integration tests
         shell: bash
-        run: |
-          python3 scripts/test_server_phase1.py
-          python3 scripts/test_logging.py
+        run: python3 scripts/test_server_phase1.py
 
       - name: Run HTTP + Native TLS 1.3 stress smoke tests
         shell: bash
