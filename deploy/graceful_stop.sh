@@ -29,10 +29,11 @@ if [[ -n "${FATEXT_TLS_CERT:-}" && -n "${FATEXT_TLS_KEY:-}" ]]; then
   SCHEME="https"
 fi
 
-curl -fsSk -X POST \
-  -H "X-Fatext-Shutdown-Secret: ${SECRET}" \
+curl -fsSk -X POST -K - \
   --max-time 5 \
-  "${SCHEME}://127.0.0.1:${PORT}/internal/shutdown" >/dev/null 2>&1 || true
+  "${SCHEME}://127.0.0.1:${PORT}/internal/shutdown" >/dev/null 2>&1 <<EOF || true
+header = "X-Fatext-Shutdown-Secret: ${SECRET}"
+EOF
 
 if [[ -n "${MAINPID:-}" && "${MAINPID}" =~ ^[0-9]+$ ]]; then
   for _ in $(seq 1 50); do

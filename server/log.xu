@@ -341,17 +341,31 @@ pub fn resolve_peer_ip(fd int) string {
 }
 
 pub fn effective_client_ip(peer_ip string, req &HttpReq, trust_proxy bool) string {
-    if !trust_proxy { << peer_ip + "" }
+    if !trust_proxy || !is_trusted_proxy_ip(&peer_ip) { << peer_ip + "" }
+    cf := strings.trim_space(&req.header("CF-Connecting-IP"))
+    if is_valid_ip_literal(&cf) { << cf }
+    xri := strings.trim_space(&req.header("X-Real-IP"))
+    if is_valid_ip_literal(&xri) { << xri }
     xff := strings.trim_space(&req.header("X-Forwarded-For"))
     if xff.len == 0 { << peer_ip + "" }
-    $first := xff + ""
-    cidx := strings.index_of(&first, ",")
-    if cidx >= 0 {
-        first = strings.trim_space(&first[0:cidx])
+    parts := strings.split(&xff, ",")
+    $last_valid := ""
+    $idx := parts.len - 1
+    while idx >= 0 {
+        cand := strings.trim_space(&parts[idx])
+        if cand.len > 0 {
+            if !is_valid_ip_literal(&cand) {
+                if last_valid.len > 0 { << last_valid }
+                << peer_ip + ""
+            }
+            last_valid = cand + ""
+            if !is_trusted_proxy_ip(&cand) {
+                << cand
+            }
+        }
+        idx -= 1
     }
-    if first.len > 0 && first.len <= 64 && !has_forbidden_ctrl(&first) {
-        << first
-    }
+    if last_valid.len > 0 { << last_valid }
     << peer_ip + ""
 }
 

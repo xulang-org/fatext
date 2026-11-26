@@ -351,30 +351,76 @@ fn handle_connection(fd int, req_seq int, peer_ip string, tls_on bool, tls_hs_ns
     cc_close($&cc)
 }
 
-fn handle_redirect_conn(fd int, https_host string) {
+fn is_allowed_redirect_path(rpath &string) bool {
+    if rpath.len == 0 || rpath.len > 4096 { << false }
+    if (rpath[0] & 255) != 47 { << false }
+    if strings.has_prefix(rpath, "//") || strings.has_prefix(rpath, "/\\") { << false }
+    for i in 0:rpath.len {
+        c := rpath[i] & 255
+        if c <= 32 || c >= 127 || c == 92 { << false }
+    }
+    << true
+}
+
+fn resolve_allowed_redirect_host(raw_host &string, https_host string) string {
+    $h := strings.to_lower(&strings.trim_space(raw_host))
+    if strings.has_suffix(&h, ":80") && h.len > 3 {
+        h = h[0:(h.len - 3)]
+    }
+    if h == https_host || h == "www." + https_host {
+        << h
+    }
+    << https_host + ""
+}
+
+fn handle_redirect_conn(fd int, peer_ip string, https_host string) {
     cc_disable_sigpipe(fd)
-    $cc := cc_from_tcp(fd, "127.0.0.1")
-    req := read_http_request($&cc) or (err) {
+    $cc := cc_from_tcp(fd, peer_ip + "")
+    req := read_http_request_timeout($&cc, 3000000000) or (err) {
+        r400 := err_resp(400, "ERR_BAD_REQUEST", err.msg(), 0, 0, 0)
+        _ := write_http_resp($&cc, &r400)
         cc_close($&cc)
         <<
     }
-    $host := strings.trim_space(&req.header("Host"))
-    if host.len == 0 { host = https_host + "" }
-    loc := "https://" + host + req.path()
+    rpath := req.path()
+    if !is_allowed_redirect_path(&rpath) {
+        r400 := err_resp(400, "ERR_BAD_REQUEST", "invalid redirect path", 0, 0, 0)
+        _ := write_http_resp($&cc, &r400)
+        cc_close($&cc)
+        <<
+    }
+    raw_h := req.header("Host")
+    host := resolve_allowed_redirect_host(&raw_h, https_host + "")
+    loc := "https://" + host + rpath
     body := "Redirecting to " + loc + "\n"
     r := http_resp(301, "text/plain; charset=utf-8", "Location: " + loc + "\r\n", &body)
     _ := write_http_resp($&cc, &r)
     cc_close($&cc)
 }
 
-fn redirect_loop(redir_addr string, https_host string) {
+fn handle_redirect_conn_guarded(fd int, peer_ip string, https_host string, gate_ch chan ConnGateMsg) {
+    handle_redirect_conn(fd, peer_ip + "", https_host + "")
+    release_conn_slot(gate_ch, peer_ip + "")
+}
+
+fn redirect_loop(redir_addr string, https_host string, gate_ch chan ConnGateMsg, log_ch chan string) {
     lfd := net.listen(redir_addr + "") or (err) {
         println("fatext-server: redirect listen failed: " + err.msg())
         <<
     }
     while true {
-        fd := net.accept(lfd) or (err) { -> }
-        xu handle_redirect_conn(fd, https_host + "")
+        fd := net.accept(lfd) or (err) {
+            time.sleep(10000000)
+            ->
+        }
+        peer_ip := resolve_peer_ip(fd)
+        if !acquire_conn_slot(gate_ch, peer_ip + "") {
+            log_event_json(log_ch, time.now_time().unix(), "conn_rejected",
+                "\"ip\":" + json.quote(&peer_ip) + ",\"reason\":\"redirect_conn_limit\"")
+            close_raw_fd_quiet(fd)
+            ->
+        }
+        xu handle_redirect_conn_guarded(fd, peer_ip + "", https_host + "", gate_ch)
     }
 }
 
@@ -456,6 +502,7 @@ fn main() int {
     tls_cert_path := os.getenv("FATEXT_TLS_CERT")
     tls_key_path := os.getenv("FATEXT_TLS_KEY")
     redir_addr := os.getenv("FATEXT_HTTP_REDIRECT_ADDR")
+    public_host := strings.to_lower(&getenv_or("FATEXT_PUBLIC_HOST", "fatext.com"))
 
     log_dir := getenv_or("FATEXT_LOG_DIR", data_dir + "/logs")
     retain_days := getenv_int_or("FATEXT_LOG_RETENTION_DAYS", 30)
@@ -498,8 +545,14 @@ fn main() int {
     flush_done := chan int{cap: 1}
     xu logger_loop(log_dir + "", retain_days, stdout_mirror, log_ch, flush_done)
 
+    webhook_ch := chan string{cap: 128}
+    for wi in 0:4 {
+        _ := wi
+        xu webhook_worker_loop(webhook_ch)
+    }
+
     now0 := time.now_time().unix()
-    hub := new_hub_state(st, log_ch, log_dir + "", slow_ms, now0, max_sse, max_sse_per_agent, admin_secret + "", shutdown_secret.len > 0)
+    hub := new_hub_state(st, log_ch, webhook_ch, log_dir + "", slow_ms, now0, max_sse, max_sse_per_agent, admin_secret + "", shutdown_secret.len > 0)
     jobs := chan HubJob{cap: 128}
     xu hub_loop(hub, jobs)
     xu maintenance_loop(data_dir + "", ch_names, log_ch, jobs)
@@ -515,7 +568,7 @@ fn main() int {
     }
 
     if tls_on && redir_addr.len > 0 {
-        xu redirect_loop(redir_addr + "", "fatext.com")
+        xu redirect_loop(redir_addr + "", public_host + "", gate_ch, log_ch)
     }
 
     lfd := net.listen(addr + "") or (err) {

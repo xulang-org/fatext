@@ -159,6 +159,9 @@ pub fn handle_register(st $&State, req &HttpReq, now int) HttpResp {
     }
 
     body := req.body()
+    if body.len > 16384 {
+        << err_resp(413, "ERR_PAYLOAD_TOO_LARGE", "registration body exceeds 16384 bytes", 0, 0, 0)
+    }
     doc := json.parse(&body)
     if !doc.ok() {
         << err_resp(400, "ERR_BAD_REQUEST", "invalid JSON body", 0, 0, 0)
@@ -337,6 +340,9 @@ pub fn handle_profile_update(st $&State, req &HttpReq, now int) HttpResp {
     }
 
     body := req.body()
+    if body.len > 16384 {
+        << err_resp(413, "ERR_PAYLOAD_TOO_LARGE", "profile body exceeds 16384 bytes", 0, 0, 0)
+    }
     doc := json.parse(&body)
     if !doc.ok() {
         << err_resp(400, "ERR_BAD_REQUEST", "invalid JSON body", 0, 0, 0)
@@ -593,6 +599,11 @@ pub fn handle_create_post(st $&State, req &HttpReq, ch string, now int) HttpResp
         << err_resp(au.status, au.code, au.message, 0, 0, 0)
     }
 
+    body := req.body()
+    if body.len > 8192 {
+        << err_resp(413, "ERR_PAYLOAD_TOO_LARGE", "post body exceeds 8192 bytes", 0, 0, 0)
+    }
+
     pow_nonce := strings.trim_space(&req.header("X-PoW-Nonce"))
     if pow_nonce.len == 0 {
         << err_resp(400, "ERR_POW_REQUIRED", "X-PoW-Nonce required for posting", 0, 0, st.pow_bits)
@@ -608,7 +619,6 @@ pub fn handle_create_post(st $&State, req &HttpReq, ch string, now int) HttpResp
         << err_resp(429, "ERR_DAILY_POST_LIMIT", "daily limit: 1 top-level post per UTC day", rst - now, rst, 0)
     }
 
-    body := req.body()
     doc := json.parse(&body)
     if !doc.ok() {
         << err_resp(400, "ERR_BAD_REQUEST", "invalid JSON body", 0, 0, 0)
@@ -685,6 +695,9 @@ pub fn handle_create_reply(st $&State, req &HttpReq, root_id string, now int) Ht
     }
 
     body := req.body()
+    if body.len > 8192 {
+        << err_resp(413, "ERR_PAYLOAD_TOO_LARGE", "reply body exceeds 8192 bytes", 0, 0, 0)
+    }
     doc := json.parse(&body)
     if !doc.ok() {
         << err_resp(400, "ERR_BAD_REQUEST", "invalid JSON body", 0, 0, 0)

@@ -374,6 +374,10 @@ fn room_target_err_resp(code string) HttpResp {
 fn handle_room_create(hub $&HubState, req &HttpReq, now int) HttpResp {
     au := authenticate_scoped($&hub.st, req, now, "room")
     if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
+    cur_rooms := load_agent_room_ids(&hub.st, au.agent_id + "")
+    if cur_rooms.len >= 100 {
+        << err_resp(429, "ERR_RATE_LIMITED", "room membership limit reached (max 100)", 0, 0, 0)
+    }
     doc := json.parse(&req.body())
     if !doc.ok() || !doc.is_dict(doc.root()) {
         << err_resp(400, "ERR_BAD_REQUEST", "invalid JSON body", 0, 0, 0)
@@ -630,6 +634,20 @@ fn handle_room_add_member(hub $&HubState, req &HttpReq, rid string, now int) Htt
         }
     }
 
+    $inv_frame := ""
+    if doc.has(r, "invite_frame") && !doc.is_null(doc.get(r, "invite_frame")) {
+        if !doc.is_dict(doc.get(r, "invite_frame")) {
+            << err_resp(400, "ERR_BAD_REQUEST", "invite_frame must be JSON object", 0, 0, 0)
+        }
+        inv_frame = json_encode_or(&doc, doc.get(r, "invite_frame"), "")
+        if inv_frame.len == 0 {
+            << err_resp(400, "ERR_BAD_REQUEST", "invalid invite_frame JSON", 0, 0, 0)
+        }
+        if inv_frame.len > 32768 {
+            << err_resp(413, "ERR_PAYLOAD_TOO_LARGE", "invite_frame exceeds 32768 bytes", 0, 0, 0)
+        }
+    }
+
     rd.members.push(RoomMember{agent_id: tgt + "", role: trole + "", muted: false, joined_at: now})
     rd.updated_at = now
     save_room_data($&hub.st, &rd) or (err) {
@@ -638,11 +656,7 @@ fn handle_room_add_member(hub $&HubState, req &HttpReq, rid string, now int) Htt
     add_agent_room_index(&hub.st, tgt + "", rid + "")
 
     $del_state := "none"
-    inv_frame := extract_json_object_field(&body, "invite_frame")
     if inv_frame.len > 0 {
-        if inv_frame.len > 32768 {
-            << err_resp(413, "ERR_PAYLOAD_TOO_LARGE", "invite_frame exceeds 32768 bytes", 0, 0, 0)
-        }
         upsert_room_keybox_entry(&hub.st, rid + "", tgt + "", au.agent_id + "", rd.epoch, now, &inv_frame)
         del_state = deliver_dm_relay_raw(hub, &tag, au.agent_id + "", tgt + "", &inv_frame, now)
     }
@@ -839,6 +853,9 @@ fn handle_room_rekey(hub $&HubState, req &HttpReq, rid string, now int) HttpResp
         if req_ep < rd.epoch {
             << err_resp(409, "ERR_CONFLICT", "rekey epoch cannot be lower than current room epoch", 0, 0, 0)
         }
+        if req_ep > rd.epoch + 1 {
+            << err_resp(400, "ERR_BAD_REQUEST", "rekey epoch can advance by at most 1", 0, 0, 0)
+        }
         if req_ep > target_ep { target_ep = req_ep }
     }
     rd.epoch = target_ep
@@ -1020,19 +1037,24 @@ pub fn handle_room_send(hub $&HubState, req &HttpReq, room_id string, now int) H
     if !fdoc.ok() || !fdoc.is_dict(fdoc.root()) {
         << err_resp(400, "ERR_BAD_REQUEST", "room frame must be JSON object", 0, 0, 0)
     }
-    if fdoc.has(fdoc.root(), "epoch") {
-        fep := json_int_or(&fdoc, fdoc.get(fdoc.root(), "epoch"), 0)
-        if fep > 0 && fep < rd.epoch {
-            << err_resp(409, "ERR_CONFLICT", "stale room key epoch; upgrade to epoch " + strconv.itoa(rd.epoch), 0, 0, 0)
-        }
+    if !fdoc.has(fdoc.root(), "epoch") {
+        << err_resp(409, "ERR_CONFLICT", "room frame missing epoch; current epoch " + strconv.itoa(rd.epoch), 0, 0, 0)
+    }
+    fep := json_int_or(&fdoc, fdoc.get(fdoc.root(), "epoch"), 0)
+    if fep < rd.epoch {
+        << err_resp(409, "ERR_CONFLICT", "stale room key epoch; upgrade to epoch " + strconv.itoa(rd.epoch), 0, 0, 0)
+    }
+    compact_body := json_encode_or(&fdoc, fdoc.root(), "")
+    if compact_body.len == 0 {
+        << err_resp(400, "ERR_BAD_REQUEST", "invalid room frame JSON", 0, 0, 0)
     }
 
-    ev_json := "{\"room_id\":" + json.quote(&room_id) + ",\"from\":" + json.quote(&au.agent_id) + ",\"frame\":" + body + "}"
+    ev_json := "{\"room_id\":" + json.quote(&room_id) + ",\"from\":" + json.quote(&au.agent_id) + ",\"frame\":" + compact_body + "}"
     delivered := hub_push_room_checked(hub, &rd, au.agent_id + "", &ev_json, now)
     hub.metrics.room_events += 1
     log_event_json(hub.log_ch, now, "room_relay",
         "\"from\":" + json.quote(&au.agent_id) + ",\"room_id\":" + json.quote(&room_id) +
-        ",\"streams\":" + strconv.itoa(delivered) + ",\"bytes\":" + strconv.itoa(body.len))
+        ",\"streams\":" + strconv.itoa(delivered) + ",\"bytes\":" + strconv.itoa(compact_body.len))
     << json_resp(202, "{\"ok\":true,\"room_id\":" + json.quote(&room_id) + ",\"streams\":" + strconv.itoa(delivered) + "}")
 }
 

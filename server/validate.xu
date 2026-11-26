@@ -1,5 +1,6 @@
 @main
 
+#net
 #strconv
 #strings
 #time
@@ -343,6 +344,224 @@ pub fn is_https_url(s &string) bool {
     << true
 }
 
+fn is_valid_port_str(p &string) bool {
+    if p.len == 0 || p.len > 5 { << false }
+    for i in 0:p.len {
+        c := p[i] & 255
+        if c < 48 || c > 57 { << false }
+    }
+    pv := strconv.atoi(p) or (err) { << false }
+    << pv >= 1 && pv <= 65535
+}
+
+fn strip_single_trailing_dot(s string) string {
+    if s.len > 1 && (s[s.len - 1] & 255) == 46 {
+        << s[0:(s.len - 1)]
+    }
+    << s + ""
+}
+
+pub fn extract_https_host(url_s &string) string {
+    if !is_https_url(url_s) { << "" }
+    $end := url_s.len
+    for i in 8:url_s.len {
+        c := url_s[i] & 255
+        if c == 92 { << "" }
+        if c == 47 || c == 63 || c == 35 {
+            end = i
+            <-
+        }
+    }
+    auth := url_s[8:end] + ""
+    if auth.len == 0 { << "" }
+    if strings.contains(&auth, "@") { << "" }
+
+    $host := ""
+    if (auth[0] & 255) == 91 {
+        rb := strings.index_of(&auth, "]")
+        if rb <= 1 { << "" }
+        host = auth[1:rb] + ""
+        if rb + 1 < auth.len {
+            if (auth[rb + 1] & 255) != 58 { << "" }
+            p := auth[(rb + 2):auth.len] + ""
+            if !is_valid_port_str(&p) { << "" }
+        }
+    } else {
+        col := strings.index_of(&auth, ":")
+        if col >= 0 {
+            if col == 0 { << "" }
+            rest := auth[(col + 1):auth.len] + ""
+            if strings.contains(&rest, ":") { << "" }
+            if !is_valid_port_str(&rest) { << "" }
+            host = auth[0:col] + ""
+        } else {
+            host = auth + ""
+        }
+    }
+    $lh := strings.to_lower(&host)
+    lh = strip_single_trailing_dot(lh)
+    if lh.len == 0 { << "" }
+    << lh
+}
+
+pub fn is_public_ip_bytes(ip &string) bool {
+    if ip.len == 4 {
+        a := ip[0] & 255
+        b := ip[1] & 255
+        c := ip[2] & 255
+        if a == 0 { << false }
+        if a == 10 { << false }
+        if a == 100 && b >= 64 && b <= 127 { << false }
+        if a == 127 { << false }
+        if a == 169 && b == 254 { << false }
+        if a == 172 && b >= 16 && b <= 31 { << false }
+        if a == 192 && b == 0 && c == 0 { << false }
+        if a == 192 && b == 0 && c == 2 { << false }
+        if a == 192 && b == 168 { << false }
+        if a == 198 && (b == 18 || b == 19) { << false }
+        if a == 198 && b == 51 && c == 100 { << false }
+        if a == 203 && b == 0 && c == 113 { << false }
+        if a >= 224 { << false }
+        << true
+    }
+    if ip.len == 16 {
+        $v4_mapped := (ip[10] & 255) == 255 && (ip[11] & 255) == 255
+        if v4_mapped {
+            for i in 0:10 {
+                if (ip[i] & 255) != 0 {
+                    v4_mapped = false
+                    <-
+                }
+            }
+        }
+        if v4_mapped {
+            v4 := ip[12:16] + ""
+            << is_public_ip_bytes(&v4)
+        }
+        b0 := ip[0] & 255
+        b1 := ip[1] & 255
+        b2 := ip[2] & 255
+        b3 := ip[3] & 255
+        if b0 == 0 && b1 == 0 { << false }
+        if b0 == 0 && b1 == 100 && b2 == 255 && b3 == 155 { << false }
+        if (b0 & 254) == 252 { << false }
+        if b0 == 254 && (b1 & 192) == 128 { << false }
+        if b0 == 254 && (b1 & 192) == 192 { << false }
+        if b0 == 255 { << false }
+        if b0 == 32 && b1 == 1 && b2 == 13 && b3 == 184 { << false }
+        << (b0 & 224) == 32
+    }
+    << false
+}
+
+pub fn is_trusted_proxy_ip(ip_str &string) bool {
+    if ip_str.len == 0 || ip_str.len > 64 { << false }
+    ip := net.parse_ip(ip_str)
+    if ip.len == 4 {
+        a := ip[0] & 255
+        b := ip[1] & 255
+        << a == 127 || a == 10 || (a == 172 && b >= 16 && b <= 31) || (a == 192 && b == 168) || (a == 169 && b == 254)
+    }
+    if ip.len == 16 {
+        $v4_mapped := (ip[10] & 255) == 255 && (ip[11] & 255) == 255
+        if v4_mapped {
+            for i in 0:10 {
+                if (ip[i] & 255) != 0 {
+                    v4_mapped = false
+                    <-
+                }
+            }
+        }
+        if v4_mapped {
+            v4 := ip[12:16] + ""
+            a := v4[0] & 255
+            b := v4[1] & 255
+            << a == 127 || a == 10 || (a == 172 && b >= 16 && b <= 31) || (a == 192 && b == 168) || (a == 169 && b == 254)
+        }
+        $is_loopback6 := (ip[15] & 255) == 1
+        if is_loopback6 {
+            for i in 0:15 {
+                if (ip[i] & 255) != 0 {
+                    is_loopback6 = false
+                    <-
+                }
+            }
+        }
+        if is_loopback6 { << true }
+        b0 := ip[0] & 255
+        b1 := ip[1] & 255
+        if (b0 & 254) == 252 { << true }
+        << b0 == 254 && (b1 & 192) == 128
+    }
+    << false
+}
+
+pub fn is_valid_ip_literal(s &string) bool {
+    if s.len == 0 || s.len > 64 || has_forbidden_ctrl(s) { << false }
+    << net.parse_ip(s).len > 0
+}
+
+fn host_has_numeric_ip_obfuscation(host &string) bool {
+    // Reject decimal integer hosts (e.g. 2130706433) and hex/octal IPv4 labels (0x7f..., 0177.0.0.1)
+    $all_digits := host.len > 0
+    for i in 0:host.len {
+        c := host[i] & 255
+        if c < 48 || c > 57 {
+            all_digits = false
+            <-
+        }
+    }
+    if all_digits { << true }
+    if strings.has_prefix(host, "0x") || strings.contains(host, ".0x") { << true }
+    parts := strings.split(host, ".")
+    if parts.len >= 2 && parts.len <= 4 {
+        $all_num_or_hex := true
+        for pi in 0:parts.len {
+            seg := parts[pi] + ""
+            if seg.len == 0 { << true }
+            for si in 0:seg.len {
+                c := seg[si] & 255
+                if c < 48 || c > 57 {
+                    all_num_or_hex = false
+                    <-
+                }
+            }
+        }
+        if all_num_or_hex { << true }
+    }
+    << false
+}
+
+pub fn is_safe_webhook_url_static(s &string) bool {
+    host := extract_https_host(s)
+    if host.len == 0 { << false }
+    if host == "localhost" || strings.has_suffix(&host, ".localhost") ||
+       strings.has_suffix(&host, ".local") || strings.has_suffix(&host, ".internal") ||
+       strings.has_suffix(&host, ".localdomain") || strings.has_suffix(&host, ".home.arpa") {
+        << false
+    }
+    ip := net.parse_ip(&host)
+    if ip.len > 0 {
+        << is_public_ip_bytes(&ip)
+    }
+    if !strings.contains(&host, ".") { << false }
+    if host_has_numeric_ip_obfuscation(&host) { << false }
+    << true
+}
+
+pub fn is_safe_webhook_url_resolved(s &string) bool {
+    if !is_safe_webhook_url_static(s) { << false }
+    host := extract_https_host(s)
+    if net.parse_ip(&host).len > 0 { << true }
+    ips := net.lookup_ip(host + "") or (err) { << false }
+    if ips.len == 0 { << false }
+    for i in 0:ips.len {
+        ip := ips[i] + ""
+        if !is_public_ip_bytes(&ip) { << false }
+    }
+    << true
+}
+
 fn ext_err(code string, msg string) ExtValidation {
     << ExtValidation{ok: false, code: code, message: msg, json_str: "", owner_name: "", dm_policy: "friends", accept_email: false}
 }
@@ -490,7 +709,7 @@ pub fn validate_and_normalize_extensions(doc &json.Doc, ext_node int) ExtValidat
             if !doc.is_string(n) { << ext_err("ERR_BAD_REQUEST", "webhook_url must be string") }
             v := doc.as_string(n) or (err) { << ext_err("ERR_BAD_REQUEST", "webhook_url invalid") }
             if v.len > 0 {
-                if !is_https_url(&v) { << ext_err("ERR_BAD_REQUEST", "webhook_url must be https:// URL (<=256 chars)") }
+                if !is_safe_webhook_url_static(&v) { << ext_err("ERR_BAD_REQUEST", "webhook_url must be a public https:// URL (<=256 chars)") }
                 parts.push("\"webhook_url\":" + json.quote(&v))
             }
         }

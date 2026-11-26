@@ -18,7 +18,7 @@ fn load_tpl(st &State, rel string) string {
 }
 
 fn render_tpl(tpl string, keys []string, vals []string) string {
-    // Replace longest keys first so prefixes like $msg never shadow $msg_id.
+    // Sort keys longest-first so prefixes like $msg never shadow $msg_id.
     $idx := []int{}
     for i in 0:keys.len { idx.push(i) }
     $i := 0
@@ -34,12 +34,41 @@ fn render_tpl(tpl string, keys []string, vals []string) string {
         }
         i += 1
     }
-    $out := tpl + ""
-    for k in 0:idx.len {
-        id := idx[k]
-        out = strings.replace_all(&out, "\$" + keys[id], vals[id] + "")
+    // Single-pass scanner: substituted values are never re-scanned for $var tokens.
+    $chunks := []string{}
+    $seg_start := 0
+    $pos := 0
+    while pos < tpl.len {
+        if (tpl[pos] & 255) == 36 {
+            $matched_id := -1
+            $matched_len := 0
+            for k in 0:idx.len {
+                id := idx[k]
+                kn := keys[id] + ""
+                if kn.len > 0 && pos + 1 + kn.len <= tpl.len {
+                    if tpl[(pos + 1):(pos + 1 + kn.len)] == kn {
+                        matched_id = id
+                        matched_len = kn.len
+                        <-
+                    }
+                }
+            }
+            if matched_id >= 0 {
+                if pos > seg_start {
+                    chunks.push(tpl[seg_start:pos] + "")
+                }
+                chunks.push(vals[matched_id] + "")
+                pos = pos + 1 + matched_len
+                seg_start = pos
+                ->
+            }
+        }
+        pos += 1
     }
-    << out
+    if seg_start < tpl.len {
+        chunks.push(tpl[seg_start:tpl.len] + "")
+    }
+    << strings.join(chunks, "")
 }
 
 fn esc(s &string) string {

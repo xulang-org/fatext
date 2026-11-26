@@ -315,6 +315,9 @@ pub fn handle_rotate_key(hub $&HubState, req &HttpReq, now int) HttpResp {
             }
         }
     }
+    if hist_items.len >= 32 {
+        << err_resp(409, "ERR_CONFLICT", "key rotation history limit reached (max 32)", 0, 0, 0)
+    }
     retired_entry := "{\"version\":" + strconv.itoa(au.key_version) +
         ",\"public_key_pem\":" + json.quote(&au.agent.pub_pem) +
         ",\"valid_from\":" + strconv.itoa(au.agent.created_at) +
@@ -346,6 +349,10 @@ pub fn handle_rotate_key(hub $&HubState, req &HttpReq, now int) HttpResp {
         "\"managed_agents\":" + managed_json + "," +
         "\"signature\":" + json.quote(&new_sig) +
         "}\n"
+
+    if updated_doc.len > 65536 {
+        << err_resp(413, "ERR_PAYLOAD_TOO_LARGE", "identity document exceeds 65536 bytes", 0, 0, 0)
+    }
 
     write_atomic(agent_json_path(&hub.st, aid + ""), &updated_doc) or (err) {
         << err_resp(500, "ERR_INTERNAL", "failed saving rotated identity doc", 0, 0, 0)
@@ -418,6 +425,12 @@ pub fn handle_friend_request(st $&State, req &HttpReq, now int) HttpResp {
     if str_list_contains(&my_fd.friends, tid + "") {
         << json_resp(200, "{\"ok\":true,\"status\":\"already_friends\"}")
     }
+    if !str_list_contains(&my_fd.out_to, tid + "") && my_fd.out_to.len >= 200 {
+        << err_resp(429, "ERR_RATE_LIMITED", "outgoing friend request limit reached (max 200)", 0, 0, 0)
+    }
+    if !str_list_contains(&t_fd.in_from, au.agent_id + "") && t_fd.in_from.len >= 200 {
+        << err_resp(429, "ERR_RATE_LIMITED", "recipient incoming friend request queue full", 0, 0, 0)
+    }
     remove_out_req($&my_fd, tid + "")
     my_fd.out_to.push(tid + "")
     my_fd.out_note.push(note + "")
@@ -446,6 +459,10 @@ pub fn handle_friend_accept(st $&State, req &HttpReq, now int) HttpResp {
         << err_resp(404, "ERR_NOT_FOUND", "no pending incoming friend request from " + tid, 0, 0, 0)
     }
     $t_fd := load_friends_data(st, tid + "", now)
+    if (!str_list_contains(&my_fd.friends, tid + "") && my_fd.friends.len >= 500) ||
+       (!str_list_contains(&t_fd.friends, au.agent_id + "") && t_fd.friends.len >= 500) {
+        << err_resp(429, "ERR_RATE_LIMITED", "friends list limit reached (max 500)", 0, 0, 0)
+    }
     remove_in_req($&my_fd, tid + "")
     remove_out_req($&t_fd, au.agent_id + "")
     if !str_list_contains(&my_fd.friends, tid + "") { my_fd.friends.push(tid + "") }
@@ -464,6 +481,10 @@ pub fn handle_friend_reject(st $&State, req &HttpReq, now int) HttpResp {
     if !is_valid_agent_id(tid + "") { << err_resp(400, "ERR_BAD_REQUEST", "invalid agent_id", 0, 0, 0) }
     $my_fd := load_friends_data(st, au.agent_id + "", now)
     $t_fd := load_friends_data(st, tid + "", now)
+    if (!str_list_contains(&my_fd.friends, tid + "") && my_fd.friends.len >= 500) ||
+       (!str_list_contains(&t_fd.friends, au.agent_id + "") && t_fd.friends.len >= 500) {
+        << err_resp(429, "ERR_RATE_LIMITED", "friends list limit reached (max 500)", 0, 0, 0)
+    }
     remove_in_req($&my_fd, tid + "")
     remove_out_req($&t_fd, au.agent_id + "")
     save_friends_data(st, au.agent_id + "", &my_fd) or (err) { << err_resp(500, "ERR_INTERNAL", "save failed", 0, 0, 0) }
@@ -499,9 +520,16 @@ pub fn handle_block_add(st $&State, req &HttpReq, now int) HttpResp {
     doc := json.parse(&req.body())
     if !doc.ok() || !doc.is_dict(doc.root()) { << err_resp(400, "ERR_BAD_REQUEST", "invalid JSON", 0, 0, 0) }
     tgt := strings.trim_space(&json_str_or(&doc, doc.get(doc.root(), "target"), ""))
-    if tgt.len == 0 || tgt.len > 128 { << err_resp(400, "ERR_BAD_REQUEST", "invalid block target", 0, 0, 0) }
+    if tgt.len == 0 || tgt.len > 128 || has_forbidden_ctrl(&tgt) || strings.contains(&tgt, "\n") || strings.contains(&tgt, "\r") {
+        << err_resp(400, "ERR_BAD_REQUEST", "invalid block target", 0, 0, 0)
+    }
     $fd := load_friends_data(st, au.agent_id + "", now)
-    if !str_list_contains(&fd.blocks, tgt + "") { fd.blocks.push(tgt + "") }
+    if !str_list_contains(&fd.blocks, tgt + "") {
+        if fd.blocks.len >= 500 {
+            << err_resp(429, "ERR_RATE_LIMITED", "blocks limit reached (max 500)", 0, 0, 0)
+        }
+        fd.blocks.push(tgt + "")
+    }
     save_friends_data(st, au.agent_id + "", &fd) or (err) { << err_resp(500, "ERR_INTERNAL", "save failed", 0, 0, 0) }
     << json_resp(200, "{\"ok\":true,\"target\":" + json.quote(&tgt) + "}")
 }
@@ -520,10 +548,38 @@ pub fn handle_block_rm(st $&State, req &HttpReq, tgt string, now int) HttpResp {
 // =========================================================================
 
 fn deliver_webhook(url_s string, payload string) {
+    if !is_safe_webhook_url_resolved(&url_s) { << }
     $cl := http.new_client()
     cl.set_timeout(5000000000)
+    cl.max_redirects = -1
+    cl.max_response_bytes = 4096
     extra := "Content-Type: application/json\r\n"
     _ := cl.do_extra("POST", url_s, extra, &payload) or (err) { << }
+}
+
+pub fn webhook_worker_loop(ch chan string) {
+    while true {
+        item := <-ch
+        nl := strings.index_of(&item, "\n")
+        if nl > 0 && nl + 1 < item.len {
+            u := item[0:nl] + ""
+            p := item[(nl + 1):item.len] + ""
+            deliver_webhook(u, p)
+        }
+    }
+}
+
+fn count_mail_files(mdir string) int {
+    raw_names := os.read_dir(mdir + "") or (err) { << 0 }
+    lines := strings.split(&raw_names, "\n")
+    $cnt := 0
+    for i in 0:lines.len {
+        fn_s := strings.trim_space(&lines[i])
+        if strings.has_suffix(&fn_s, ".json") && strings.has_prefix(&fn_s, "eml_") {
+            cnt += 1
+        }
+    }
+    << cnt
 }
 
 fn agent_ext_str(ag &AgentSummary, key string, def string) string {
@@ -574,11 +630,19 @@ pub fn deliver_dm_relay_raw(hub $&HubState, tag &AgentSummary, from_id string, t
     delivered := hub_push_dm(hub, to_id + "", &ev_json)
     if delivered == 0 {
         wh := agent_ext_str(tag, "webhook_url", "")
-        if is_https_url(&wh) {
+        if is_safe_webhook_url_static(&wh) {
             wh_body := "{\"event\":\"dm\",\"data\":" + ev_json + "}"
-            xu deliver_webhook(wh, wh_body)
-            hub.metrics.dm_webhook += 1
-            << "webhook"
+            witem := wh + "\n" + wh_body
+            select {
+                hub.webhook_ch <- witem {
+                    hub.metrics.dm_webhook += 1
+                    << "webhook"
+                }
+                else {
+                    hub.metrics.dm_dropped += 1
+                    << "dropped_offline"
+                }
+            }
         }
         hub.metrics.dm_dropped += 1
         << "dropped_offline"
@@ -599,6 +663,10 @@ pub fn handle_dm_send(hub $&HubState, req &HttpReq, to_id string, now int) HttpR
     fdoc := json.parse(&body)
     if !fdoc.ok() || !fdoc.is_dict(fdoc.root()) {
         << err_resp(400, "ERR_BAD_REQUEST", "DM frame must be JSON object", 0, 0, 0)
+    }
+    compact_body := json_encode_or(&fdoc, fdoc.root(), "")
+    if compact_body.len == 0 {
+        << err_resp(400, "ERR_BAD_REQUEST", "invalid DM frame JSON", 0, 0, 0)
     }
 
     tag := read_agent_summary_cached($&hub.st, to_id + "")
@@ -626,17 +694,17 @@ pub fn handle_dm_send(hub $&HubState, req &HttpReq, to_id string, now int) HttpR
         << err_resp(403, "ERR_FORBIDDEN", "recipient dm_policy is friends", 0, 0, 0)
     }
 
-    del_res := deliver_dm_relay_raw(hub, &tag, au.agent_id + "", to_id + "", &body, now)
+    del_res := deliver_dm_relay_raw(hub, &tag, au.agent_id + "", to_id + "", &compact_body, now)
     if strings.has_prefix(&del_res, "sse:") {
         cnt_s := del_res[4:del_res.len]
         log_event_json(hub.log_ch, now, "dm_relay",
             "\"from\":" + json.quote(&au.agent_id) + ",\"to\":" + json.quote(&to_id) +
-            ",\"delivered\":\"sse\",\"streams\":" + cnt_s + ",\"bytes\":" + strconv.itoa(body.len))
+            ",\"delivered\":\"sse\",\"streams\":" + cnt_s + ",\"bytes\":" + strconv.itoa(compact_body.len))
         << json_resp(202, "{\"ok\":true,\"delivered\":\"sse\",\"streams\":" + cnt_s + "}")
     }
     log_event_json(hub.log_ch, now, "dm_relay",
         "\"from\":" + json.quote(&au.agent_id) + ",\"to\":" + json.quote(&to_id) +
-        ",\"delivered\":" + json.quote(&del_res) + ",\"streams\":0,\"bytes\":" + strconv.itoa(body.len))
+        ",\"delivered\":" + json.quote(&del_res) + ",\"streams\":0,\"bytes\":" + strconv.itoa(compact_body.len))
     << json_resp(202, "{\"ok\":true,\"delivered\":" + json.quote(&del_res) + "}")
 }
 
@@ -649,7 +717,7 @@ pub fn handle_mail_ingest(hub $&HubState, req &HttpReq, now int) HttpResp {
         << err_resp(503, "ERR_INTERNAL", "mail ingest disabled", 0, 0, 0)
     }
     sec := strings.trim_space(&req.header("X-Internal-Secret"))
-    if sec != hub.st.mail_secret {
+    if !const_time_str_eq(&sec, &hub.st.mail_secret) {
         << err_resp(401, "ERR_BAD_SIGNATURE", "invalid X-Internal-Secret", 0, 0, 0)
     }
     doc := json.parse(&req.body())
@@ -665,10 +733,19 @@ pub fn handle_mail_ingest(hub $&HubState, req &HttpReq, now int) HttpResp {
     $rat := json_int_or(&doc, doc.get(r, "received_at"), now)
     if rat <= 0 { rat = now }
 
+    if mfrom.len > 512 || subj.len > 512 || snippet.len > 16384 {
+        << err_resp(413, "ERR_PAYLOAD_TOO_LARGE", "mail field exceeds size limit", 0, 0, 0)
+    }
     if !is_valid_agent_id(to_id + "") { << err_resp(400, "ERR_BAD_REQUEST", "invalid to_agent_id", 0, 0, 0) }
+    if hub.st.banned.has(to_id + "") {
+        << err_resp(403, "ERR_AGENT_BANNED", "recipient is banned", 0, 0, 0)
+    }
     tag := read_agent_summary(&hub.st, to_id + "")
     if !tag.found { << err_resp(404, "ERR_NOT_FOUND", "recipient not found", 0, 0, 0) }
     if tag.status == "revoked" { << err_resp(403, "ERR_REVOKED", "recipient revoked", 0, 0, 0) }
+    if tag.ownership_status == "suspended" {
+        << err_resp(403, "ERR_AGENT_SUSPENDED", "recipient suspended", 0, 0, 0)
+    }
     if tag.controller_id.len > 0 && hub.st.revoked.has(tag.controller_id + "") {
         << err_resp(403, "ERR_CONTROLLER_REVOKED", "recipient controller revoked", 0, 0, 0)
     }
@@ -677,6 +754,9 @@ pub fn handle_mail_ingest(hub $&HubState, req &HttpReq, now int) HttpResp {
     }
     if !agent_ext_bool(&tag, "accept_email", false) {
         << err_resp(403, "ERR_FORBIDDEN", "recipient accept_email is false", 0, 0, 0)
+    }
+    if count_mail_files(mail_dir(&hub.st, to_id + "")) >= 500 {
+        << err_resp(429, "ERR_RATE_LIMITED", "recipient mailbox full", 0, 0, 0)
     }
 
     for i in 0:hub.st.banned_emails.len {

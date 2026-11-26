@@ -67,6 +67,7 @@ pub struct HubState {
     pub ip_hits maps.StrInt
     pub ip_window int
     pub log_ch chan string
+    pub webhook_ch chan string
     pub log_dir string
     pub slow_ms int
     pub draining bool
@@ -97,7 +98,7 @@ pub fn empty_entity_stats_cache() EntityStatsCache {
     }
 }
 
-pub fn new_hub_state(st State, log_ch chan string, log_dir string, slow_ms int, now int, max_sse int, max_sse_per_agent int, admin_secret string, shutdown_enabled bool) HubState {
+pub fn new_hub_state(st State, log_ch chan string, webhook_ch chan string, log_dir string, slow_ms int, now int, max_sse int, max_sse_per_agent int, admin_secret string, shutdown_enabled bool) HubState {
     << HubState{
         st: st,
         clients: []SseClient{},
@@ -105,6 +106,7 @@ pub fn new_hub_state(st State, log_ch chan string, log_dir string, slow_ms int, 
         ip_hits: maps.new_str_int(),
         ip_window: 0,
         log_ch: log_ch,
+        webhook_ch: webhook_ch,
         log_dir: log_dir,
         slow_ms: slow_ms,
         draining: false,

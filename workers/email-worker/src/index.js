@@ -18,10 +18,24 @@ function extractLocalPart(address) {
   return cleaned.slice(0, at).toLowerCase();
 }
 
+function extractTrustedAuthResults(headerVal) {
+  if (!headerVal) return "";
+  const parts = String(headerVal).split(/,\s*(?=[a-z0-9.-]+\s*;)/i);
+  for (const part of parts) {
+    const semi = part.indexOf(";");
+    const authserv = (semi >= 0 ? part.slice(0, semi) : part).trim().toLowerCase();
+    if (/^[a-z0-9.-]*cloudflare\.[a-z]+$/.test(authserv)) {
+      return part;
+    }
+  }
+  return "";
+}
+
 function parseAuthResult(headerVal, mechanism) {
-  if (!headerVal) return false;
+  const trusted = extractTrustedAuthResults(headerVal);
+  if (!trusted) return false;
   const re = new RegExp(`\\b${mechanism}=([a-z0-9_-]+)`, "i");
-  const m = headerVal.match(re);
+  const m = trusted.match(re);
   return !!(m && m[1] && m[1].toLowerCase() === "pass");
 }
 

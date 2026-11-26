@@ -184,11 +184,19 @@ fn http_reason(status int) string {
     << "Internal Server Error"
 }
 
-pub fn format_http_resp_ka(r &HttpResp, keep_alive bool) string {
+pub fn format_http_resp_ka_tls(r &HttpResp, keep_alive bool, is_tls bool) string {
     $out := "HTTP/1.1 " + strconv.itoa(r.status) + " " + http_reason(r.status) + "\r\n"
     out = out + "Content-Type: " + r.ctype + "\r\n"
     out = out + "Content-Length: " + strconv.itoa(r.body.len) + "\r\n"
     out = out + "X-Content-Type-Options: nosniff\r\n"
+    out = out + "X-Frame-Options: DENY\r\n"
+    out = out + "Referrer-Policy: no-referrer\r\n"
+    if strings.has_prefix(&r.ctype, "text/html") {
+        out = out + "Content-Security-Policy: default-src 'none'; style-src 'self'; img-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'\r\n"
+    }
+    if is_tls {
+        out = out + "Strict-Transport-Security: max-age=31536000; includeSubDomains\r\n"
+    }
     if r.extra.len > 0 {
         out = out + r.extra
     }
@@ -201,12 +209,16 @@ pub fn format_http_resp_ka(r &HttpResp, keep_alive bool) string {
     << out
 }
 
+pub fn format_http_resp_ka(r &HttpResp, keep_alive bool) string {
+    << format_http_resp_ka_tls(r, keep_alive, false)
+}
+
 pub fn format_http_resp(r &HttpResp) string {
     << format_http_resp_ka(r, false)
 }
 
 pub fn write_http_resp_ka(cc $&ClientConn, r &HttpResp, keep_alive bool) int {
-    wire := format_http_resp_ka(r, keep_alive)
+    wire := format_http_resp_ka_tls(r, keep_alive, cc.is_tls)
     << cc_write(cc, &wire) or (err) { << -1 }
 }
 
@@ -225,19 +237,67 @@ pub fn write_sse_open(cc $&ClientConn) int {
     << cc_write(cc, &hdr) or (err) { << -1 }
 }
 
+fn is_strict_header_name(s &string) bool {
+    if s.len == 0 || s.len > 128 { << false }
+    for i in 0:s.len {
+        c := s[i] & 255
+        if c <= 32 || c >= 127 { << false }
+    }
+    << true
+}
+
+fn is_valid_http_method(s &string) bool {
+    if s.len == 0 || s.len > 16 { << false }
+    for i in 0:s.len {
+        c := s[i] & 255
+        if c < 65 || c > 90 { << false }
+    }
+    << true
+}
+
+fn is_valid_http_path(s &string) bool {
+    if s.len == 0 || s.len > 8192 { << false }
+    if (s[0] & 255) != 47 { << false }
+    if strings.has_prefix(s, "//") { << false }
+    for i in 0:s.len {
+        c := s[i] & 255
+        if c <= 32 || c >= 127 { << false }
+    }
+    << true
+}
+
 fn parse_content_length_hdr(names &[]string, vals &[]string) int {
+    $seen := false
+    $cl := 0
     for i in 0:names.len {
+        if names[i] == "transfer-encoding" {
+            << -2
+        }
         if names[i] == "content-length" {
+            if seen { << -1 }
             v := strings.trim_space(&vals[i])
+            if v.len == 0 || v.len > 10 { << -1 }
+            for j in 0:v.len {
+                c := v[j] & 255
+                if c < 48 || c > 57 { << -1 }
+            }
             n := strconv.atoi(&v) or (err) { << -1 }
-            << n
+            if n < 0 { << -1 }
+            seen = true
+            cl = n
         }
     }
-    << 0
+    << cl
 }
 
 pub fn read_http_request_timeout(cc $&ClientConn, timeout_ns int) HttpReq {
-    cc_set_sock_timeout(cc, timeout_ns)
+    $deadline_ns := 0
+    if timeout_ns > 0 {
+        deadline_ns = time.now() + timeout_ns
+        cc_set_sock_timeout(cc, timeout_ns)
+    } else {
+        cc_set_sock_timeout(cc, 0)
+    }
     $hdr_end := -1
     while hdr_end < 0 {
         idx := strings.index_of(&cc.buf, "\r\n\r\n")
@@ -247,6 +307,13 @@ pub fn read_http_request_timeout(cc $&ClientConn, timeout_ns int) HttpReq {
         }
         if cc.buf.len > 16384 {
             >> errors.new("header too large")
+        }
+        if deadline_ns > 0 {
+            rem := deadline_ns - time.now()
+            if rem <= 0 {
+                >> errors.new("request read timeout")
+            }
+            cc_set_sock_timeout(cc, rem)
         }
         chunk := cc_read(cc, 4096) or >>
         if chunk.len == 0 {
@@ -265,33 +332,46 @@ pub fn read_http_request_timeout(cc $&ClientConn, timeout_ns int) HttpReq {
     cc.buf = ""
 
     lines := strings.split(&head_s, "\r\n")
-    if lines.len == 0 {
-        >> errors.new("empty request")
+    if lines.len == 0 || lines.len > 129 {
+        >> errors.new("empty or oversized header block")
     }
     req_parts := strings.split(&lines[0], " ")
-    if req_parts.len < 2 {
+    if req_parts.len != 3 {
         >> errors.new("malformed request line")
     }
     meth := strings.to_upper(&strings.trim_space(&req_parts[0]))
     rpath := req_parts[1] + ""
+    proto := strings.trim_space(&req_parts[2])
+    if !is_valid_http_method(&meth) || !is_valid_http_path(&rpath) || (proto != "HTTP/1.1" && proto != "HTTP/1.0") {
+        >> errors.new("invalid request target or protocol")
+    }
 
     $hnames := []string{}
     $hvals := []string{}
     for i in 1:lines.len {
         ln := lines[i] + ""
+        if ln.len == 0 { -> }
         col := strings.index_of(&ln, ":")
-        if col > 0 {
-            k := strings.to_lower(&strings.trim_space(&ln[0:col]))
-            $v := ""
-            if col + 1 < ln.len {
-                v = strings.trim_space(&ln[(col + 1):ln.len])
-            }
-            hnames.push(k)
-            hvals.push(v)
+        if col <= 0 {
+            >> errors.new("malformed header")
         }
+        k_raw := ln[0:col] + ""
+        if !is_strict_header_name(&k_raw) {
+            >> errors.new("invalid header name")
+        }
+        k := strings.to_lower(&k_raw)
+        $v := ""
+        if col + 1 < ln.len {
+            v = strings.trim_space(&ln[(col + 1):ln.len])
+        }
+        hnames.push(k)
+        hvals.push(v)
     }
 
     clen := parse_content_length_hdr(&hnames, &hvals)
+    if clen == -2 {
+        >> errors.new("transfer-encoding not supported")
+    }
     if clen < 0 || clen > 262144 {
         >> errors.new("invalid or oversized content-length")
     }
@@ -299,6 +379,13 @@ pub fn read_http_request_timeout(cc $&ClientConn, timeout_ns int) HttpReq {
         need := clen - rest.len
         $rmax := 8192
         if need < rmax { rmax = need }
+        if deadline_ns > 0 {
+            rem := deadline_ns - time.now()
+            if rem <= 0 {
+                >> errors.new("request body read timeout")
+            }
+            cc_set_sock_timeout(cc, rem)
+        }
         chunk := cc_read(cc, rmax) or >>
         if chunk.len == 0 {
             >> errors.new("unexpected eof reading body")

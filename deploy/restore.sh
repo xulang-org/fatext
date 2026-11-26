@@ -24,15 +24,25 @@ if [[ -n "$MODE" && "$MODE" != "--dry-run" ]]; then
   exit 1
 fi
 
-# Verify tarball readability & reject unsafe paths (absolute paths or '..')
+# Verify tarball readability & reject unsafe paths (absolute paths, '..', symlinks, hardlinks, devices)
 MANIFEST="$(tar -tzf "$ARCHIVE")"
 while IFS= read -r entry; do
   [[ -z "$entry" ]] && continue
-  if [[ "$entry" == /* || "$entry" == ../* || "$entry" == */../* || "$entry" == ".." ]]; then
+  if [[ "$entry" == /* || "$entry" == ../* || "$entry" == */../* || "$entry" == */.. || "$entry" == ".." ]]; then
     echo "Error: unsafe path in backup archive: $entry" >&2
     exit 1
   fi
 done <<< "$MANIFEST"
+
+VERBOSE_MANIFEST="$(tar -tvzf "$ARCHIVE")"
+while IFS= read -r vline; do
+  [[ -z "$vline" ]] && continue
+  ftype="${vline:0:1}"
+  if [[ "$ftype" == "l" || "$ftype" == "h" || "$ftype" == "b" || "$ftype" == "c" || "$ftype" == "p" ]]; then
+    echo "Error: unsafe entry type (${ftype}) in backup archive: $vline" >&2
+    exit 1
+  fi
+done <<< "$VERBOSE_MANIFEST"
 
 if [[ "$MODE" == "--dry-run" ]]; then
   echo "Dry-run verified archive (${ARCHIVE}):"
