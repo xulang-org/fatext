@@ -13,7 +13,10 @@ pub const HUB_SSE_SUB = 2
 pub const HUB_SSE_UNSUB = 3
 pub const HUB_METRIC_TLS = 4
 pub const HUB_METRIC_FLUSH = 5
+pub const HUB_METRIC_GC = 6
+pub const HUB_SHUTDOWN_DRAIN = 7
 pub const SSE_CTRL_CLOSE = "__FATEXT_SSE_CLOSE__"
+pub const SSE_CTRL_SHUTDOWN = "__FATEXT_SSE_SHUTDOWN__"
 
 pub struct SseClient {
     pub id int
@@ -52,10 +55,14 @@ pub struct HubState {
     pub ip_window int
     pub log_ch chan string
     pub slow_ms int
+    pub draining bool
+    pub started_at int
+    pub max_sse int
+    pub max_sse_per_agent int
     pub metrics MetricsState
 }
 
-pub fn new_hub_state(st State, log_ch chan string, slow_ms int, now int) HubState {
+pub fn new_hub_state(st State, log_ch chan string, slow_ms int, now int, max_sse int, max_sse_per_agent int) HubState {
     << HubState{
         st: st,
         clients: []SseClient{},
@@ -64,6 +71,10 @@ pub fn new_hub_state(st State, log_ch chan string, slow_ms int, now int) HubStat
         ip_window: 0,
         log_ch: log_ch,
         slow_ms: slow_ms,
+        draining: false,
+        started_at: now,
+        max_sse: max_sse,
+        max_sse_per_agent: max_sse_per_agent,
         metrics: new_metrics_state(now)
     }
 }
@@ -130,17 +141,16 @@ pub fn hub_push_room_checked(hub $&HubState, room &RoomData, sender_id string, d
     msg := "event: room\ndata: " + data_json + "\n\n"
     $sent := 0
     for i in 0:hub.clients.len {
-        c := &hub.clients[i]
-        if c.agent_id == sender_id { -> }
-        if !room_has_member(room, c.agent_id + "") { -> }
-        if agent_blocks_sender(&hub.st, c.agent_id + "", sender_id + "", now) { -> }
-        if str_list_contains(&c.rooms, room.room_id + "") || c.rooms.len == 0 {
-            if send_sse_msg(c, msg + "") {
-                sent += 1
-                hub.metrics.sse_events_pushed += 1
-            } else {
-                hub.metrics.sse_dropped_full += 1
-            }
+        cid := hub.clients[i].agent_id + ""
+        if cid == sender_id { -> }
+        if !room_has_member(room, cid + "") { -> }
+        if !(hub.clients[i].rooms.len == 0 || str_list_contains(&hub.clients[i].rooms, room.room_id + "")) { -> }
+        if agent_blocks_sender_cached($&hub.st, cid + "", sender_id + "", now) { -> }
+        if send_sse_msg(&hub.clients[i], msg + "") {
+            sent += 1
+            hub.metrics.sse_events_pushed += 1
+        } else {
+            hub.metrics.sse_dropped_full += 1
         }
     }
     << sent
@@ -259,72 +269,86 @@ fn hex_val(c int) int {
     << -1
 }
 
-fn maybe_run_maintenance(hub $&HubState, now int) {
-    // Daily anchor .sha256 generation for yesterday's UTC channel archives
-    today := utc_date_from_unix(now)
-    if hub.st.last_anchor_date != today {
-        hub.st.last_anchor_date = today + ""
-        yday := shift_utc_date(today + "", -1)
-        $anchors := 0
-        for i in 0:hub.st.channels.len {
-            ch := hub.st.channels[i].name + ""
-            p := channel_day_path(&hub.st, ch + "", yday + "")
-            raw := read_file_or_empty(p + "")
-            if raw.len > 0 {
-                sha_p := p + ".sha256"
-                if read_file_or_empty(sha_p + "").len == 0 {
-                    anchor := sha256.sum256(raw + "") + "  " + yday + ".jsonl\n"
-                    write_atomic_quiet(sha_p, &anchor)
-                    anchors += 1
-                }
-            }
-        }
-        if anchors > 0 {
-            log_event_json(hub.log_ch, now, "maintenance",
-                "\"task\":\"daily_anchors\",\"date\":" + json.quote(&yday) + ",\"anchors\":" + strconv.itoa(anchors))
-        }
-    }
-
-    // Periodic 10-day mail GC every 3600s
-    if now - hub.st.last_gc >= 3600 {
-        t0 := time.now()
-        hub.st.last_gc = now
-        $deleted := 0
-        mail_root := hub.st.data_dir + "/mail"
-        buckets := os.read_dir(mail_root + "") or (err) { << }
-        blines := strings.split(&buckets, "\n")
-        for bi in 0:blines.len {
-            b := strings.trim_space(&blines[bi])
-            if b.len != 2 { -> }
-            bdir := mail_root + "/" + b
-            agents := os.read_dir(bdir + "") or (err) { -> }
-            alines := strings.split(&agents, "\n")
-            for ai in 0:alines.len {
-                aid := strings.trim_space(&alines[ai])
-                if !is_valid_agent_id(aid + "") { -> }
-                adir := bdir + "/" + aid
-                files := os.read_dir(adir + "") or (err) { -> }
-                flines := strings.split(&files, "\n")
-                for fi in 0:flines.len {
-                    fn_s := strings.trim_space(&flines[fi])
-                    if !strings.has_suffix(&fn_s, ".json") { -> }
-                    fpath := adir + "/" + fn_s
-                    raw := read_file_or_empty(fpath + "")
-                    doc := json.parse(&raw)
-                    if doc.ok() && doc.has(doc.root(), "received_at") {
-                        rat := json_int_or(&doc, doc.get(doc.root(), "received_at"), 0)
-                        if rat > 0 && now - rat > MAIL_TTL_SEC {
-                            _ := os.remove(fpath + "") or (err) { -> }
-                            deleted += 1
-                        }
+fn run_mail_gc_pass(data_dir string, now int) int {
+    $deleted := 0
+    mail_root := data_dir + "/mail"
+    buckets := os.read_dir(mail_root + "") >>> (err) { << 0 }
+    blines := strings.split(&buckets, "\n")
+    for bi in 0:blines.len {
+        b := strings.trim_space(&blines[bi])
+        if b.len != 2 { -> }
+        bdir := mail_root + "/" + b
+        agents := os.read_dir(bdir + "") >>> (err) { -> }
+        alines := strings.split(&agents, "\n")
+        for ai in 0:alines.len {
+            aid := strings.trim_space(&alines[ai])
+            if !is_valid_agent_id(aid + "") { -> }
+            adir := bdir + "/" + aid
+            files := os.read_dir(adir + "") >>> (err) { -> }
+            flines := strings.split(&files, "\n")
+            for fi in 0:flines.len {
+                fn_s := strings.trim_space(&flines[fi])
+                if !strings.has_suffix(&fn_s, ".json") { -> }
+                fpath := adir + "/" + fn_s
+                raw := read_file_or_empty(fpath + "")
+                doc := json.parse(&raw)
+                if doc.ok() && doc.has(doc.root(), "received_at") {
+                    rat := json_int_or(&doc, doc.get(doc.root(), "received_at"), 0)
+                    if rat > 0 && now - rat > MAIL_TTL_SEC {
+                        _ := os.remove(fpath + "") >>> (err) { -> }
+                        deleted += 1
                     }
                 }
             }
         }
-        hub.metrics.mail_gc_deleted += deleted
-        dur_ms := (time.now() - t0) / 1000000
-        log_event_json(hub.log_ch, now, "maintenance",
-            "\"task\":\"mail_gc\",\"deleted\":" + strconv.itoa(deleted) + ",\"duration_ms\":" + strconv.itoa(dur_ms))
+    }
+    << deleted
+}
+
+pub fn maintenance_loop(data_dir string, ch_names []string, log_ch chan string, jobs chan HubJob) {
+    $last_anchor := ""
+    $last_gc := 0
+    tick := time.new_ticker(60000000000)
+    while true {
+        now := time.now_time().unix()
+        today := utc_date_from_unix(now)
+        if last_anchor != today {
+            last_anchor = today + ""
+            yday := shift_utc_date(today + "", -1)
+            $anchors := 0
+            for i in 0:ch_names.len {
+                ch := ch_names[i] + ""
+                y := yday[0:4]
+                m := yday[5:7]
+                p := data_dir + "/public/channels/" + ch + "/" + y + "/" + m + "/" + yday + ".jsonl"
+                raw := read_file_or_empty(p + "")
+                if raw.len > 0 {
+                    sha_p := p + ".sha256"
+                    if read_file_or_empty(sha_p + "").len == 0 {
+                        anchor := sha256.sum256(raw + "") + "  " + yday + ".jsonl\n"
+                        write_atomic_quiet(sha_p, &anchor)
+                        anchors += 1
+                    }
+                }
+            }
+            if anchors > 0 {
+                log_event_json(log_ch, now, "maintenance",
+                    "\"task\":\"daily_anchors\",\"date\":" + json.quote(&yday) + ",\"anchors\":" + strconv.itoa(anchors))
+            }
+        }
+        if now - last_gc >= 3600 {
+            t0 := time.now()
+            last_gc = now
+            deleted := run_mail_gc_pass(data_dir + "", now)
+            if deleted > 0 {
+                gc_job := HubJob{kind: HUB_METRIC_GC, req: empty_req(), sse_id: 0, enqueued_ns: 0, flag: deleted, reply_ch: chan HubReply{cap: 1}}
+                jobs <- gc_job
+            }
+            dur_ms := (time.now() - t0) / 1000000
+            log_event_json(log_ch, now, "maintenance",
+                "\"task\":\"mail_gc\",\"deleted\":" + strconv.itoa(deleted) + ",\"duration_ms\":" + strconv.itoa(dur_ms))
+        }
+        _ := <-tick.c
     }
 }
 
@@ -334,6 +358,24 @@ fn dispatch_http(hub $&HubState, req &HttpReq, now int) HttpResp {
 
     if method == "GET" && path == "/health" {
         << http_resp(200, "text/plain; charset=utf-8", "", &"ok\n")
+    }
+    if method == "GET" && path == "/ready" {
+        $st_code := 200
+        $st_txt := "ready"
+        $ok_s := "true"
+        if hub.draining {
+            st_code = 503
+            st_txt = "draining"
+            ok_s = "false"
+        }
+        $up := now - hub.started_at
+        if up < 0 { up = 0 }
+        rbody := "{\"ok\":" + ok_s +
+            ",\"status\":" + json.quote(&st_txt) +
+            ",\"active_sse\":" + strconv.itoa(hub.clients.len) +
+            ",\"uptime_sec\":" + strconv.itoa(up) +
+            ",\"version\":\"3.0\"}"
+        << json_resp(st_code, rbody)
     }
     if method == "GET" {
         st_resp := serve_static_allowlisted(&hub.st, path + "")
@@ -534,10 +576,10 @@ fn dispatch_http(hub $&HubState, req &HttpReq, now int) HttpResp {
             }
         }
         if strings.has_suffix(&rest, ".json") {
-            << handle_get_key_json(&hub.st, rest[0:(rest.len - 5)])
+            << handle_get_key_json($&hub.st, rest[0:(rest.len - 5)])
         }
         if strings.has_suffix(&rest, ".pem") {
-            << handle_get_key_pem(&hub.st, rest[0:(rest.len - 4)])
+            << handle_get_key_pem($&hub.st, rest[0:(rest.len - 4)])
         }
     }
 
@@ -620,17 +662,33 @@ pub fn hub_loop(hub_init HubState, jobs chan HubJob) {
         t_start := time.now()
         now := time.now_time().unix()
         reload_configs_if_needed($&hub.st, now)
-        maybe_run_maintenance($&hub, now)
+        sweep_state_maps($&hub.st, now)
 
         if job.kind == HUB_METRIC_FLUSH {
             acl := hub.clients.len
             lch := hub.log_ch
             metrics_flush_and_reset($&hub.metrics, acl, now, lch)
+            if job.flag == 1 {
+                job.reply_ch <- reply_http(json_resp(200, "{}"), 0, 0, "", "internal", "")
+            }
             ->
         }
         if job.kind == HUB_METRIC_TLS {
             if job.flag == 1 { hub.metrics.tls_ok += 1 }
             else { hub.metrics.tls_fail += 1 }
+            ->
+        }
+        if job.kind == HUB_METRIC_GC {
+            hub.metrics.mail_gc_deleted += job.flag
+            ->
+        }
+        if job.kind == HUB_SHUTDOWN_DRAIN {
+            hub.draining = true
+            for i in 0:hub.clients.len {
+                _ := send_sse_msg(&hub.clients[i], SSE_CTRL_SHUTDOWN)
+            }
+            hub.clients = []SseClient{}
+            job.reply_ch <- reply_http(json_resp(200, "{\"ok\":true}"), 0, 0, "", "internal", "")
             ->
         }
 
@@ -687,6 +745,38 @@ pub fn hub_loop(hub_init HubState, jobs chan HubJob) {
                 metrics_record_http($&hub.metrics, au.status, job.req.req_body.len, r_err.body.len, q_ms, h_ms, q_ms + h_ms, slow)
                 job.reply_ch <- reply_http(r_err, q_ms, h_ms, au.code + "", atyp, aid_hdr)
                 ->
+            }
+            if hub.draining {
+                h_ms := (time.now() - t_start) / 1000000
+                r503 := err_resp(503, "ERR_OVERLOADED", "server is draining", 5, now + 5, 0)
+                slow := hub.slow_ms
+                metrics_record_http($&hub.metrics, 503, job.req.req_body.len, r503.body.len, q_ms, h_ms, q_ms + h_ms, slow)
+                job.reply_ch <- reply_http(r503, q_ms, h_ms, "ERR_OVERLOADED", "agent", au.agent_id + "")
+                ->
+            }
+            if hub.max_sse > 0 && hub.clients.len >= hub.max_sse {
+                h_ms := (time.now() - t_start) / 1000000
+                r503 := err_resp(503, "ERR_OVERLOADED", "max concurrent SSE streams reached", 5, now + 5, 0)
+                slow := hub.slow_ms
+                metrics_record_http($&hub.metrics, 503, job.req.req_body.len, r503.body.len, q_ms, h_ms, q_ms + h_ms, slow)
+                job.reply_ch <- reply_http(r503, q_ms, h_ms, "ERR_OVERLOADED", "agent", au.agent_id + "")
+                ->
+            }
+            if hub.max_sse_per_agent > 0 {
+                $agent_sse := 0
+                for ci in 0:hub.clients.len {
+                    if hub.clients[ci].agent_id == au.agent_id {
+                        agent_sse += 1
+                    }
+                }
+                if agent_sse >= hub.max_sse_per_agent {
+                    h_ms := (time.now() - t_start) / 1000000
+                    r429 := err_resp(429, "ERR_RATE_LIMITED", "too many concurrent SSE streams for agent", 5, now + 5, 0)
+                    slow := hub.slow_ms
+                    metrics_record_http($&hub.metrics, 429, job.req.req_body.len, r429.body.len, q_ms, h_ms, q_ms + h_ms, slow)
+                    job.reply_ch <- reply_http(r429, q_ms, h_ms, "ERR_RATE_LIMITED", "agent", au.agent_id + "")
+                    ->
+                }
             }
             sid := hub.next_sse_id
             hub.next_sse_id += 1

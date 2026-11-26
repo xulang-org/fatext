@@ -1,5 +1,6 @@
 @main
 
+core #runtime/core
 #net
 #maps
 #os
@@ -29,7 +30,7 @@ fn getenv_int_or(key string, fallback int) int {
 
 fn close_raw_fd_quiet(fd int) {
     if fd >= 0 {
-        _ := net.conn_close(fd) or (err) { << }
+        _ := net.conn_close(fd) >>> (err) { << }
     }
 }
 
@@ -88,12 +89,31 @@ fn is_static_or_dl_path(p &string) bool {
         (strings.has_prefix(p, "/dl/") && p.len > 4)
 }
 
-fn handle_connection_guarded(fd int, req_seq int, peer_ip string, tls_on bool, tls_hs_ns int, cert_pem string, key_pem string, gate_ch chan ConnGateMsg, static_ch chan StaticJob, jobs chan HubJob, log_ch chan string, slow_ms int, trust_proxy bool) {
-    handle_connection(fd, req_seq, peer_ip + "", tls_on, tls_hs_ns, cert_pem, key_pem, static_ch, jobs, log_ch, slow_ms, trust_proxy)
+fn const_time_str_eq(a &string, b &string) bool {
+    if a.len != b.len { << false }
+    $diff := 0
+    for i in 0:a.len {
+        diff = diff | ((a[i] & 255) ^ (b[i] & 255))
+    }
+    << diff == 0
+}
+
+struct ConnRuntimeCfg {
+    tls_on bool
+    tls_hs_ns int
+    cert_pem string
+    key_pem string
+    slow_ms int
+    trust_proxy bool
+    shutdown_secret string
+}
+
+fn handle_connection_guarded(fd int, req_seq int, peer_ip string, rcfg ConnRuntimeCfg, gate_ch chan ConnGateMsg, static_ch chan StaticJob, jobs chan HubJob, log_ch chan string, sig_ch chan int) {
+    handle_connection(fd, req_seq, peer_ip + "", rcfg.tls_on, rcfg.tls_hs_ns, rcfg.cert_pem + "", rcfg.key_pem + "", static_ch, jobs, log_ch, rcfg.slow_ms, rcfg.trust_proxy, rcfg.shutdown_secret + "", sig_ch)
     release_conn_slot(gate_ch, peer_ip + "")
 }
 
-fn handle_connection(fd int, req_seq int, peer_ip string, tls_on bool, tls_hs_ns int, cert_pem string, key_pem string, static_ch chan StaticJob, jobs chan HubJob, log_ch chan string, slow_ms int, trust_proxy bool) {
+fn handle_connection(fd int, req_seq int, peer_ip string, tls_on bool, tls_hs_ns int, cert_pem string, key_pem string, static_ch chan StaticJob, jobs chan HubJob, log_ch chan string, slow_ms int, trust_proxy bool, shutdown_secret string, sig_ch chan int) {
     cc_disable_sigpipe(fd)
     t0_ns := time.now()
     req_prefix := "r_" + strconv.itoa(req_seq)
@@ -102,7 +122,7 @@ fn handle_connection(fd int, req_seq int, peer_ip string, tls_on bool, tls_hs_ns
     $tls_ms := 0
     if tls_on {
         t_tls0 := time.now()
-        cc = cc_from_tls(fd, &cert_pem, &key_pem, peer_ip + "", tls_hs_ns) or (err) {
+        cc = cc_from_tls(fd, &cert_pem, &key_pem, peer_ip + "", tls_hs_ns) >>> (err) {
             tls_ms = (time.now() - t_tls0) / 1000000
             if tls_ms < 0 { tls_ms = 0 }
             jobs <- HubJob{kind: HUB_METRIC_TLS, req: empty_req(), sse_id: 0, enqueued_ns: 0, flag: 0, reply_ch: chan HubReply{cap: 1}}
@@ -221,6 +241,11 @@ fn handle_connection(fd int, req_seq int, peer_ip string, tls_on bool, tls_hs_ns
                             _ := cc_write($&cc, &disc)
                             close_reason = "ctrl_close"
                             alive = false
+                        } else if msg == SSE_CTRL_SHUTDOWN {
+                            sd := "event: system\ndata: {\"kind\":\"shutdown\"}\n\n"
+                            _ := cc_write($&cc, &sd)
+                            close_reason = "shutdown"
+                            alive = false
                         } else if cc_peer_closed(&cc) {
                             close_reason = "peer_closed"
                             alive = false
@@ -266,6 +291,21 @@ fn handle_connection(fd int, req_seq int, peer_ip string, tls_on bool, tls_hs_ns
 
         ka := wants_keep_alive(&req) && req_n + 1 < 200
         req_p_only := path_only(raw_p + "")
+        if meth == "POST" && req_p_only == "/internal/shutdown" && shutdown_secret.len > 0 {
+            got_sec := req.header("X-Fatext-Shutdown-Secret")
+            if !const_time_str_eq(&got_sec, &shutdown_secret) {
+                r := err_resp(403, "ERR_FORBIDDEN", "invalid shutdown secret", 0, 0, 0)
+                _ := write_http_resp_ka($&cc, &r, false)
+                <-
+            }
+            r := json_resp(200, "{\"ok\":true,\"stopping\":true}")
+            _ := write_http_resp_ka($&cc, &r, false)
+            select {
+                sig_ch <- signal.SIGTERM {}
+                else {}
+            }
+            <-
+        }
         if meth == "GET" && is_static_or_dl_path(&req_p_only) {
             t_st0 := time.now()
             st_rch := chan HttpResp{cap: 1}
@@ -314,7 +354,7 @@ fn handle_connection(fd int, req_seq int, peer_ip string, tls_on bool, tls_hs_ns
 fn handle_redirect_conn(fd int, https_host string) {
     cc_disable_sigpipe(fd)
     $cc := cc_from_tcp(fd, "127.0.0.1")
-    req := read_http_request($&cc) or (err) {
+    req := read_http_request($&cc) >>> (err) {
         cc_close($&cc)
         <<
     }
@@ -328,12 +368,12 @@ fn handle_redirect_conn(fd int, https_host string) {
 }
 
 fn redirect_loop(redir_addr string, https_host string) {
-    lfd := net.listen(redir_addr + "") or (err) {
+    lfd := net.listen(redir_addr + "") >>> (err) {
         println("fatext-server: redirect listen failed: " + err.msg())
         <<
     }
     while true {
-        fd := net.accept(lfd) or (err) { -> }
+        fd := net.accept(lfd) >>> (err) { -> }
         xu handle_redirect_conn(fd, https_host + "")
     }
 }
@@ -348,18 +388,69 @@ fn metrics_ticker_loop(interval_sec int, jobs chan HubJob) {
 }
 
 fn ignore_sigpipe_quiet() {
-    _ := signal.ignore(signal.SIGPIPE) or (err) { << }
+    _ := signal.ignore(signal.SIGPIPE) >>> (err) { << }
+}
+
+fn watch_signal_quiet(ch chan int, sig int) {
+    _ := signal.notify(ch, sig) >>> (err) { << }
+}
+
+fn shutdown_watcher_loop(sig_ch chan int, accept_stop chan int, lfd int, drain_ms int, jobs chan HubJob, log_ch chan string, flush_done chan int) {
+    sig := <-sig_ch
+    time.sleep(30000000)
+
+    d_rch := chan HubReply{cap: 1}
+    jobs <- HubJob{kind: HUB_SHUTDOWN_DRAIN, req: empty_req(), sse_id: 0, enqueued_ns: 0, flag: 0, reply_ch: d_rch}
+    dtick := time.new_ticker(1000000000)
+    select {
+        _ := <-d_rch {}
+        _ := <-dtick.c {}
+    }
+    dtick.stop()
+
+    select {
+        accept_stop <- 1 {}
+        else {}
+    }
+    close_raw_fd_quiet(lfd)
+    if drain_ms > 0 {
+        time.sleep(drain_ms * 1000000)
+    }
+
+    now := time.now_time().unix()
+    log_event_json(log_ch, now, "server_stop", "\"signal\":" + strconv.itoa(sig))
+
+    m_rch := chan HubReply{cap: 1}
+    m_job := HubJob{kind: HUB_METRIC_FLUSH, req: empty_req(), sse_id: 0, enqueued_ns: 0, flag: 1, reply_ch: m_rch}
+    jobs <- m_job
+    mtick := time.new_ticker(500000000)
+    select {
+        _ := <-m_rch {}
+        _ := <-mtick.c {}
+    }
+    mtick.stop()
+
+    flush_sig := LOG_CTRL_FLUSH
+    log_ch <- flush_sig
+    ltick := time.new_ticker(2000000000)
+    select {
+        _ := <-flush_done {}
+        _ := <-ltick.c {}
+    }
+    ltick.stop()
+    core.exit_process(0)
 }
 
 fn main() int {
     ignore_sigpipe_quiet()
     addr := getenv_or("FATEXT_ADDR", "127.0.0.1:8080")
     data_dir := getenv_or("FATEXT_DATA_DIR", "/var/lib/fatext")
-    www_dir := getenv_or("FATEXT_WWW_DIR", "/Users/jay/Documents/work/xulang-org/fatext/www")
-    tpl_dir := getenv_or("FATEXT_TEMPLATES_DIR", "/Users/jay/Documents/work/xulang-org/fatext/templates")
+    www_dir := getenv_or("FATEXT_WWW_DIR", "./www")
+    tpl_dir := getenv_or("FATEXT_TEMPLATES_DIR", "./templates")
     dl_dir := getenv_or("FATEXT_DL_DIR", data_dir + "/dl")
     pow_bits := getenv_int_or("FATEXT_POW_BITS", 20)
     mail_secret := os.getenv("FATEXT_MAIL_INTERNAL_SECRET")
+    shutdown_secret := os.getenv("FATEXT_SHUTDOWN_SECRET")
     ip_rpm := getenv_int_or("FATEXT_IP_RPM", 600)
     tls_cert_path := os.getenv("FATEXT_TLS_CERT")
     tls_key_path := os.getenv("FATEXT_TLS_KEY")
@@ -373,6 +464,9 @@ fn main() int {
     trust_proxy := getenv_int_or("FATEXT_TRUST_PROXY", 0) != 0
     max_conns := getenv_int_or("FATEXT_MAX_CONNS", 4096)
     max_conns_per_ip := getenv_int_or("FATEXT_MAX_CONNS_PER_IP", 64)
+    max_sse := getenv_int_or("FATEXT_MAX_SSE", 2048)
+    max_sse_per_agent := getenv_int_or("FATEXT_MAX_SSE_PER_AGENT", 8)
+    drain_ms := getenv_int_or("FATEXT_DRAIN_MS", 150)
     tls_handshake_ms := getenv_int_or("FATEXT_TLS_HANDSHAKE_MS", 5000)
     tls_hs_ns := tls_handshake_ms * 1000000
 
@@ -380,11 +474,11 @@ fn main() int {
     $cert_pem := ""
     $key_pem := ""
     if tls_cert_path.len > 0 && tls_key_path.len > 0 {
-        cert_pem = os.read(tls_cert_path + "") or (err) {
+        cert_pem = os.read(tls_cert_path + "") >>> (err) {
             println("fatext-server: failed reading FATEXT_TLS_CERT: " + err.msg())
             << 1
         }
-        key_pem = os.read(tls_key_path + "") or (err) {
+        key_pem = os.read(tls_key_path + "") >>> (err) {
             println("fatext-server: failed reading FATEXT_TLS_KEY: " + err.msg())
             << 1
         }
@@ -394,13 +488,20 @@ fn main() int {
     $st := new_state(addr + "", data_dir + "", www_dir + "", tpl_dir + "", dl_dir + "", pow_bits, mail_secret + "", ip_rpm)
     init_state($&st)
 
+    $ch_names := []string{}
+    for ci in 0:st.channels.len {
+        ch_names.push(st.channels[ci].name + "")
+    }
+
     log_ch := chan string{cap: 1024}
-    xu logger_loop(log_dir + "", retain_days, stdout_mirror, log_ch)
+    flush_done := chan int{cap: 1}
+    xu logger_loop(log_dir + "", retain_days, stdout_mirror, log_ch, flush_done)
 
     now0 := time.now_time().unix()
-    hub := new_hub_state(st, log_ch, slow_ms, now0)
+    hub := new_hub_state(st, log_ch, slow_ms, now0, max_sse, max_sse_per_agent)
     jobs := chan HubJob{cap: 128}
     xu hub_loop(hub, jobs)
+    xu maintenance_loop(data_dir + "", ch_names, log_ch, jobs)
 
     static_ch := chan StaticJob{cap: 64}
     xu static_loop(www_dir + "", dl_dir + "", static_ch)
@@ -416,10 +517,16 @@ fn main() int {
         xu redirect_loop(redir_addr + "", "fatext.com")
     }
 
-    lfd := net.listen(addr + "") or (err) {
+    lfd := net.listen(addr + "") >>> (err) {
         println("fatext-server: listen failed: " + err.msg())
         << 1
     }
+    sig_ch := chan int{cap: 4}
+    accept_stop := chan int{cap: 1}
+    watch_signal_quiet(sig_ch, signal.SIGINT)
+    watch_signal_quiet(sig_ch, signal.SIGTERM)
+    xu shutdown_watcher_loop(sig_ch, accept_stop, lfd, drain_ms, jobs, log_ch, flush_done)
+
     $scheme := "http"
     $tls_s := "false"
     if tls_on {
@@ -436,8 +543,27 @@ fn main() int {
     println("fatext-server listening on " + scheme + "://" + addr + " (data=" + data_dir + ", pow=" + str(pow_bits) + ", logs=" + log_dir + ")")
 
     $req_seq := 0
-    while true {
-        fd := net.accept(lfd) or (err) { -> }
+    $accept_running := true
+    while accept_running {
+        select {
+            _ := <-accept_stop {
+                accept_running = false
+            }
+            else {}
+        }
+        if !accept_running { -> }
+        fd := net.accept(lfd) >>> (err) {
+            select {
+                _ := <-accept_stop {
+                    accept_running = false
+                }
+                else {}
+            }
+            if accept_running {
+                time.sleep(10000000)
+            }
+            ->
+        }
         peer_ip := resolve_peer_ip(fd)
         if !acquire_conn_slot(gate_ch, peer_ip + "") {
             log_event_json(log_ch, time.now_time().unix(), "conn_rejected",
@@ -446,7 +572,19 @@ fn main() int {
             ->
         }
         req_seq += 1
-        xu handle_connection_guarded(fd, req_seq, peer_ip + "", tls_on, tls_hs_ns, cert_pem + "", key_pem + "", gate_ch, static_ch, jobs, log_ch, slow_ms, trust_proxy)
+        rcfg := ConnRuntimeCfg{
+            tls_on: tls_on,
+            tls_hs_ns: tls_hs_ns,
+            cert_pem: cert_pem + "",
+            key_pem: key_pem + "",
+            slow_ms: slow_ms,
+            trust_proxy: trust_proxy,
+            shutdown_secret: shutdown_secret + ""
+        }
+        xu handle_connection_guarded(fd, req_seq, peer_ip + "", rcfg, gate_ch, static_ch, jobs, log_ch, sig_ch)
+    }
+    while true {
+        time.sleep(1000000000)
     }
     << 0
 }

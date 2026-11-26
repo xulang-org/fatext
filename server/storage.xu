@@ -5,6 +5,7 @@
 #strings
 #strconv
 #time
+#crypto/rsa
 #crypto/sha256
 #encoding/json
 
@@ -112,6 +113,14 @@ pub struct State {
     pub ch_cache_html maps.StrStr
     pub ch_cache_ts maps.StrInt
     pub room_slow_ts maps.StrInt
+
+    pub agent_raw_cache maps.StrStr
+    pub agent_pk_idx maps.StrInt
+    pub agent_pks []rsa.PublicKey
+    pub friends_raw_cache maps.StrStr
+    pub agent_blocks_flat maps.StrStr
+    pub room_raw_cache maps.StrStr
+    pub last_map_sweep int
 }
 
 pub fn new_state(addr string, data_dir string, www_dir string, templates_dir string, dl_dir string, pow_bits int, mail_secret string, ip_rpm int) State {
@@ -155,7 +164,14 @@ pub fn new_state(addr string, data_dir string, www_dir string, templates_dir str
         thread_reply_totals: maps.new_str_int(),
         ch_cache_html: maps.new_str_str(),
         ch_cache_ts: maps.new_str_int(),
-        room_slow_ts: maps.new_str_int()
+        room_slow_ts: maps.new_str_int(),
+        agent_raw_cache: maps.new_str_str(),
+        agent_pk_idx: maps.new_str_int(),
+        agent_pks: []rsa.PublicKey{},
+        friends_raw_cache: maps.new_str_str(),
+        agent_blocks_flat: maps.new_str_str(),
+        room_raw_cache: maps.new_str_str(),
+        last_map_sweep: 0
     }
 }
 
@@ -175,6 +191,10 @@ pub fn room_bucket(room_id string) string {
 
 pub fn room_path(st &State, room_id string) string {
     << st.data_dir + "/rooms/" + room_bucket(room_id + "") + "/" + room_id + ".json"
+}
+
+pub fn room_keybox_path(st &State, room_id string) string {
+    << st.data_dir + "/rooms/" + room_bucket(room_id + "") + "/" + room_id + ".keybox.json"
 }
 
 pub fn agent_rooms_path(st &State, agent_id string) string {
@@ -231,60 +251,60 @@ pub fn agent_doc_path(st &State, agent_id string, kind string) string {
 }
 
 pub fn write_atomic(path string, data &string) int {
-    tmp := path + ".tmp." + strconv.itoa(os.getpid())
-    os.write(tmp + "", data + "") or >>
-    os.rename(tmp + "", path) or >>
+    tmp := path + ".tmp." + strconv.itoa(os.getpid()) + "." + strconv.itoa(time.now())
+    os.write(tmp + "", data + "") >>>
+    os.rename(tmp + "", path) >>>
     << 0
 }
 
 pub fn read_file_or_empty(path string) string {
-    << os.read(path) or (err) { << "" }
+    << os.read(path) >>> (err) { << "" }
 }
 
 pub fn close_file_quiet(f $&os.File) {
-    f.close() or (err) { << }
+    f.close() >>> (err) { << }
 }
 
 pub fn mkdir_all_quiet(path string) {
-    os.mkdir_all(path) or (err) { << }
+    os.mkdir_all(path) >>> (err) { << }
 }
 
 pub fn write_atomic_quiet(path string, data &string) {
-    write_atomic(path, data) or (err) { << }
+    write_atomic(path, data) >>> (err) { << }
 }
 
 pub fn append_jsonl(path string, line string) int {
-    $f := os.open_append(path) or >>
-    f.write(line + "\n") or (err) {
+    $f := os.open_append(path) >>>
+    f.write(line + "\n") >>> (err) {
         close_file_quiet($&f)
-        >> err
+        >>> err
     }
-    f.close() or >>
+    f.close() >>>
     << 0
 }
 
 pub fn append_jsonl_quiet(path string, line string) {
-    append_jsonl(path, line) or (err) { << }
+    append_jsonl(path, line) >>> (err) { << }
 }
 
 pub fn json_str_or(doc &json.Doc, node int, def string) string {
     if node < 0 { << def }
-    << doc.as_string(node) or (err) { << def }
+    << doc.as_string(node) >>> (err) { << def }
 }
 
 pub fn json_int_or(doc &json.Doc, node int, def int) int {
     if node < 0 { << def }
-    << doc.as_int(node) or (err) { << def }
+    << doc.as_int(node) >>> (err) { << def }
 }
 
 pub fn json_bool_or(doc &json.Doc, node int, def bool) bool {
     if node < 0 { << def }
-    << doc.as_bool(node) or (err) { << def }
+    << doc.as_bool(node) >>> (err) { << def }
 }
 
 pub fn json_encode_or(doc &json.Doc, node int, def string) string {
     if node < 0 { << def }
-    << doc.encode(node) or (err) { << def }
+    << doc.encode(node) >>> (err) { << def }
 }
 
 fn default_channels_json() string {
@@ -303,7 +323,7 @@ fn parse_channels_data(st $&State, raw &string) {
     for i in 0:cnt {
         el := doc.at(arr, i)
         if doc.is_dict(el) && doc.has(el, "name") {
-            nm := doc.as_string(doc.get(el, "name")) or (err) { -> }
+            nm := doc.as_string(doc.get(el, "name")) >>> (err) { -> }
             $desc := ""
             if doc.has(el, "description") {
                 desc = json_str_or(&doc, doc.get(el, "description"), "")
@@ -328,8 +348,8 @@ fn parse_pins_data(st $&State, raw &string) {
         el := doc.at(arr, i)
         if !doc.is_dict(el) { -> }
         if !doc.has(el, "msg_id") || !doc.has(el, "pin_type") { -> }
-        mid := doc.as_string(doc.get(el, "msg_id")) or (err) { -> }
-        pt := doc.as_string(doc.get(el, "pin_type")) or (err) { -> }
+        mid := doc.as_string(doc.get(el, "msg_id")) >>> (err) { -> }
+        pt := doc.as_string(doc.get(el, "pin_type")) >>> (err) { -> }
         $lbl := "ANNOUNCEMENT"
         if pt == "sponsored" { lbl = "SPONSORED" }
         if doc.has(el, "label") {
@@ -395,11 +415,11 @@ pub fn map_set(m $&maps.StrInt, k string, v int) {
 }
 
 pub fn map_get_or(m &maps.StrInt, k string, def int) int {
-    << m.get(k) or (err) { << def }
+    << m.get(k) >>> (err) { << def }
 }
 
 pub fn str_map_get_or(m &maps.StrStr, k string, def string) string {
-    << m.get(k) or (err) { << def }
+    << m.get(k) >>> (err) { << def }
 }
 
 pub fn str_map_set(m $&maps.StrStr, k string, v string) {
@@ -539,7 +559,7 @@ fn restore_today_daily_limits(st $&State, today string) {
 }
 
 fn file_exists(path string) bool {
-    _ := os.stat(path) or (err) { << false }
+    _ := os.stat(path) >>> (err) { << false }
     << true
 }
 
@@ -633,7 +653,13 @@ pub fn read_agent_summary(st &State, agent_id string) AgentSummary {
         managed_count: 0, managed_agents_raw: "[]", raw_json: ""
     }
     if !is_valid_agent_id(agent_id + "") { << out }
-    raw := os.read(agent_json_path(st, agent_id + "")) or (err) { << out }
+    $raw := ""
+    if st.agent_raw_cache.has(agent_id + "") {
+        raw = str_map_get_or(&st.agent_raw_cache, agent_id + "", "")
+    }
+    if raw.len == 0 {
+        raw = os.read(agent_json_path(st, agent_id + "")) >>> (err) { << out }
+    }
     doc := json.parse(&raw)
     if !doc.ok() { << out }
     r := doc.root()
@@ -743,7 +769,7 @@ pub fn parse_post_line(raw_line &string) PostRecord {
 
 pub fn read_jsonl_records(path string) []PostRecord {
     $out := []PostRecord{}
-    raw := os.read(path) or (err) { << out }
+    raw := os.read(path) >>> (err) { << out }
     lines := strings.split(&raw, "\n")
     for i in 0:lines.len {
         ln := strings.trim_space(&lines[i])
@@ -838,4 +864,101 @@ pub fn active_pins_for_channel(st &State, ch string, now int) []PinEntry {
         })
     }
     << out
+}
+
+pub fn invalidate_agent_cache(st $&State, aid string) {
+    am := $&st.agent_raw_cache
+    am.del(aid + "")
+    pm := $&st.agent_pk_idx
+    pm.del(aid + "")
+}
+
+pub fn read_agent_summary_cached(st $&State, agent_id string) AgentSummary {
+    out := read_agent_summary(st, agent_id + "")
+    if out.found && !st.agent_raw_cache.has(agent_id + "") {
+        if st.agent_raw_cache.keys().len >= 4096 {
+            am := $&st.agent_raw_cache
+            am.clear()
+        }
+        str_map_set($&st.agent_raw_cache, agent_id + "", out.raw_json + "")
+    }
+    << out
+}
+
+pub fn verify_request_sig_cached(st $&State, aid string, pub_pem &string, method string, raw_path string, ts string, body &string, sig_b64 string) bool {
+    if !st.agent_pk_idx.has(aid + "") {
+        pk := parse_spki_rsa_pem(pub_pem) >>> (err) { << false }
+        if st.agent_pks.len >= 4096 {
+            pm := $&st.agent_pk_idx
+            pm.clear()
+            st.agent_pks = []rsa.PublicKey{}
+        }
+        idx := st.agent_pks.len
+        st.agent_pks.push(pk)
+        map_set($&st.agent_pk_idx, aid + "", idx)
+    }
+    pidx := map_get_or(&st.agent_pk_idx, aid + "", -1)
+    if pidx < 0 || pidx >= st.agent_pks.len { << false }
+    << verify_request_sig(&st.agent_pks[pidx], method, raw_path, ts, body, sig_b64)
+}
+
+fn sweep_old_int_map(m $&maps.StrInt, cutoff int) {
+    ks := m.keys()
+    $drop := []string{}
+    for i in 0:ks.len {
+        k := ks[i] + ""
+        v := map_get_or(m, k + "", 0)
+        if v < cutoff { drop.push(k) }
+    }
+    for i in 0:drop.len { m.del(drop[i] + "") }
+}
+
+pub fn sweep_state_maps(st $&State, now int) {
+    if now - st.last_map_sweep < 300 { << }
+    st.last_map_sweep = now
+    sweep_old_int_map($&st.room_slow_ts, now - 3600)
+    sweep_old_int_map($&st.thread_cooldown, now - 300)
+    sweep_old_int_map($&st.profile_min_ts, now - 120)
+
+    today := utc_date_from_unix(now)
+    dp_ks := st.daily_posts.keys()
+    $dp_drop := []string{}
+    for i in 0:dp_ks.len {
+        if !strings.has_prefix(&dp_ks[i], today) { dp_drop.push(dp_ks[i] + "") }
+    }
+    dp := $&st.daily_posts
+    for i in 0:dp_drop.len { dp.del(dp_drop[i] + "") }
+
+    dr_ks := st.daily_replies.keys()
+    $dr_drop := []string{}
+    for i in 0:dr_ks.len {
+        if !strings.has_prefix(&dr_ks[i], today) { dr_drop.push(dr_ks[i] + "") }
+    }
+    dr := $&st.daily_replies
+    for i in 0:dr_drop.len { dr.del(dr_drop[i] + "") }
+
+    if st.ch_cache_html.keys().len > 256 {
+        m1 := $&st.ch_cache_html
+        m1.clear()
+        m2 := $&st.ch_cache_ts
+        m2.clear()
+    }
+    if st.agent_names.keys().len > 4096 {
+        an := $&st.agent_names
+        an.clear()
+    }
+    if st.thread_counts.keys().len > 4096 {
+        tc := $&st.thread_counts
+        tc.clear()
+    }
+    if st.friends_raw_cache.keys().len > 4096 {
+        fc := $&st.friends_raw_cache
+        fc.clear()
+        bf := $&st.agent_blocks_flat
+        bf.clear()
+    }
+    if st.room_raw_cache.keys().len > 2048 {
+        rc := $&st.room_raw_cache
+        rc.clear()
+    }
 }

@@ -207,7 +207,7 @@ fn dl_kind_label(name string) string {
 }
 
 fn read_dir_or_empty(p string) string {
-    << os.read_dir(p) or (err) { << "" }
+    << os.read_dir(p) >>> (err) { << "" }
 }
 
 pub fn serve_download(st &State) HttpResp {
@@ -219,7 +219,7 @@ pub fn serve_download(st &State) HttpResp {
             for i in 0:lines.len {
                 fn_s := strings.trim_space(&lines[i])
                 if !is_safe_dl_filename(fn_s + "") { -> }
-                info := os.stat(st.dl_dir + "/" + fn_s) or (err) { -> }
+                info := os.stat(st.dl_dir + "/" + fn_s) >>> (err) { -> }
                 if !info.is_dir {
                     files.push(fn_s)
                 }
@@ -245,7 +245,7 @@ pub fn serve_download(st &State) HttpResp {
         $rows := ""
         for k in 0:files.len {
             fn_s := files[k] + ""
-            info := os.stat(st.dl_dir + "/" + fn_s) or (err) { -> }
+            info := os.stat(st.dl_dir + "/" + fn_s) >>> (err) { -> }
             kind_s := dl_kind_label(fn_s + "")
             sz_s := format_bytes_human(info.size)
             rows = rows + "<tr><td><a href=\"/dl/" + esc(&fn_s) + "\"><code>" + esc(&fn_s) + "</code></a></td><td><code>" + esc(&kind_s) + "</code></td><td>" + esc(&sz_s) + "</td></tr>"
@@ -710,7 +710,7 @@ fn is_valid_dl_semver(s &string) bool {
 }
 
 fn atoi_or_zero(s &string) int {
-    << strconv.atoi(s) or (err) { << 0 }
+    << strconv.atoi(s) >>> (err) { << 0 }
 }
 
 fn ssr_semver_gt(a &string, b &string) bool {
@@ -752,7 +752,7 @@ fn extract_ver_from_dl_filename(name &string) string {
 
 pub fn resolve_dl_latest_version(dl_dir &string) string {
     if dl_dir.len == 0 { << "" }
-    lraw := os.read(dl_dir + "/latest.json") or (err) { << "" }
+    lraw := os.read(dl_dir + "/latest.json") >>> (err) { << "" }
     if lraw.len > 0 {
         ldoc := json.parse(&lraw)
         if ldoc.ok() && ldoc.is_dict(ldoc.root()) && ldoc.has(ldoc.root(), "latest_version") {
@@ -841,21 +841,21 @@ pub fn serve_static_allowlisted(st &State, path string) HttpResp {
         << HttpResp{status: 0, ctype: "", extra: "", body: ""}
     }
 
-    data := os.read(disk_path) or (err) {
+    data := os.read(disk_path) >>> (err) {
         << serve_error_html(st, 404, "ERR_NOT_FOUND", "Static asset not present on disk.")
     }
     if path == "/.well-known/fatext.json" {
         patched := patch_fatext_json_latest(&data, &st.dl_dir)
-        << http_resp(200, ctype, "", &patched)
+        << http_resp(200, ctype, "Cache-Control: public, max-age=60\r\n", &patched)
     }
-    << http_resp(200, ctype, "", &data)
+    << http_resp(200, ctype, "Cache-Control: public, max-age=300\r\n", &data)
 }
 
 pub fn serve_dl_file(st &State, filename string) HttpResp {
     if st.dl_dir.len == 0 || !is_safe_dl_filename(filename + "") {
         << err_resp(404, "ERR_NOT_FOUND", "download artifact not found", 0, 0, 0)
     }
-    data := os.read(st.dl_dir + "/" + filename) or (err) {
+    data := os.read(st.dl_dir + "/" + filename) >>> (err) {
         << err_resp(404, "ERR_NOT_FOUND", "download artifact not found", 0, 0, 0)
     }
     $ctype := "application/octet-stream"
@@ -897,9 +897,9 @@ pub fn static_loop(www_dir string, dl_dir string, ch chan StaticJob) {
             body := str_map_get_or(&bodies, p + "", "")
             if p == "/.well-known/fatext.json" {
                 patched := patch_fatext_json_latest(&body, &dl_dir)
-                job.reply_ch <- http_resp(200, ct, "", &patched)
+                job.reply_ch <- http_resp(200, ct, "Cache-Control: public, max-age=60\r\n", &patched)
             } else {
-                job.reply_ch <- http_resp(200, ct, "", &body)
+                job.reply_ch <- http_resp(200, ct, "Cache-Control: public, max-age=300\r\n", &body)
             }
             ->
         }
@@ -910,7 +910,7 @@ pub fn static_loop(www_dir string, dl_dir string, ch chan StaticJob) {
                 ->
             }
             fpath := dl_dir + "/" + fn_s
-            info := os.stat(fpath + "") or (err) {
+            info := os.stat(fpath + "") >>> (err) {
                 job.reply_ch <- err_resp(404, "ERR_NOT_FOUND", "download artifact not found", 0, 0, 0)
                 ->
             }
@@ -935,7 +935,7 @@ pub fn static_loop(www_dir string, dl_dir string, ch chan StaticJob) {
                     ->
                 }
             }
-            data := os.read(fpath + "") or (err) {
+            data := os.read(fpath + "") >>> (err) {
                 job.reply_ch <- err_resp(404, "ERR_NOT_FOUND", "download artifact not found", 0, 0, 0)
                 ->
             }

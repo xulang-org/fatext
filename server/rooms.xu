@@ -12,6 +12,14 @@ pub struct RoomMember {
     pub joined_at int
 }
 
+struct RoomKeyBoxEntry {
+    agent_id string
+    from_id string
+    epoch int
+    updated_at int
+    frame_json string
+}
+
 pub struct RoomData {
     pub found bool
     pub room_id string
@@ -84,10 +92,10 @@ fn room_is_priv_role(role string) bool {
     << role == "owner" || role == "admin"
 }
 
-fn load_room_data(st &State, room_id string) RoomData {
+fn parse_room_raw(room_id string, raw &string) RoomData {
     $rd := empty_room_data()
-    raw := os.read(room_path(st, room_id + "")) or (err) { << rd }
-    doc := json.parse(&raw)
+    if raw.len == 0 { << rd }
+    doc := json.parse(raw)
     if !doc.ok() || !doc.is_dict(doc.root()) { << rd }
     r := doc.root()
 
@@ -140,6 +148,28 @@ fn load_room_data(st &State, room_id string) RoomData {
     << rd
 }
 
+fn load_room_data(st &State, room_id string) RoomData {
+    if st.room_raw_cache.has(room_id + "") {
+        cached := str_map_get_or(&st.room_raw_cache, room_id + "", "")
+        << parse_room_raw(room_id + "", &cached)
+    }
+    raw := os.read(room_path(st, room_id + "")) >>> (err) { << empty_room_data() }
+    << parse_room_raw(room_id + "", &raw)
+}
+
+fn load_room_data_cached(st $&State, room_id string) RoomData {
+    if st.room_raw_cache.has(room_id + "") {
+        cached := str_map_get_or(&st.room_raw_cache, room_id + "", "")
+        << parse_room_raw(room_id + "", &cached)
+    }
+    raw := os.read(room_path(st, room_id + "")) >>> (err) { << empty_room_data() }
+    rd := parse_room_raw(room_id + "", &raw)
+    if rd.found {
+        str_map_set($&st.room_raw_cache, room_id + "", raw)
+    }
+    << rd
+}
+
 fn serialize_room_json(rd &RoomData, viewer_id string, include_banned bool) string {
     $mem_s := []string{}
     for i in 0:rd.members.len {
@@ -181,15 +211,96 @@ fn serialize_room_json(rd &RoomData, viewer_id string, include_banned bool) stri
         ",\"banned\":[" + strings.join(ban_s, ",") + "]}"
 }
 
-fn save_room_data(st &State, rd &RoomData) int {
+fn save_room_data(st $&State, rd &RoomData) int {
     mkdir_all_quiet(st.data_dir + "/rooms/" + room_bucket(rd.room_id + ""))
     body := serialize_room_json(rd, rd.owner_id + "", true) + "\n"
-    << write_atomic(room_path(st, rd.room_id + ""), &body) or >>
+    rc := write_atomic(room_path(st, rd.room_id + ""), &body) >>>
+    str_map_set($&st.room_raw_cache, rd.room_id + "", body)
+    << rc
+}
+
+fn load_room_keybox(st &State, rid string) []RoomKeyBoxEntry {
+    $out := []RoomKeyBoxEntry{}
+    raw := os.read(room_keybox_path(st, rid + "")) >>> (err) { << out }
+    doc := json.parse(&raw)
+    if !doc.ok() || !doc.is_dict(doc.root()) { << out }
+    r := doc.root()
+    if !doc.has(r, "entries") || !doc.is_list(doc.get(r, "entries")) { << out }
+    arr := doc.get(r, "entries")
+    for i in 0:doc.count(arr) {
+        el := doc.at(arr, i)
+        if !doc.is_dict(el) { -> }
+        aid := json_str_or(&doc, doc.get(el, "agent_id"), "")
+        fid := json_str_or(&doc, doc.get(el, "from"), "")
+        ep := json_int_or(&doc, doc.get(el, "epoch"), 1)
+        uat := json_int_or(&doc, doc.get(el, "updated_at"), 0)
+        fjson := json_encode_or(&doc, doc.get(el, "frame"), "")
+        if is_valid_agent_id(aid + "") && fjson.len > 0 {
+            out.push(RoomKeyBoxEntry{agent_id: aid, from_id: fid, epoch: ep, updated_at: uat, frame_json: fjson})
+        }
+    }
+    << out
+}
+
+fn save_room_keybox(st &State, rid string, entries &[]RoomKeyBoxEntry) {
+    p := room_keybox_path(st, rid + "")
+    if entries.len == 0 {
+        os.remove(p) >>> (err) { << }
+        <<
+    }
+    mkdir_all_quiet(st.data_dir + "/rooms/" + room_bucket(rid + ""))
+    $items := []string{}
+    for i in 0:entries.len {
+        e := &entries[i]
+        items.push("{\"agent_id\":" + json.quote(&e.agent_id) +
+            ",\"from\":" + json.quote(&e.from_id) +
+            ",\"epoch\":" + strconv.itoa(e.epoch) +
+            ",\"updated_at\":" + strconv.itoa(e.updated_at) +
+            ",\"frame\":" + e.frame_json + "}")
+    }
+    body := "{\"room_id\":" + json.quote(&rid) + ",\"entries\":[" + strings.join(items, ",") + "]}\n"
+    write_atomic_quiet(p, &body)
+}
+
+fn upsert_room_keybox_entry(st &State, rid string, target_id string, from_id string, epoch int, now int, frame_json &string) {
+    if frame_json.len == 0 || !is_valid_agent_id(target_id + "") { << }
+    cur := load_room_keybox(st, rid + "")
+    $next := []RoomKeyBoxEntry{}
+    for i in 0:cur.len {
+        if cur[i].agent_id != target_id {
+            e := &cur[i]
+            next.push(RoomKeyBoxEntry{agent_id: e.agent_id + "", from_id: e.from_id + "", epoch: e.epoch, updated_at: e.updated_at, frame_json: e.frame_json + ""})
+        }
+    }
+    next.push(RoomKeyBoxEntry{agent_id: target_id + "", from_id: from_id + "", epoch: epoch, updated_at: now, frame_json: frame_json + ""})
+    save_room_keybox(st, rid + "", &next)
+}
+
+fn remove_room_keybox_entry(st &State, rid string, target_id string) {
+    cur := load_room_keybox(st, rid + "")
+    if cur.len == 0 { << }
+    $next := []RoomKeyBoxEntry{}
+    $removed := false
+    for i in 0:cur.len {
+        if cur[i].agent_id == target_id {
+            removed = true
+        } else {
+            e := &cur[i]
+            next.push(RoomKeyBoxEntry{agent_id: e.agent_id + "", from_id: e.from_id + "", epoch: e.epoch, updated_at: e.updated_at, frame_json: e.frame_json + ""})
+        }
+    }
+    if removed {
+        save_room_keybox(st, rid + "", &next)
+    }
+}
+
+fn delete_room_keybox_file(st &State, rid string) {
+    os.remove(room_keybox_path(st, rid + "")) >>> (err) { << }
 }
 
 fn load_agent_room_ids(st &State, aid string) []string {
     $out := []string{}
-    raw := os.read(agent_rooms_path(st, aid + "")) or (err) { << out }
+    raw := os.read(agent_rooms_path(st, aid + "")) >>> (err) { << out }
     doc := json.parse(&raw)
     if !doc.ok() || !doc.is_dict(doc.root()) { << out }
     r := doc.root()
@@ -335,7 +446,7 @@ fn handle_room_create(hub $&HubState, req &HttpReq, now int) HttpResp {
         members: [RoomMember{agent_id: au.agent_id + "", role: "owner", muted: false, joined_at: now}],
         banned: []string{}
     }
-    save_room_data(&hub.st, &rd) or (err) {
+    save_room_data($&hub.st, &rd) >>> (err) {
         << err_resp(500, "ERR_INTERNAL", "failed saving room", 0, 0, 0)
     }
     add_agent_room_index(&hub.st, au.agent_id + "", rid + "")
@@ -437,7 +548,7 @@ fn handle_room_patch(hub $&HubState, req &HttpReq, rid string, now int) HttpResp
     }
 
     rd.updated_at = now
-    save_room_data(&hub.st, &rd) or (err) {
+    save_room_data($&hub.st, &rd) >>> (err) {
         << err_resp(500, "ERR_INTERNAL", "failed saving room", 0, 0, 0)
     }
     emit_room_event(hub, &rd, "room_updated", au.agent_id + "", "", "")
@@ -521,7 +632,7 @@ fn handle_room_add_member(hub $&HubState, req &HttpReq, rid string, now int) Htt
 
     rd.members.push(RoomMember{agent_id: tgt + "", role: trole + "", muted: false, joined_at: now})
     rd.updated_at = now
-    save_room_data(&hub.st, &rd) or (err) {
+    save_room_data($&hub.st, &rd) >>> (err) {
         << err_resp(500, "ERR_INTERNAL", "failed saving room", 0, 0, 0)
     }
     add_agent_room_index(&hub.st, tgt + "", rid + "")
@@ -532,6 +643,7 @@ fn handle_room_add_member(hub $&HubState, req &HttpReq, rid string, now int) Htt
         if inv_frame.len > 32768 {
             << err_resp(413, "ERR_PAYLOAD_TOO_LARGE", "invite_frame exceeds 32768 bytes", 0, 0, 0)
         }
+        upsert_room_keybox_entry(&hub.st, rid + "", tgt + "", au.agent_id + "", rd.epoch, now, &inv_frame)
         del_state = deliver_dm_relay_raw(hub, &tag, au.agent_id + "", tgt + "", &inv_frame, now)
     }
     log_event_json(hub.log_ch, now, "room_invite",
@@ -587,7 +699,7 @@ fn handle_room_patch_member(hub $&HubState, req &HttpReq, rid string, aid string
     }
 
     rd.updated_at = now
-    save_room_data(&hub.st, &rd) or (err) {
+    save_room_data($&hub.st, &rd) >>> (err) {
         << err_resp(500, "ERR_INTERNAL", "failed saving room", 0, 0, 0)
     }
     $ms := "false"
@@ -648,10 +760,11 @@ fn handle_room_kick_or_ban(hub $&HubState, req &HttpReq, rid string, aid string,
         rd.epoch += 1
     }
     rd.updated_at = now
-    save_room_data(&hub.st, &rd) or (err) {
+    save_room_data($&hub.st, &rd) >>> (err) {
         << err_resp(500, "ERR_INTERNAL", "failed saving room", 0, 0, 0)
     }
     remove_agent_room_index(&hub.st, aid + "", rid + "")
+    remove_room_keybox_entry(&hub.st, rid + "", aid + "")
 
     $act := "kick"
     $kind := "member_kicked"
@@ -693,7 +806,7 @@ fn handle_room_unban(hub $&HubState, req &HttpReq, rid string, aid string, now i
     }
     rd.banned = next_ban
     rd.updated_at = now
-    save_room_data(&hub.st, &rd) or (err) {
+    save_room_data($&hub.st, &rd) >>> (err) {
         << err_resp(500, "ERR_INTERNAL", "failed saving room", 0, 0, 0)
     }
     log_event_json(hub.log_ch, now, "room_unban", "\"room_id\":" + json.quote(&rid) + ",\"actor\":" + json.quote(&au.agent_id) + ",\"target\":" + json.quote(&aid))
@@ -730,7 +843,7 @@ fn handle_room_rekey(hub $&HubState, req &HttpReq, rid string, now int) HttpResp
     }
     rd.epoch = target_ep
     rd.updated_at = now
-    save_room_data(&hub.st, &rd) or (err) {
+    save_room_data($&hub.st, &rd) >>> (err) {
         << err_resp(500, "ERR_INTERNAL", "failed saving room", 0, 0, 0)
     }
 
@@ -750,6 +863,7 @@ fn handle_room_rekey(hub $&HubState, req &HttpReq, rid string, now int) HttpResp
             if room_agent_usable_error(&hub.st, &tag).len > 0 { -> }
             if agent_blocks_sender(&hub.st, to_id + "", au.agent_id + "", now) { -> }
             tot_cnt += 1
+            upsert_room_keybox_entry(&hub.st, rid + "", to_id + "", au.agent_id + "", rd.epoch, now, &frame_s)
             res := deliver_dm_relay_raw(hub, &tag, au.agent_id + "", to_id + "", &frame_s, now)
             if res != "dropped_offline" { del_cnt += 1 }
         }
@@ -790,7 +904,7 @@ fn handle_room_transfer(hub $&HubState, req &HttpReq, rid string, now int) HttpR
     rd.members[nidx].role = "owner"
     rd.owner_id = new_owner + ""
     rd.updated_at = now
-    save_room_data(&hub.st, &rd) or (err) {
+    save_room_data($&hub.st, &rd) >>> (err) {
         << err_resp(500, "ERR_INTERNAL", "failed saving room", 0, 0, 0)
     }
     emit_room_event(hub, &rd, "owner_transferred", au.agent_id + "", "\"new_owner\":" + json.quote(&new_owner), "")
@@ -819,10 +933,11 @@ fn handle_room_leave(hub $&HubState, req &HttpReq, rid string, now int) HttpResp
     }
     rd.members = next_members
     rd.updated_at = now
-    save_room_data(&hub.st, &rd) or (err) {
+    save_room_data($&hub.st, &rd) >>> (err) {
         << err_resp(500, "ERR_INTERNAL", "failed saving room", 0, 0, 0)
     }
     remove_agent_room_index(&hub.st, au.agent_id + "", rid + "")
+    remove_room_keybox_entry(&hub.st, rid + "", au.agent_id + "")
     emit_room_event(hub, &rd, "member_left", au.agent_id + "", "", "")
     log_event_json(hub.log_ch, now, "room_leave", "\"room_id\":" + json.quote(&rid) + ",\"agent_id\":" + json.quote(&au.agent_id))
     << json_resp(200, "{\"ok\":true,\"room_id\":" + json.quote(&rid) + ",\"left\":true}")
@@ -838,12 +953,13 @@ fn handle_room_close(hub $&HubState, req &HttpReq, rid string, now int) HttpResp
     }
     rd.status = "closed"
     rd.updated_at = now
-    save_room_data(&hub.st, &rd) or (err) {
+    save_room_data($&hub.st, &rd) >>> (err) {
         << err_resp(500, "ERR_INTERNAL", "failed saving room", 0, 0, 0)
     }
     for i in 0:rd.members.len {
         remove_agent_room_index(&hub.st, rd.members[i].agent_id + "", rid + "")
     }
+    delete_room_keybox_file(&hub.st, rid + "")
     emit_room_event(hub, &rd, "room_closed", au.agent_id + "", "", "")
     log_event_json(hub.log_ch, now, "room_close", "\"room_id\":" + json.quote(&rid) + ",\"owner\":" + json.quote(&au.agent_id))
     << json_resp(200, "{\"ok\":true,\"room_id\":" + json.quote(&rid) + ",\"status\":\"closed\"}")
@@ -858,7 +974,7 @@ pub fn handle_room_send(hub $&HubState, req &HttpReq, room_id string, now int) H
     au := authenticate_scoped($&hub.st, req, now, "room")
     if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
 
-    rd := load_room_data(&hub.st, room_id + "")
+    rd := load_room_data_cached($&hub.st, room_id + "")
     if !rd.found { << err_resp(404, "ERR_NOT_FOUND", "room not found", 0, 0, 0) }
     if rd.status != "active" { << err_resp(403, "ERR_ROOM_CLOSED", "room is closed", 0, 0, 0) }
     if room_is_banned(&rd, au.agent_id + "") {
@@ -920,10 +1036,63 @@ pub fn handle_room_send(hub $&HubState, req &HttpReq, room_id string, now int) H
     << json_resp(202, "{\"ok\":true,\"room_id\":" + json.quote(&room_id) + ",\"streams\":" + strconv.itoa(delivered) + "}")
 }
 
+fn format_room_keybox_item(rd &RoomData, e &RoomKeyBoxEntry) string {
+    << "{\"room_id\":" + json.quote(&rd.room_id) +
+        ",\"name\":" + json.quote(&rd.name) +
+        ",\"room_epoch\":" + strconv.itoa(rd.epoch) +
+        ",\"epoch\":" + strconv.itoa(e.epoch) +
+        ",\"from\":" + json.quote(&e.from_id) +
+        ",\"updated_at\":" + strconv.itoa(e.updated_at) +
+        ",\"frame\":" + e.frame_json + "}"
+}
+
+fn handle_room_keyboxes_list(hub $&HubState, req &HttpReq, now int) HttpResp {
+    au := authenticate_scoped($&hub.st, req, now, "room")
+    if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
+    ids := load_agent_room_ids(&hub.st, au.agent_id + "")
+    $boxes := []string{}
+    for i in 0:ids.len {
+        rid := ids[i] + ""
+        rd := load_room_data(&hub.st, rid + "")
+        if !rd.found || rd.status != "active" { -> }
+        if !room_has_member(&rd, au.agent_id + "") { -> }
+        entries := load_room_keybox(&hub.st, rid + "")
+        for j in 0:entries.len {
+            if entries[j].agent_id == au.agent_id {
+                boxes.push(format_room_keybox_item(&rd, &entries[j]))
+                <-
+            }
+        }
+    }
+    << json_resp(200, "{\"ok\":true,\"boxes\":[" + strings.join(boxes, ",") + "]}")
+}
+
+fn handle_room_keybox_get(hub $&HubState, req &HttpReq, rid string, now int) HttpResp {
+    au := authenticate_scoped($&hub.st, req, now, "room")
+    if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
+    rd := load_room_data(&hub.st, rid + "")
+    if !rd.found { << err_resp(404, "ERR_NOT_FOUND", "room not found", 0, 0, 0) }
+    if rd.status != "active" { << err_resp(403, "ERR_ROOM_CLOSED", "room is closed", 0, 0, 0) }
+    if !room_has_member(&rd, au.agent_id + "") {
+        << err_resp(403, "ERR_FORBIDDEN", "not a room member", 0, 0, 0)
+    }
+    entries := load_room_keybox(&hub.st, rid + "")
+    for j in 0:entries.len {
+        if entries[j].agent_id == au.agent_id {
+            << json_resp(200, "{\"ok\":true,\"found\":true,\"box\":" + format_room_keybox_item(&rd, &entries[j]) + "}")
+        }
+    }
+    << json_resp(200, "{\"ok\":true,\"found\":false,\"room_id\":" + json.quote(&rid) + ",\"room_epoch\":" + strconv.itoa(rd.epoch) + "}")
+}
+
 pub fn handle_rooms_dispatch(hub $&HubState, req &HttpReq, path string, method string, now int) HttpResp {
     if path == "/v1/rooms" {
         if method == "POST" { << handle_room_create(hub, req, now) }
         if method == "GET" { << handle_room_list(hub, req, now) }
+        << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0)
+    }
+    if path == "/v1/rooms/key-boxes" {
+        if method == "GET" { << handle_room_keyboxes_list(hub, req, now) }
         << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0)
     }
     if !strings.has_prefix(&path, "/v1/rooms/") {
@@ -945,6 +1114,10 @@ pub fn handle_rooms_dispatch(hub $&HubState, req &HttpReq, path string, method s
     }
     if parts.len == 2 {
         sub := parts[1] + ""
+        if sub == "key-box" {
+            if method != "GET" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+            << handle_room_keybox_get(hub, req, rid + "", now)
+        }
         if sub == "send" {
             if method != "POST" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
             << handle_room_send(hub, req, rid + "", now)

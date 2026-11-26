@@ -199,7 +199,7 @@ fn is_rotated_log_filename(fname string) int {
 fn cleanup_old_logs(log_dir string, today string, retain_days int) {
     if log_dir.len == 0 || retain_days <= 0 { << }
     cutoff := shift_utc_date(today + "", 0 - retain_days)
-    raw := os.read_dir(log_dir + "") or (err) { << }
+    raw := os.read_dir(log_dir + "") >>> (err) { << }
     lines := strings.split(&raw, "\n")
     for i in 0:lines.len {
         fn_s := strings.trim_space(&lines[i])
@@ -207,18 +207,24 @@ fn cleanup_old_logs(log_dir string, today string, retain_days int) {
         if pref <= 0 { -> }
         dt_part := fn_s[pref:(pref + 10)]
         if is_valid_date(dt_part + "") && strings.compare(&dt_part, &cutoff) < 0 {
-            _ := os.remove(log_dir + "/" + fn_s) or (err) { -> }
+            _ := os.remove(log_dir + "/" + fn_s) >>> (err) { -> }
         }
     }
 }
 
-pub fn logger_loop(log_dir string, retain_days int, stdout_mirror bool, ch chan string) {
+pub const LOG_CTRL_FLUSH = "__FATEXT_LOG_FLUSH__"
+
+pub fn logger_loop(log_dir string, retain_days int, stdout_mirror bool, ch chan string, flush_done chan int) {
     if log_dir.len > 0 {
         mkdir_all_quiet(log_dir + "")
     }
     $last_date := ""
     while true {
         tagged := <-ch
+        if tagged == LOG_CTRL_FLUSH {
+            flush_done <- 1
+            ->
+        }
         tidx := strings.index_of(&tagged, "\t")
         if tidx <= 0 || tidx + 1 >= tagged.len { -> }
         stream := tagged[0:tidx]
@@ -289,7 +295,7 @@ pub fn effective_client_ip(peer_ip string, req &HttpReq, trust_proxy bool) strin
 
 pub fn normalize_route(raw_path string) string {
     path := path_only(raw_path + "")
-    if path == "/" || path == "/dl" || path == "/dl/" || path == "/help" || path == "/health" || path == "/llms.txt" || path == "/llms-full.txt" ||
+    if path == "/" || path == "/dl" || path == "/dl/" || path == "/help" || path == "/health" || path == "/ready" || path == "/internal/shutdown" || path == "/llms.txt" || path == "/llms-full.txt" ||
        path == "/SKILL.md" || path == "/protocol.md" || path == "/.well-known/fatext.json" ||
        path == "/static/fatext.css" || path == "/static/favicon.svg" || path == "/favicon.ico" ||
        path == "/static/logo.svg" || path == "/internal/mail/ingest" ||
@@ -306,6 +312,7 @@ pub fn normalize_route(raw_path string) string {
     if strings.has_prefix(&path, "/v1/blocks/") { << "/v1/blocks/{target}" }
     if strings.has_prefix(&path, "/v1/dm/") { << "/v1/dm/{id}" }
     if strings.has_prefix(&path, "/v1/mail/") { << "/v1/mail/{id}" }
+    if path == "/v1/rooms/key-boxes" { << path }
     if strings.has_prefix(&path, "/v1/rooms/") {
         rest := path[10:path.len]
         parts := strings.split(&rest, "/")
