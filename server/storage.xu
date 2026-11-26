@@ -257,6 +257,31 @@ pub fn write_atomic(path string, data &string) int {
     << 0
 }
 
+pub fn write_atomic_mode(path string, data &string, mode int) int {
+    tmp := path + ".tmp." + strconv.itoa(os.getpid()) + "." + strconv.itoa(time.now())
+    empty := ""
+    os.write(tmp + "", empty) or >>
+    os.chmod(tmp + "", mode) or (err) {
+        _ := os.remove(tmp + "") or (e2) { << 0 }
+        >> err
+    }
+    os.write(tmp + "", data + "") or (err) {
+        _ := os.remove(tmp + "") or (e2) { << 0 }
+        >> err
+    }
+    os.rename(tmp + "", path) or (err) {
+        _ := os.remove(tmp + "") or (e2) { << 0 }
+        >> err
+    }
+    << 0
+}
+
+pub fn ensure_dir_mode(path string, mode int) int {
+    os.mkdir_all(path + "") or >>
+    os.chmod(path + "", mode) or >>
+    << 0
+}
+
 pub fn read_file_or_empty(path string) string {
     << os.read(path) or (err) { << "" }
 }

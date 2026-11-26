@@ -399,11 +399,35 @@ fn handle_admin_stats(hub $&HubState, req &HttpReq, now int) HttpResp {
         ",\"room_raw\":" + strconv.itoa(hub.st.room_raw_cache.len()) +
         ",\"blocks_flat\":" + strconv.itoa(hub.st.agent_blocks_flat.len()) +
         ",\"replay_cache\":" + strconv.itoa(hub.st.replay_cache.len()) + "}"
+    csnap := cert_store_get(hub.cert_ch)
+    $tls_en_s := "false"
+    if csnap.enabled { tls_en_s = "true" }
+    $days_rem := 0
+    if csnap.not_after > 0 {
+        days_rem = (csnap.not_after - now) / 86400
+        if days_rem < 0 { days_rem = 0 }
+    }
+    $dom_items := []string{}
+    if csnap.domains_csv.len > 0 {
+        dparts := strings.split(&csnap.domains_csv, ",")
+        for di in 0:dparts.len {
+            dv := strings.trim_space(&dparts[di])
+            if dv.len > 0 { dom_items.push(json.quote(&dv)) }
+        }
+    }
+    tls_j := "{\"enabled\":" + tls_en_s +
+        ",\"mode\":" + json.quote(&csnap.mode) +
+        ",\"domains\":[" + strings.join(dom_items, ",") + "]" +
+        ",\"not_before\":" + strconv.itoa(csnap.not_before) +
+        ",\"not_after\":" + strconv.itoa(csnap.not_after) +
+        ",\"days_remaining\":" + strconv.itoa(days_rem) +
+        ",\"updated_at\":" + strconv.itoa(csnap.updated_at) + "}"
     body := "{\"ok\":true,\"runtime\":" + runtime_j +
         ",\"cumulative\":" + metrics_json_string(&tot, hub.clients.len, now) +
         ",\"window\":" + metrics_json_string(&hub.metrics, hub.clients.len, now) +
         ",\"entities\":" + entities_j +
         ",\"caches\":" + caches_j +
+        ",\"tls\":" + tls_j +
         ",\"per_channel_today\":" + hub.entity_cache.per_channel_today_json + "}"
     << json_resp(200, body)
 }
@@ -1129,8 +1153,33 @@ fn handle_admin_reload(hub $&HubState, req &HttpReq, now int) HttpResp {
     clear_all_state_caches($&hub.st)
     hub.entity_cache.ts = 0
     hub.pub_stats_ts = 0
+    $tls_reloaded_s := "false"
+    if hub.tls_cert_path.len > 0 && hub.tls_key_path.len > 0 {
+        c_pem := os.read(hub.tls_cert_path + "") or (err) {
+            << err_resp(400, "ERR_BAD_REQUEST", "failed reading FATEXT_TLS_CERT: " + err.msg(), 0, 0, 0)
+        }
+        k_pem := os.read(hub.tls_key_path + "") or (err) {
+            << err_resp(400, "ERR_BAD_REQUEST", "failed reading FATEXT_TLS_KEY: " + err.msg(), 0, 0, 0)
+        }
+        meta := parse_and_validate_cert_pair(&c_pem, &k_pem) or (err) {
+            << err_resp(400, "ERR_BAD_REQUEST", "invalid TLS cert/key: " + err.msg(), 0, 0, 0)
+        }
+        cert_store_set(hub.cert_ch, CertSnapshot{
+            enabled: true,
+            mode: "static",
+            cert_pem: c_pem,
+            key_pem: k_pem,
+            domains_csv: meta.domains_csv + "",
+            not_before: meta.not_before,
+            not_after: meta.not_after,
+            updated_at: now
+        })
+        log_event_json(hub.log_ch, now, "tls_cert_reloaded",
+            "\"mode\":\"static\",\"domains\":" + json.quote(&meta.domains_csv) + ",\"not_after\":" + strconv.itoa(meta.not_after))
+        tls_reloaded_s = "true"
+    }
     log_admin_action(hub, req, now, "reload_configs", "all_caches", "")
-    << json_resp(200, "{\"ok\":true,\"reloaded_at\":" + strconv.itoa(now) + "}")
+    << json_resp(200, "{\"ok\":true,\"reloaded_at\":" + strconv.itoa(now) + ",\"tls_reloaded\":" + tls_reloaded_s + "}")
 }
 
 fn handle_admin_events(hub &HubState, req &HttpReq, now int) HttpResp {

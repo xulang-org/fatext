@@ -101,19 +101,18 @@ pub fn const_time_str_eq(a &string, b &string) bool {
 struct ConnRuntimeCfg {
     tls_on bool
     tls_hs_ns int
-    cert_pem string
-    key_pem string
+    cert_ch chan CertStoreMsg
     slow_ms int
     trust_proxy bool
     shutdown_secret string
 }
 
 fn handle_connection_guarded(fd int, req_seq int, peer_ip string, rcfg ConnRuntimeCfg, gate_ch chan ConnGateMsg, static_ch chan StaticJob, jobs chan HubJob, log_ch chan string, sig_ch chan int) {
-    handle_connection(fd, req_seq, peer_ip + "", rcfg.tls_on, rcfg.tls_hs_ns, rcfg.cert_pem + "", rcfg.key_pem + "", static_ch, jobs, log_ch, rcfg.slow_ms, rcfg.trust_proxy, rcfg.shutdown_secret + "", sig_ch)
+    handle_connection(fd, req_seq, peer_ip + "", rcfg.tls_on, rcfg.tls_hs_ns, rcfg.cert_ch, static_ch, jobs, log_ch, rcfg.slow_ms, rcfg.trust_proxy, rcfg.shutdown_secret + "", sig_ch)
     release_conn_slot(gate_ch, peer_ip + "")
 }
 
-fn handle_connection(fd int, req_seq int, peer_ip string, tls_on bool, tls_hs_ns int, cert_pem string, key_pem string, static_ch chan StaticJob, jobs chan HubJob, log_ch chan string, slow_ms int, trust_proxy bool, shutdown_secret string, sig_ch chan int) {
+fn handle_connection(fd int, req_seq int, peer_ip string, tls_on bool, tls_hs_ns int, cert_ch chan CertStoreMsg, static_ch chan StaticJob, jobs chan HubJob, log_ch chan string, slow_ms int, trust_proxy bool, shutdown_secret string, sig_ch chan int) {
     cc_disable_sigpipe(fd)
     t0_ns := time.now()
     req_prefix := "r_" + strconv.itoa(req_seq)
@@ -121,8 +120,19 @@ fn handle_connection(fd int, req_seq int, peer_ip string, tls_on bool, tls_hs_ns
     $cc := cc_from_tcp(fd, peer_ip + "")
     $tls_ms := 0
     if tls_on {
+        csnap := cert_store_get(cert_ch)
+        if !csnap.enabled || csnap.cert_pem.len == 0 || csnap.key_pem.len == 0 {
+            jobs <- HubJob{kind: HUB_METRIC_TLS, req: empty_req(), sse_id: 0, enqueued_ns: 0, flag: 0, reply_ch: chan HubReply{cap: 1}}
+            now_err := time.now_time().unix()
+            no_msg := "no active TLS certificate"
+            log_event_json(log_ch, now_err, "tls_handshake_fail",
+                "\"req_id\":" + json.quote(&req_prefix) + ",\"ip\":" + json.quote(&peer_ip) +
+                ",\"tls_ms\":0,\"error\":" + json.quote(&no_msg))
+            close_raw_fd_quiet(fd)
+            <<
+        }
         t_tls0 := time.now()
-        cc = cc_from_tls(fd, &cert_pem, &key_pem, peer_ip + "", tls_hs_ns) or (err) {
+        cc = cc_from_tls(fd, &csnap.cert_pem, &csnap.key_pem, peer_ip + "", tls_hs_ns) or (err) {
             tls_ms = (time.now() - t_tls0) / 1000000
             if tls_ms < 0 { tls_ms = 0 }
             jobs <- HubJob{kind: HUB_METRIC_TLS, req: empty_req(), sse_id: 0, enqueued_ns: 0, flag: 0, reply_ch: chan HubReply{cap: 1}}
@@ -362,10 +372,15 @@ fn is_allowed_redirect_path(rpath &string) bool {
     << true
 }
 
-fn resolve_allowed_redirect_host(raw_host &string, https_host string) string {
+fn resolve_allowed_redirect_host(raw_host &string, https_host string, allowed_hosts &[]string) string {
     $h := strings.to_lower(&strings.trim_space(raw_host))
     if strings.has_suffix(&h, ":80") && h.len > 3 {
         h = h[0:(h.len - 3)]
+    }
+    for i in 0:allowed_hosts.len {
+        if h == allowed_hosts[i] {
+            << h
+        }
     }
     if h == https_host || h == "www." + https_host {
         << h
@@ -373,7 +388,7 @@ fn resolve_allowed_redirect_host(raw_host &string, https_host string) string {
     << https_host + ""
 }
 
-fn handle_redirect_conn(fd int, peer_ip string, https_host string) {
+fn handle_redirect_conn(fd int, peer_ip string, https_host string, allowed_hosts &[]string, chal_ch chan AcmeChalMsg) {
     cc_disable_sigpipe(fd)
     $cc := cc_from_tcp(fd, peer_ip + "")
     req := read_http_request_timeout($&cc, 3000000000) or (err) {
@@ -383,6 +398,41 @@ fn handle_redirect_conn(fd int, peer_ip string, https_host string) {
         <<
     }
     rpath := req.path()
+    p_only := path_only(rpath + "")
+    if strings.has_prefix(&p_only, "/.well-known/acme-challenge/") {
+        meth := req.method()
+        if meth != "GET" && meth != "HEAD" {
+            r405 := err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0)
+            _ := write_http_resp($&cc, &r405)
+            cc_close($&cc)
+            <<
+        }
+        tok := p_only[28:p_only.len]
+        if !is_valid_acme_token(&tok) {
+            r404 := http_resp(404, "text/plain; charset=utf-8", "", &"not found\n")
+            _ := write_http_resp($&cc, &r404)
+            cc_close($&cc)
+            <<
+        }
+        key_auth := acme_chal_get(chal_ch, tok + "")
+        if key_auth.len == 0 {
+            r404 := http_resp(404, "text/plain; charset=utf-8", "", &"challenge not found\n")
+            _ := write_http_resp($&cc, &r404)
+            cc_close($&cc)
+            <<
+        }
+        if meth == "HEAD" {
+            empty_b := ""
+            r200 := http_resp(200, "text/plain; charset=utf-8", "Cache-Control: no-store\r\n", &empty_b)
+            _ := write_http_resp($&cc, &r200)
+            cc_close($&cc)
+            <<
+        }
+        r200 := http_resp(200, "text/plain; charset=utf-8", "Cache-Control: no-store\r\n", &key_auth)
+        _ := write_http_resp($&cc, &r200)
+        cc_close($&cc)
+        <<
+    }
     if !is_allowed_redirect_path(&rpath) {
         r400 := err_resp(400, "ERR_BAD_REQUEST", "invalid redirect path", 0, 0, 0)
         _ := write_http_resp($&cc, &r400)
@@ -390,7 +440,7 @@ fn handle_redirect_conn(fd int, peer_ip string, https_host string) {
         <<
     }
     raw_h := req.header("Host")
-    host := resolve_allowed_redirect_host(&raw_h, https_host + "")
+    host := resolve_allowed_redirect_host(&raw_h, https_host + "", allowed_hosts)
     loc := "https://" + host + rpath
     body := "Redirecting to " + loc + "\n"
     r := http_resp(301, "text/plain; charset=utf-8", "Location: " + loc + "\r\n", &body)
@@ -398,16 +448,18 @@ fn handle_redirect_conn(fd int, peer_ip string, https_host string) {
     cc_close($&cc)
 }
 
-fn handle_redirect_conn_guarded(fd int, peer_ip string, https_host string, gate_ch chan ConnGateMsg) {
-    handle_redirect_conn(fd, peer_ip + "", https_host + "")
+fn handle_redirect_conn_guarded(fd int, peer_ip string, https_host string, allowed_hosts []string, chal_ch chan AcmeChalMsg, gate_ch chan ConnGateMsg) {
+    handle_redirect_conn(fd, peer_ip + "", https_host + "", &allowed_hosts, chal_ch)
     release_conn_slot(gate_ch, peer_ip + "")
 }
 
-fn redirect_loop(redir_addr string, https_host string, gate_ch chan ConnGateMsg, log_ch chan string) {
+fn redirect_loop(redir_addr string, https_host string, allowed_hosts []string, chal_ch chan AcmeChalMsg, gate_ch chan ConnGateMsg, log_ch chan string, ready_ch chan int) {
     lfd := net.listen(redir_addr + "") or (err) {
-        println("fatext-server: redirect listen failed: " + err.msg())
+        println("fatext-server: redirect/HTTP-01 listen failed: " + err.msg())
+        ready_ch <- 0
         <<
     }
+    ready_ch <- 1
     while true {
         fd := net.accept(lfd) or (err) {
             time.sleep(10000000)
@@ -420,7 +472,7 @@ fn redirect_loop(redir_addr string, https_host string, gate_ch chan ConnGateMsg,
             close_raw_fd_quiet(fd)
             ->
         }
-        xu handle_redirect_conn_guarded(fd, peer_ip + "", https_host + "", gate_ch)
+        xu handle_redirect_conn_guarded(fd, peer_ip + "", https_host + "", clone_str_slice(&allowed_hosts), chal_ch, gate_ch)
     }
 }
 
@@ -487,6 +539,17 @@ fn shutdown_watcher_loop(sig_ch chan int, accept_stop chan int, lfd int, drain_m
     core.exit_process(0)
 }
 
+fn flush_logs_before_exit(log_ch chan string, flush_done chan int) {
+    flush_sig := LOG_CTRL_FLUSH
+    log_ch <- flush_sig
+    ltick := time.new_ticker(1500000000)
+    select {
+        _ := <-flush_done {}
+        _ := <-ltick.c {}
+    }
+    ltick.stop()
+}
+
 fn main() int {
     ignore_sigpipe_quiet()
     addr := getenv_or("FATEXT_ADDR", "127.0.0.1:8080")
@@ -501,8 +564,21 @@ fn main() int {
     ip_rpm := getenv_int_or("FATEXT_IP_RPM", 600)
     tls_cert_path := os.getenv("FATEXT_TLS_CERT")
     tls_key_path := os.getenv("FATEXT_TLS_KEY")
-    redir_addr := os.getenv("FATEXT_HTTP_REDIRECT_ADDR")
-    public_host := strings.to_lower(&getenv_or("FATEXT_PUBLIC_HOST", "fatext.com"))
+    $redir_addr := os.getenv("FATEXT_HTTP_REDIRECT_ADDR")
+    raw_public_host := os.getenv("FATEXT_PUBLIC_HOST")
+    $public_host := strings.to_lower(&getenv_or("FATEXT_PUBLIC_HOST", "fatext.com"))
+
+    acme_domains_raw := strings.trim_space(&os.getenv("FATEXT_ACME_DOMAINS"))
+    acme_email := strings.trim_space(&os.getenv("FATEXT_ACME_EMAIL"))
+    acme_dir := getenv_or("FATEXT_ACME_DIR", data_dir + "/acme")
+    acme_staging := getenv_int_or("FATEXT_ACME_STAGING", 0) != 0
+    acme_dir_override := strings.trim_space(&os.getenv("FATEXT_ACME_DIRECTORY_URL"))
+    $acme_renew_days := getenv_int_or("FATEXT_ACME_RENEW_DAYS", 30)
+    if acme_renew_days < 1 { acme_renew_days = 1 }
+    if acme_renew_days > 89 { acme_renew_days = 89 }
+    $acme_check_sec := getenv_int_or("FATEXT_ACME_CHECK_SEC", 21600)
+    if acme_check_sec < 1 { acme_check_sec = 1 }
+    acme_insecure_tls := getenv_int_or("FATEXT_ACME_INSECURE_TLS", 0) != 0
 
     log_dir := getenv_or("FATEXT_LOG_DIR", data_dir + "/logs")
     retain_days := getenv_int_or("FATEXT_LOG_RETENTION_DAYS", 30)
@@ -518,20 +594,85 @@ fn main() int {
     tls_handshake_ms := getenv_int_or("FATEXT_TLS_HANDSHAKE_MS", 5000)
     tls_hs_ns := tls_handshake_ms * 1000000
 
+    has_static_tls := tls_cert_path.len > 0 || tls_key_path.len > 0
+    acme_on := acme_domains_raw.len > 0
+    if acme_on && has_static_tls {
+        println("fatext-server: FATEXT_ACME_DOMAINS cannot be combined with FATEXT_TLS_CERT/FATEXT_TLS_KEY")
+        << 1
+    }
+    if (tls_cert_path.len > 0 && tls_key_path.len == 0) || (tls_cert_path.len == 0 && tls_key_path.len > 0) {
+        println("fatext-server: FATEXT_TLS_CERT and FATEXT_TLS_KEY must both be set")
+        << 1
+    }
+
     $tls_on := false
-    $cert_pem := ""
-    $key_pem := ""
+    $tls_mode := "off"
+    $init_snap := empty_cert_snapshot()
+    $acme_domains := []string{}
+    $acme_dir_url := ACME_PROD_DIR
+    if acme_staging { acme_dir_url = ACME_STAGING_DIR }
+    if acme_dir_override.len > 0 { acme_dir_url = acme_dir_override + "" }
+    allow_loopback_http := acme_dir_override.len > 0
+
+    now_boot := time.now_time().unix()
     if tls_cert_path.len > 0 && tls_key_path.len > 0 {
-        cert_pem = os.read(tls_cert_path + "") or (err) {
+        cert_pem := os.read(tls_cert_path + "") or (err) {
             println("fatext-server: failed reading FATEXT_TLS_CERT: " + err.msg())
             << 1
         }
-        key_pem = os.read(tls_key_path + "") or (err) {
+        key_pem := os.read(tls_key_path + "") or (err) {
             println("fatext-server: failed reading FATEXT_TLS_KEY: " + err.msg())
             << 1
         }
+        cmeta := parse_and_validate_cert_pair(&cert_pem, &key_pem) or (err) {
+            println("fatext-server: invalid FATEXT_TLS_CERT/KEY: " + err.msg())
+            << 1
+        }
         tls_on = true
+        tls_mode = "static"
+        init_snap = CertSnapshot{
+            enabled: true,
+            mode: "static",
+            cert_pem: cert_pem,
+            key_pem: key_pem,
+            domains_csv: cmeta.domains_csv + "",
+            not_before: cmeta.not_before,
+            not_after: cmeta.not_after,
+            updated_at: now_boot
+        }
+    } else if acme_on {
+        acme_domains = parse_acme_domains(&acme_domains_raw) or (err) {
+            println("fatext-server: " + err.msg())
+            << 1
+        }
+        validate_acme_url(&acme_dir_url, allow_loopback_http) or (err) {
+            println("fatext-server: invalid ACME directory URL: " + err.msg())
+            << 1
+        }
+        if raw_public_host.len == 0 {
+            public_host = acme_domains[0] + ""
+        }
+        if redir_addr.len == 0 {
+            redir_addr = "0.0.0.0:80"
+        }
+        tls_on = true
+        tls_mode = "acme"
     }
+
+    $allowed_hosts := []string{}
+    allowed_hosts.push(public_host + "")
+    allowed_hosts.push("www." + public_host)
+    for di in 0:acme_domains.len {
+        d_s := acme_domains[di] + ""
+        if !str_list_contains(&allowed_hosts, d_s + "") {
+            allowed_hosts.push(d_s)
+        }
+    }
+
+    cert_ch := chan CertStoreMsg{cap: 64}
+    xu cert_store_loop(init_snap, cert_ch)
+    chal_ch := chan AcmeChalMsg{cap: 64}
+    xu acme_chal_loop(chal_ch)
 
     $st := new_state(addr + "", data_dir + "", www_dir + "", tpl_dir + "", dl_dir + "", pow_bits, mail_secret + "", ip_rpm)
     init_state($&st)
@@ -552,7 +693,7 @@ fn main() int {
     }
 
     now0 := time.now_time().unix()
-    hub := new_hub_state(st, log_ch, webhook_ch, log_dir + "", slow_ms, now0, max_sse, max_sse_per_agent, admin_secret + "", shutdown_secret.len > 0)
+    hub := new_hub_state(st, log_ch, webhook_ch, log_dir + "", slow_ms, now0, max_sse, max_sse_per_agent, admin_secret + "", shutdown_secret.len > 0, cert_ch, tls_cert_path + "", tls_key_path + "")
     jobs := chan HubJob{cap: 128}
     xu hub_loop(hub, jobs)
     xu maintenance_loop(data_dir + "", ch_names, log_ch, jobs)
@@ -568,11 +709,72 @@ fn main() int {
     }
 
     if tls_on && redir_addr.len > 0 {
-        xu redirect_loop(redir_addr + "", public_host + "", gate_ch, log_ch)
+        redir_ready := chan int{cap: 1}
+        xu redirect_loop(redir_addr + "", public_host + "", clone_str_slice(&allowed_hosts), chal_ch, gate_ch, log_ch, redir_ready)
+        rok := <-redir_ready
+        if acme_on && rok == 0 {
+            err_msg := "ACME HTTP-01 listener failed to bind " + redir_addr
+            log_event_json(log_ch, time.now_time().unix(), "acme_error", "\"error\":" + json.quote(&err_msg))
+            flush_logs_before_exit(log_ch, flush_done)
+            println("fatext-server: " + err_msg)
+            core.exit_process(1)
+            << 1
+        }
+    }
+
+    if acme_on {
+        acme_cfg := AcmeConfig{
+            domains: clone_str_slice(&acme_domains),
+            email: acme_email + "",
+            acme_dir: acme_dir + "",
+            directory_url: acme_dir_url + "",
+            renew_days: acme_renew_days,
+            check_sec: acme_check_sec,
+            insecure_tls: acme_insecure_tls,
+            allow_loopback_http: allow_loopback_http
+        }
+        $dom_json := []string{}
+        for di in 0:acme_domains.len {
+            ds := acme_domains[di] + ""
+            dom_json.push(json.quote(&ds))
+        }
+        log_event_json(log_ch, time.now_time().unix(), "acme_start",
+            "\"domains\":[" + strings.join(dom_json, ",") + "]" +
+            ",\"directory_url\":" + json.quote(&acme_dir_url) +
+            ",\"acme_dir\":" + json.quote(&acme_dir) +
+            ",\"renew_days\":" + strconv.itoa(acme_renew_days) +
+            ",\"check_sec\":" + strconv.itoa(acme_check_sec))
+        loaded := acme_try_load_cached(&acme_cfg, cert_ch, log_ch)
+        if !loaded {
+            $issued := false
+            $last_err := ""
+            $try_n := 0
+            while try_n < 3 && !issued {
+                try_n += 1
+                _ := acme_issue_and_install(&acme_cfg, chal_ch, cert_ch, log_ch) or (err) {
+                    last_err = err.msg()
+                    if try_n < 3 {
+                        time.sleep(1000000000)
+                    }
+                    ->
+                }
+                issued = true
+            }
+            if !issued {
+                log_event_json(log_ch, time.now_time().unix(), "acme_error",
+                    "\"error\":" + json.quote(&last_err) + ",\"stage\":\"startup\"")
+                flush_logs_before_exit(log_ch, flush_done)
+                println("fatext-server: initial ACME issuance failed: " + last_err)
+                core.exit_process(1)
+                << 1
+            }
+        }
+        xu acme_renew_loop(acme_cfg, chal_ch, cert_ch, log_ch)
     }
 
     lfd := net.listen(addr + "") or (err) {
         println("fatext-server: listen failed: " + err.msg())
+        core.exit_process(1)
         << 1
     }
     sig_ch := chan int{cap: 4}
@@ -591,13 +793,14 @@ fn main() int {
     if admin_secret.len > 0 { adm_s = "true" }
     log_event_json(log_ch, now0, "server_start",
         "\"addr\":" + json.quote(&addr) + ",\"tls\":" + tls_s +
+        ",\"tls_mode\":" + json.quote(&tls_mode) +
         ",\"admin_enabled\":" + adm_s +
         ",\"pow_bits\":" + strconv.itoa(pow_bits) + ",\"ip_rpm\":" + strconv.itoa(ip_rpm) +
         ",\"max_conns\":" + strconv.itoa(max_conns) + ",\"max_conns_per_ip\":" + strconv.itoa(max_conns_per_ip) +
         ",\"tls_handshake_ms\":" + strconv.itoa(tls_handshake_ms) +
         ",\"log_dir\":" + json.quote(&log_dir) + ",\"retain_days\":" + strconv.itoa(retain_days) +
         ",\"slow_ms\":" + strconv.itoa(slow_ms) + ",\"metrics_interval_sec\":" + strconv.itoa(metrics_interval_sec))
-    println("fatext-server listening on " + scheme + "://" + addr + " (data=" + data_dir + ", pow=" + str(pow_bits) + ", logs=" + log_dir + ")")
+    println("fatext-server listening on " + scheme + "://" + addr + " (tls=" + tls_mode + ", data=" + data_dir + ", pow=" + str(pow_bits) + ", logs=" + log_dir + ")")
 
     $req_seq := 0
     $accept_running := true
@@ -632,8 +835,7 @@ fn main() int {
         rcfg := ConnRuntimeCfg{
             tls_on: tls_on,
             tls_hs_ns: tls_hs_ns,
-            cert_pem: cert_pem + "",
-            key_pem: key_pem + "",
+            cert_ch: cert_ch,
             slow_ms: slow_ms,
             trust_proxy: trust_proxy,
             shutdown_secret: shutdown_secret + ""

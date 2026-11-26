@@ -60,11 +60,12 @@ jobs:
             codesign -fs - build/fatext-server
           fi
 
-      - name: Run Phase 1 & Admin/Stats integration tests
+      - name: Run Phase 1, Admin/Stats & ACME Auto-TLS integration tests
         shell: bash
         run: |
           python3 scripts/test_server_phase1.py
           python3 scripts/test_admin_and_stats.py
+          python3 scripts/test_acme.py
 
       - name: Run HTTP + Native TLS 1.3 stress smoke tests
         shell: bash

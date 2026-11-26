@@ -1,21 +1,29 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Bootstrap fatext-server on Linux with native built-in TLS (no Caddy required).
+# Bootstrap fatext-server on Linux with built-in ACME Auto-TLS (no Caddy or certbot required).
 # Usage (as root):
-#   sudo bash deploy/setup.sh [DOMAIN]
+#   sudo bash deploy/setup.sh [DOMAIN] [ACME_EMAIL]
 
 DOMAIN="${1:-fatext.com}"
+ACME_EMAIL="${2:-}"
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
+if [[ "$DOMAIN" != *.*.* && "$DOMAIN" != www.* ]]; then
+  ACME_DOMAINS="${DOMAIN},www.${DOMAIN}"
+else
+  ACME_DOMAINS="${DOMAIN}"
+fi
+
 if [[ $EUID -ne 0 ]]; then
-  echo "Run as root (e.g. sudo bash deploy/setup.sh $DOMAIN)" >&2
+  echo "Run as root (e.g. sudo bash deploy/setup.sh $DOMAIN $ACME_EMAIL)" >&2
   exit 1
 fi
 
 id -u fatext >/dev/null 2>&1 || useradd --system --home /var/lib/fatext --shell /usr/sbin/nologin fatext
 
 install -d -m 0755 /opt/fatext /opt/fatext/deploy /opt/fatext/scripts /etc/fatext /var/lib/fatext /var/lib/fatext/dl /var/lib/fatext/public
+install -d -m 0700 -o fatext -g fatext /var/lib/fatext/acme
 cp -r "$REPO_ROOT/www" /opt/fatext/
 cp -r "$REPO_ROOT/templates" /opt/fatext/
 cp -r "$REPO_ROOT/config" /opt/fatext/
@@ -38,8 +46,15 @@ if [[ ! -f /etc/fatext/fatext.env ]]; then
   cat >/etc/fatext/fatext.env <<EOF
 FATEXT_ADDR=0.0.0.0:443
 FATEXT_HTTP_REDIRECT_ADDR=0.0.0.0:80
-FATEXT_TLS_CERT=/etc/letsencrypt/live/${DOMAIN}/fullchain.pem
-FATEXT_TLS_KEY=/etc/letsencrypt/live/${DOMAIN}/privkey.pem
+FATEXT_PUBLIC_HOST=${DOMAIN}
+FATEXT_ACME_DOMAINS=${ACME_DOMAINS}
+FATEXT_ACME_EMAIL=${ACME_EMAIL}
+FATEXT_ACME_DIR=/var/lib/fatext/acme
+FATEXT_ACME_STAGING=0
+FATEXT_ACME_RENEW_DAYS=30
+# Static cert fallback (mutually exclusive with FATEXT_ACME_DOMAINS; hot-reloadable via POST /internal/admin/reload):
+# FATEXT_TLS_CERT=/etc/letsencrypt/live/${DOMAIN}/fullchain.pem
+# FATEXT_TLS_KEY=/etc/letsencrypt/live/${DOMAIN}/privkey.pem
 FATEXT_DATA_DIR=/var/lib/fatext
 FATEXT_WWW_DIR=/opt/fatext/www
 FATEXT_TEMPLATES_DIR=/opt/fatext/templates
@@ -78,11 +93,11 @@ install -m 0644 "$REPO_ROOT/deploy/fatext-log-report.timer" /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable fatext.service fatext-backup.timer fatext-log-report.timer
 
-echo "Setup complete."
+chmod 0700 /var/lib/fatext/acme
+
+echo "Setup complete (built-in ACME Auto-TLS enabled for ${ACME_DOMAINS})."
+echo "Ensure DNS A/AAAA records for ${ACME_DOMAINS} point to this host and ports 80/443 are open."
 echo "Next:"
-echo "  1. Issue TLS cert if not present (e.g. certbot certonly --standalone -d ${DOMAIN} -d www.${DOMAIN})"
-echo "     Add a certbot deploy-hook (e.g. /etc/letsencrypt/renewal-hooks/deploy/fatext.sh):"
-echo "       setfacl -m u:fatext:rx /etc/letsencrypt/live /etc/letsencrypt/archive && setfacl -R -m u:fatext:rX /etc/letsencrypt/live/${DOMAIN} /etc/letsencrypt/archive/${DOMAIN} && systemctl restart fatext"
-echo "  2. Run: python3 $REPO_ROOT/scripts/init_official.py --data-dir /var/lib/fatext --out-dir /etc/fatext"
+echo "  1. Run: python3 $REPO_ROOT/scripts/init_official.py --data-dir /var/lib/fatext --out-dir /etc/fatext"
+echo "  2. Start service (automatically issues & renews TLS cert with zero downtime): systemctl start fatext fatext-backup.timer fatext-log-report.timer && systemctl status fatext"
 echo "  3. Publish signed CLI binaries: bash /opt/fatext/deploy/sync_dl.sh latest /var/lib/fatext/dl https://${DOMAIN}/k/ftx_fatextoffice.pem"
-echo "  4. Start service: systemctl start fatext fatext-backup.timer fatext-log-report.timer && systemctl status fatext"

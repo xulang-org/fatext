@@ -1,0 +1,842 @@
+@main
+
+#errors
+#os
+#maps
+#strings
+#strconv
+#time
+#crypto/ecdsa
+#crypto/rsa
+#crypto/sha256
+#crypto/x509
+#encoding/base64
+#encoding/json
+#encoding/pem
+#net/http
+#net/url
+
+pub const ACME_PROD_DIR = "https://acme-v02.api.letsencrypt.org/directory"
+pub const ACME_STAGING_DIR = "https://acme-staging-v02.api.letsencrypt.org/directory"
+
+pub const ACME_CHAL_GET = 1
+pub const ACME_CHAL_SET = 2
+pub const ACME_CHAL_DEL = 3
+
+pub struct CertSnapshot {
+    pub enabled bool
+    pub mode string
+    pub cert_pem string
+    pub key_pem string
+    pub domains_csv string
+    pub not_before int
+    pub not_after int
+    pub updated_at int
+}
+
+pub struct CertStoreMsg {
+    pub is_set bool
+    pub snap CertSnapshot
+    pub reply_ch chan CertSnapshot
+}
+
+pub fn empty_cert_snapshot() CertSnapshot {
+    << CertSnapshot{
+        enabled: false,
+        mode: "off",
+        cert_pem: "",
+        key_pem: "",
+        domains_csv: "",
+        not_before: 0,
+        not_after: 0,
+        updated_at: 0
+    }
+}
+
+fn clone_cert_snapshot(s &CertSnapshot) CertSnapshot {
+    << CertSnapshot{
+        enabled: s.enabled,
+        mode: s.mode + "",
+        cert_pem: s.cert_pem + "",
+        key_pem: s.key_pem + "",
+        domains_csv: s.domains_csv + "",
+        not_before: s.not_before,
+        not_after: s.not_after,
+        updated_at: s.updated_at
+    }
+}
+
+pub fn cert_store_loop(init_snap CertSnapshot, ch chan CertStoreMsg) {
+    $cur := init_snap
+    while true {
+        msg := <-ch
+        if msg.is_set {
+            cur = clone_cert_snapshot(&msg.snap)
+            msg.reply_ch <- clone_cert_snapshot(&cur)
+        } else {
+            msg.reply_ch <- clone_cert_snapshot(&cur)
+        }
+    }
+}
+
+pub fn cert_store_get(ch chan CertStoreMsg) CertSnapshot {
+    rc := chan CertSnapshot{cap: 1}
+    ch <- CertStoreMsg{is_set: false, snap: empty_cert_snapshot(), reply_ch: rc}
+    << <-rc
+}
+
+pub fn cert_store_set(ch chan CertStoreMsg, snap CertSnapshot) {
+    rc := chan CertSnapshot{cap: 1}
+    ch <- CertStoreMsg{is_set: true, snap: snap, reply_ch: rc}
+    _ := <-rc
+}
+
+pub struct CertMeta {
+    pub not_before int
+    pub not_after int
+    pub dns_names []string
+    pub domains_csv string
+}
+
+pub fn parse_and_validate_cert_pair(cert_pem &string, key_pem &string) CertMeta {
+    $leaf_der := ""
+    $rem := cert_pem + ""
+    while rem.len > 0 {
+        blk := pem.decode(&rem)
+        if blk.typ.len == 0 && blk.bytes.len == 0 {
+            <-
+        }
+        if blk.typ == "CERTIFICATE" && blk.bytes.len > 0 {
+            leaf_der = blk.bytes + ""
+            <-
+        }
+        rem = blk.rest + ""
+    }
+    if leaf_der.len == 0 {
+        >> errors.new("tls: no CERTIFICATE PEM block found")
+    }
+    cert := x509.parse_certificate(leaf_der + "") or >>
+    priv := decode_rsa_private_pem(key_pem) or >>
+    want_spki := encode_rsa_spki_der(&priv.public) or >>
+    if cert.raw_subject_public_key_info != want_spki {
+        >> errors.new("tls: certificate public key does not match private key")
+    }
+
+    $dns_list := []string{}
+    $seen := maps.new_str_int()
+    for i in 0:cert.dns_names.len {
+        d := strings.to_lower(&strings.trim_space(&cert.dns_names[i]))
+        if d.len > 0 && !seen.has(d + "") {
+            map_set($&seen, d + "", 1)
+            dns_list.push(d)
+        }
+    }
+    if dns_list.len == 0 && cert.subject.common_name.len > 0 {
+        cn := strings.to_lower(&strings.trim_space(&cert.subject.common_name))
+        if cn.len > 0 {
+            dns_list.push(cn)
+        }
+    }
+    $for_csv := []string{}
+    for i in 0:dns_list.len {
+        for_csv.push(dns_list[i] + "")
+    }
+    csv := strings.join(for_csv, ",")
+    nb := cert.not_before.unix()
+    na := cert.not_after.unix()
+    << CertMeta{not_before: nb, not_after: na, dns_names: dns_list, domains_csv: csv}
+}
+
+pub fn cert_covers_domains(meta &CertMeta, want &[]string) bool {
+    for i in 0:want.len {
+        w := strings.to_lower(&want[i])
+        $found := false
+        for j in 0:meta.dns_names.len {
+            if meta.dns_names[j] == w {
+                found = true
+                <-
+            }
+        }
+        if !found { << false }
+    }
+    << true
+}
+
+pub fn snap_covers_domains(domains_csv &string, want &[]string) bool {
+    if want.len == 0 { << true }
+    if domains_csv.len == 0 { << false }
+    have := strings.split(domains_csv, ",")
+    for i in 0:want.len {
+        w := strings.to_lower(&want[i])
+        $found := false
+        for j in 0:have.len {
+            h := strings.to_lower(&strings.trim_space(&have[j]))
+            if h == w {
+                found = true
+                <-
+            }
+        }
+        if !found { << false }
+    }
+    << true
+}
+
+pub fn cert_needs_renewal(meta &CertMeta, want &[]string, now int, renew_days int) bool {
+    if !cert_covers_domains(meta, want) { << true }
+    << meta.not_after <= now + renew_days * 86400
+}
+
+pub struct AcmeChalMsg {
+    pub op int
+    pub token string
+    pub key_auth string
+    pub reply_ch chan string
+}
+
+pub fn is_valid_acme_token(tok &string) bool {
+    if tok.len == 0 || tok.len > 128 { << false }
+    for i in 0:tok.len {
+        c := tok[i] & 255
+        is_alnum := (c >= 48 && c <= 57) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122)
+        if !is_alnum && c != 45 && c != 95 { << false }
+    }
+    << true
+}
+
+pub fn acme_chal_loop(ch chan AcmeChalMsg) {
+    $tbl := maps.new_str_str()
+    while true {
+        msg := <-ch
+        if msg.op == ACME_CHAL_SET {
+            str_map_set($&tbl, msg.token + "", msg.key_auth + "")
+            msg.reply_ch <- "ok"
+        } else if msg.op == ACME_CHAL_DEL {
+            str_map_del($&tbl, msg.token + "")
+            msg.reply_ch <- "ok"
+        } else {
+            val := str_map_get_or(&tbl, msg.token + "", "")
+            msg.reply_ch <- val
+        }
+    }
+}
+
+pub fn acme_chal_set(ch chan AcmeChalMsg, token string, key_auth string) {
+    rc := chan string{cap: 1}
+    ch <- AcmeChalMsg{op: ACME_CHAL_SET, token: token + "", key_auth: key_auth + "", reply_ch: rc}
+    _ := <-rc
+}
+
+pub fn acme_chal_del(ch chan AcmeChalMsg, token string) {
+    rc := chan string{cap: 1}
+    ch <- AcmeChalMsg{op: ACME_CHAL_DEL, token: token + "", key_auth: "", reply_ch: rc}
+    _ := <-rc
+}
+
+pub fn acme_chal_get(ch chan AcmeChalMsg, token string) string {
+    rc := chan string{cap: 1}
+    ch <- AcmeChalMsg{op: ACME_CHAL_GET, token: token + "", key_auth: "", reply_ch: rc}
+    << <-rc
+}
+
+pub struct AcmeConfig {
+    pub domains []string
+    pub email string
+    pub acme_dir string
+    pub directory_url string
+    pub renew_days int
+    pub check_sec int
+    pub insecure_tls bool
+    pub allow_loopback_http bool
+}
+
+pub fn is_valid_acme_domain(d &string) bool {
+    if d.len < 3 || d.len > 253 { << false }
+    if strings.contains(d, "*") || strings.has_prefix(d, ".") || strings.has_suffix(d, ".") { << false }
+    if !strings.contains(d, ".") { << false }
+    labels := strings.split(d, ".")
+    if labels.len < 2 { << false }
+    for li in 0:labels.len {
+        lb := labels[li] + ""
+        if lb.len == 0 || lb.len > 63 { << false }
+        first := lb[0] & 255
+        last := lb[lb.len - 1] & 255
+        if first == 45 || last == 45 { << false }
+        for ci in 0:lb.len {
+            c := lb[ci] & 255
+            is_low := (c >= 97 && c <= 122)
+            is_dig := (c >= 48 && c <= 57)
+            if !is_low && !is_dig && c != 45 { << false }
+        }
+    }
+    tld := labels[labels.len - 1] + ""
+    $has_alpha := false
+    for ci in 0:tld.len {
+        c := tld[ci] & 255
+        if c >= 97 && c <= 122 { has_alpha = true }
+    }
+    << has_alpha
+}
+
+pub fn parse_acme_domains(raw &string) []string {
+    parts := strings.split(raw, ",")
+    $out := []string{}
+    $seen := maps.new_str_int()
+    for i in 0:parts.len {
+        d := strings.to_lower(&strings.trim_space(&parts[i]))
+        if d.len == 0 { -> }
+        if !is_valid_acme_domain(&d) {
+            >> errors.new("acme: invalid domain in FATEXT_ACME_DOMAINS: " + d)
+        }
+        if !seen.has(d + "") {
+            map_set($&seen, d + "", 1)
+            out.push(d)
+        }
+    }
+    if out.len == 0 || out.len > 10 {
+        >> errors.new("acme: FATEXT_ACME_DOMAINS must contain 1..10 domains")
+    }
+    << out
+}
+
+fn is_loopback_host(host &string) bool {
+    $h := strings.to_lower(&strings.trim_space(host))
+    if h == "127.0.0.1" || h == "localhost" || h == "[::1]" || h == "::1" {
+        << true
+    }
+    if strings.has_prefix(&h, "127.0.0.1:") || strings.has_prefix(&h, "localhost:") || strings.has_prefix(&h, "[::1]:") {
+        << true
+    }
+    << false
+}
+
+pub fn validate_acme_url(raw_url &string, allow_loopback_http bool) int {
+    $u := url.new_url()
+    u.parse(raw_url + "") or >>
+    sch := strings.to_lower(&u.scheme())
+    host := u.host()
+    if host.len == 0 {
+        >> errors.new("acme: URL missing host: " + *raw_url)
+    }
+    if sch == "https" {
+        << 0
+    }
+    if sch == "http" && allow_loopback_http && is_loopback_host(&host) {
+        << 0
+    }
+    >> errors.new("acme: disallowed URL scheme/host: " + *raw_url)
+}
+
+fn load_or_create_account_key(acme_dir string) string {
+    ensure_dir_mode(acme_dir + "", 448) or >>
+    kpath := acme_dir + "/account.key.pem"
+    raw := read_file_or_empty(kpath + "")
+    if raw.len > 0 {
+        priv := ecdsa.parse_private_pem(&raw) or >>
+        if priv.len != ecdsa.PRIVATE_KEY_SIZE_P256 {
+            >> errors.new("acme: account key must be ECDSA P-256")
+        }
+        << priv
+    }
+    priv := ecdsa.generate_key(ecdsa.P256) or >>
+    pem_s := ecdsa.marshal_pkcs8_pem(&priv) or >>
+    write_atomic_mode(kpath + "", &pem_s, 384) or >>
+    << priv
+}
+
+fn ec_p256_jwk_canon(acct_priv &string) string {
+    pub_pt := ecdsa.public(acct_priv) or >>
+    if pub_pt.len != ecdsa.PUBLIC_KEY_SIZE_P256 || (pub_pt[0] & 255) != 4 {
+        >> errors.new("acme: invalid P-256 public key")
+    }
+    x_raw := pub_pt[1:33]
+    y_raw := pub_pt[33:65]
+    x_b64 := base64.encode_raw_url(x_raw)
+    y_b64 := base64.encode_raw_url(y_raw)
+    << "{\"crv\":\"P-256\",\"kty\":\"EC\",\"x\":" + json.quote(&x_b64) + ",\"y\":" + json.quote(&y_b64) + "}"
+}
+
+fn jwk_thumbprint(jwk_canon &string) string {
+    dig := sha256.sum256_bytes(jwk_canon + "")
+    << base64.encode_raw_url(dig)
+}
+
+struct AcmeHttpResp {
+    status int
+    body string
+    nonce string
+    location string
+    retry_after int
+}
+
+fn parse_retry_after_sec(raw &string) int {
+    t := strings.trim_space(raw)
+    if t.len == 0 || t.len > 6 { << 0 }
+    $n := 0
+    for i in 0:t.len {
+        c := t[i] & 255
+        if c < 48 || c > 57 { << 0 }
+        n = n * 10 + (c - 48)
+    }
+    << n
+}
+
+fn acme_http_do(method string, target_url string, extra string, body &string, insecure_tls bool, allow_loopback_http bool) AcmeHttpResp {
+    validate_acme_url(&target_url, allow_loopback_http) or >>
+    $cl := http.new_client()
+    cl.set_timeout(30000000000)
+    cl.insecure_skip_verify = insecure_tls
+    $full_extra := extra + "User-Agent: fatext-server/3.0\r\nConnection: close\r\n"
+    resp := cl.do_extra(method, target_url, full_extra, body) or >>
+    ra_s := resp.header("Retry-After")
+    << AcmeHttpResp{
+        status: resp.status_code(),
+        body: resp.body(),
+        nonce: strings.trim_space(&resp.header("Replay-Nonce")),
+        location: strings.trim_space(&resp.header("Location")),
+        retry_after: parse_retry_after_sec(&ra_s)
+    }
+}
+
+fn acme_fetch_nonce(new_nonce_url string, insecure_tls bool, allow_loopback_http bool) string {
+    empty := ""
+    r := acme_http_do("HEAD", new_nonce_url + "", "", &empty, insecure_tls, allow_loopback_http) or >>
+    if r.nonce.len > 0 { << r.nonce }
+    r2 := acme_http_do("GET", new_nonce_url + "", "", &empty, insecure_tls, allow_loopback_http) or >>
+    if r2.nonce.len > 0 { << r2.nonce }
+    >> errors.new("acme: server did not return Replay-Nonce")
+}
+
+fn acme_build_jws(acct_priv &string, jwk_canon &string, kid string, nonce string, target_url string, payload_json &string) string {
+    $prot := "{\"alg\":\"ES256\","
+    if kid.len > 0 {
+        prot = prot + "\"kid\":" + json.quote(&kid)
+    } else {
+        prot = prot + "\"jwk\":" + jwk_canon
+    }
+    prot = prot + ",\"nonce\":" + json.quote(&nonce) + ",\"url\":" + json.quote(&target_url) + "}"
+    prot_b64 := base64.encode_raw_url(prot)
+    $pay_b64 := ""
+    if payload_json.len > 0 {
+        pay_b64 = base64.encode_raw_url(payload_json + "")
+    }
+    signing_input := prot_b64 + "." + pay_b64
+    dig := sha256.sum256_bytes(signing_input)
+    sig_raw := ecdsa.sign_raw_p256(acct_priv, &dig) or >>
+    sig_b64 := base64.encode_raw_url(sig_raw)
+    << "{\"protected\":" + json.quote(&prot_b64) +
+        ",\"payload\":" + json.quote(&pay_b64) +
+        ",\"signature\":" + json.quote(&sig_b64) + "}"
+}
+
+fn is_bad_nonce_resp(status int, body &string) bool {
+    if status != 400 { << false }
+    doc := json.parse(body)
+    if !doc.ok() || !doc.is_dict(doc.root()) { << false }
+    r := doc.root()
+    if !doc.has(r, "type") { << false }
+    tp := json_str_or(&doc, doc.get(r, "type"), "")
+    << strings.contains(&tp, "badNonce")
+}
+
+fn extract_acme_err_detail(body &string) string {
+    doc := json.parse(body)
+    if !doc.ok() || !doc.is_dict(doc.root()) { << *body + "" }
+    r := doc.root()
+    $tp := ""
+    $det := ""
+    if doc.has(r, "type") { tp = json_str_or(&doc, doc.get(r, "type"), "") }
+    if doc.has(r, "detail") { det = json_str_or(&doc, doc.get(r, "detail"), "") }
+    if tp.len > 0 && det.len > 0 { << tp + ": " + det }
+    if det.len > 0 { << det }
+    if tp.len > 0 { << tp }
+    << *body + ""
+}
+
+fn set_nonce_box(box $&[]string, val string) {
+    if box.len == 0 {
+        box.push(val)
+    } else {
+        box[0] = val
+    }
+}
+
+fn acme_jws_post(acct_priv &string, jwk_canon &string, kid string, new_nonce_url string, nonce_box $&[]string, target_url string, payload_json &string, extra_hdr string, insecure_tls bool, allow_loopback_http bool) AcmeHttpResp {
+    $attempt := 0
+    while attempt < 4 {
+        attempt += 1
+        $nonce := ""
+        if nonce_box.len > 0 {
+            nonce = nonce_box[0] + ""
+            nonce_box[0] = ""
+        }
+        if nonce.len == 0 {
+            nonce = acme_fetch_nonce(new_nonce_url + "", insecure_tls, allow_loopback_http) or >>
+        }
+        jws_body := acme_build_jws(acct_priv, jwk_canon, kid + "", nonce + "", target_url + "", payload_json) or >>
+        hdr := "Content-Type: application/jose+json\r\n" + extra_hdr
+        r := acme_http_do("POST", target_url + "", hdr, &jws_body, insecure_tls, allow_loopback_http) or >>
+        if r.nonce.len > 0 {
+            set_nonce_box(nonce_box, r.nonce + "")
+        }
+        if is_bad_nonce_resp(r.status, &r.body) && attempt < 4 {
+            ->
+        }
+        << r
+    }
+    >> errors.new("acme: exceeded badNonce retry limit")
+}
+
+fn cleanup_acme_tokens(chal_ch chan AcmeChalMsg, tokens &[]string) {
+    for i in 0:tokens.len {
+        acme_chal_del(chal_ch, tokens[i] + "")
+    }
+}
+
+fn clamp_poll_sleep(retry_after int) {
+    if retry_after > 0 {
+        $sec := retry_after
+        if sec > 5 { sec = 5 }
+        time.sleep(sec * 1000000000)
+    } else {
+        time.sleep(300000000)
+    }
+}
+
+fn domains_json_array(domains &[]string) string {
+    $parts := []string{}
+    for i in 0:domains.len {
+        d := domains[i] + ""
+        parts.push(json.quote(&d))
+    }
+    << "[" + strings.join(parts, ",") + "]"
+}
+
+pub fn acme_issue_and_install(cfg &AcmeConfig, chal_ch chan AcmeChalMsg, cert_ch chan CertStoreMsg, log_ch chan string) CertMeta {
+    acct_priv := load_or_create_account_key(cfg.acme_dir + "") or >>
+    jwk_canon := ec_p256_jwk_canon(&acct_priv) or >>
+    thumb := jwk_thumbprint(&jwk_canon)
+
+    empty := ""
+    dir_r := acme_http_do("GET", cfg.directory_url + "", "", &empty, cfg.insecure_tls, cfg.allow_loopback_http) or >>
+    if dir_r.status != 200 {
+        >> errors.new("acme: directory HTTP " + strconv.itoa(dir_r.status) + ": " + extract_acme_err_detail(&dir_r.body))
+    }
+    dir_doc := json.parse(&dir_r.body)
+    if !dir_doc.ok() || !dir_doc.is_dict(dir_doc.root()) {
+        >> errors.new("acme: invalid directory JSON")
+    }
+    dr := dir_doc.root()
+    if !dir_doc.has(dr, "newNonce") || !dir_doc.has(dr, "newAccount") || !dir_doc.has(dr, "newOrder") {
+        >> errors.new("acme: directory missing required endpoints")
+    }
+    new_nonce_url := json_str_or(&dir_doc, dir_doc.get(dr, "newNonce"), "")
+    new_acct_url := json_str_or(&dir_doc, dir_doc.get(dr, "newAccount"), "")
+    new_order_url := json_str_or(&dir_doc, dir_doc.get(dr, "newOrder"), "")
+    validate_acme_url(&new_nonce_url, cfg.allow_loopback_http) or >>
+    validate_acme_url(&new_acct_url, cfg.allow_loopback_http) or >>
+    validate_acme_url(&new_order_url, cfg.allow_loopback_http) or >>
+
+    n0 := acme_fetch_nonce(new_nonce_url + "", cfg.insecure_tls, cfg.allow_loopback_http) or >>
+    $nonce_box := [n0]
+
+    $acct_payload := "{\"termsOfServiceAgreed\":true"
+    if cfg.email.len > 0 {
+        mailto := "mailto:" + cfg.email
+        acct_payload = acct_payload + ",\"contact\":[" + json.quote(&mailto) + "]"
+    }
+    acct_payload = acct_payload + "}"
+    acct_r := acme_jws_post(&acct_priv, &jwk_canon, "", new_nonce_url + "", $&nonce_box, new_acct_url + "", &acct_payload, "", cfg.insecure_tls, cfg.allow_loopback_http) or >>
+    if acct_r.status != 200 && acct_r.status != 201 {
+        >> errors.new("acme: newAccount HTTP " + strconv.itoa(acct_r.status) + ": " + extract_acme_err_detail(&acct_r.body))
+    }
+    kid := acct_r.location + ""
+    if kid.len == 0 {
+        >> errors.new("acme: newAccount missing Location header")
+    }
+    validate_acme_url(&kid, cfg.allow_loopback_http) or >>
+
+    $id_parts := []string{}
+    for i in 0:cfg.domains.len {
+        dv := cfg.domains[i] + ""
+        id_parts.push("{\"type\":\"dns\",\"value\":" + json.quote(&dv) + "}")
+    }
+    order_payload := "{\"identifiers\":[" + strings.join(id_parts, ",") + "]}"
+    ord_r := acme_jws_post(&acct_priv, &jwk_canon, kid + "", new_nonce_url + "", $&nonce_box, new_order_url + "", &order_payload, "", cfg.insecure_tls, cfg.allow_loopback_http) or >>
+    if ord_r.status != 201 {
+        >> errors.new("acme: newOrder HTTP " + strconv.itoa(ord_r.status) + ": " + extract_acme_err_detail(&ord_r.body))
+    }
+    order_url := ord_r.location + ""
+    if order_url.len == 0 {
+        >> errors.new("acme: newOrder missing Location header")
+    }
+    validate_acme_url(&order_url, cfg.allow_loopback_http) or >>
+
+    odoc := json.parse(&ord_r.body)
+    if !odoc.ok() || !odoc.is_dict(odoc.root()) {
+        >> errors.new("acme: invalid newOrder JSON")
+    }
+    oroot := odoc.root()
+    if !odoc.has(oroot, "finalize") || !odoc.has(oroot, "authorizations") {
+        >> errors.new("acme: newOrder response missing finalize or authorizations")
+    }
+    finalize_url := json_str_or(&odoc, odoc.get(oroot, "finalize"), "")
+    validate_acme_url(&finalize_url, cfg.allow_loopback_http) or >>
+    authz_node := odoc.get(oroot, "authorizations")
+    if !odoc.is_list(authz_node) {
+        >> errors.new("acme: authorizations is not a list")
+    }
+    $authz_urls := []string{}
+    for i in 0:odoc.count(authz_node) {
+        au := json_str_or(&odoc, odoc.at(authz_node, i), "")
+        if au.len > 0 {
+            validate_acme_url(&au, cfg.allow_loopback_http) or >>
+            authz_urls.push(au)
+        }
+    }
+
+    $active_tokens := []string{}
+    for ai in 0:authz_urls.len {
+        aurl := authz_urls[ai] + ""
+        az_r := acme_jws_post(&acct_priv, &jwk_canon, kid + "", new_nonce_url + "", $&nonce_box, aurl + "", &empty, "", cfg.insecure_tls, cfg.allow_loopback_http) or (err) {
+            cleanup_acme_tokens(chal_ch, &active_tokens)
+            >> err
+        }
+        if az_r.status != 200 {
+            cleanup_acme_tokens(chal_ch, &active_tokens)
+            >> errors.new("acme: authz fetch HTTP " + strconv.itoa(az_r.status) + ": " + extract_acme_err_detail(&az_r.body))
+        }
+        az_doc := json.parse(&az_r.body)
+        if !az_doc.ok() || !az_doc.is_dict(az_doc.root()) || !az_doc.has(az_doc.root(), "status") {
+            cleanup_acme_tokens(chal_ch, &active_tokens)
+            >> errors.new("acme: malformed authz JSON")
+        }
+        az_st := json_str_or(&az_doc, az_doc.get(az_doc.root(), "status"), "")
+        if az_st == "valid" {
+            ->
+        }
+        if az_st != "pending" {
+            cleanup_acme_tokens(chal_ch, &active_tokens)
+            >> errors.new("acme: unexpected authz status: " + az_st)
+        }
+        if !az_doc.has(az_doc.root(), "challenges") || !az_doc.is_list(az_doc.get(az_doc.root(), "challenges")) {
+            cleanup_acme_tokens(chal_ch, &active_tokens)
+            >> errors.new("acme: authz missing challenges list")
+        }
+        chals := az_doc.get(az_doc.root(), "challenges")
+        $chal_url := ""
+        $chal_tok := ""
+        for ci in 0:az_doc.count(chals) {
+            ce := az_doc.at(chals, ci)
+            if !az_doc.is_dict(ce) || !az_doc.has(ce, "type") { -> }
+            ctp := json_str_or(&az_doc, az_doc.get(ce, "type"), "")
+            if ctp == "http-01" && az_doc.has(ce, "url") && az_doc.has(ce, "token") {
+                chal_url = json_str_or(&az_doc, az_doc.get(ce, "url"), "")
+                chal_tok = json_str_or(&az_doc, az_doc.get(ce, "token"), "")
+                <-
+            }
+        }
+        if chal_url.len == 0 || !is_valid_acme_token(&chal_tok) {
+            cleanup_acme_tokens(chal_ch, &active_tokens)
+            >> errors.new("acme: no valid http-01 challenge in authorization")
+        }
+        validate_acme_url(&chal_url, cfg.allow_loopback_http) or (err) {
+            cleanup_acme_tokens(chal_ch, &active_tokens)
+            >> err
+        }
+
+        key_auth := chal_tok + "." + thumb
+        acme_chal_set(chal_ch, chal_tok + "", key_auth)
+        active_tokens.push(chal_tok + "")
+
+        trig_body := "{}"
+        tr_r := acme_jws_post(&acct_priv, &jwk_canon, kid + "", new_nonce_url + "", $&nonce_box, chal_url + "", &trig_body, "", cfg.insecure_tls, cfg.allow_loopback_http) or (err) {
+            cleanup_acme_tokens(chal_ch, &active_tokens)
+            >> err
+        }
+        if tr_r.status < 200 || tr_r.status >= 300 {
+            cleanup_acme_tokens(chal_ch, &active_tokens)
+            >> errors.new("acme: challenge trigger HTTP " + strconv.itoa(tr_r.status) + ": " + extract_acme_err_detail(&tr_r.body))
+        }
+
+        $poll_ok := false
+        $p := 0
+        while p < 90 {
+            p += 1
+            clamp_poll_sleep(tr_r.retry_after)
+            pr := acme_jws_post(&acct_priv, &jwk_canon, kid + "", new_nonce_url + "", $&nonce_box, aurl + "", &empty, "", cfg.insecure_tls, cfg.allow_loopback_http) or (err) {
+                cleanup_acme_tokens(chal_ch, &active_tokens)
+                >> err
+            }
+            if pr.status != 200 {
+                cleanup_acme_tokens(chal_ch, &active_tokens)
+                >> errors.new("acme: authz poll HTTP " + strconv.itoa(pr.status))
+            }
+            pdoc := json.parse(&pr.body)
+            if !pdoc.ok() || !pdoc.is_dict(pdoc.root()) || !pdoc.has(pdoc.root(), "status") {
+                cleanup_acme_tokens(chal_ch, &active_tokens)
+                >> errors.new("acme: malformed authz poll JSON")
+            }
+            pst := json_str_or(&pdoc, pdoc.get(pdoc.root(), "status"), "")
+            if pst == "valid" {
+                poll_ok = true
+                <-
+            }
+            if pst == "invalid" || pst == "revoked" || pst == "expired" || pst == "deactivated" {
+                cleanup_acme_tokens(chal_ch, &active_tokens)
+                >> errors.new("acme: authorization failed (" + pst + "): " + pr.body)
+            }
+        }
+        if !poll_ok {
+            cleanup_acme_tokens(chal_ch, &active_tokens)
+            >> errors.new("acme: authorization validation timed out")
+        }
+    }
+    cleanup_acme_tokens(chal_ch, &active_tokens)
+
+    cert_priv := rsa.generate_key(2048) or >>
+    key_pem := encode_rsa_private_pem(&cert_priv) or >>
+    csr_der := build_rsa_csr_der(&cert_priv, &cfg.domains) or >>
+    csr_b64 := base64.encode_raw_url(csr_der + "")
+
+    fin_payload := "{\"csr\":" + json.quote(&csr_b64) + "}"
+    fin_r := acme_jws_post(&acct_priv, &jwk_canon, kid + "", new_nonce_url + "", $&nonce_box, finalize_url + "", &fin_payload, "", cfg.insecure_tls, cfg.allow_loopback_http) or >>
+    if fin_r.status < 200 || fin_r.status >= 300 {
+        >> errors.new("acme: finalize HTTP " + strconv.itoa(fin_r.status) + ": " + extract_acme_err_detail(&fin_r.body))
+    }
+
+    $ord_st := ""
+    $cert_url := ""
+    $fdoc := json.parse(&fin_r.body)
+    if fdoc.ok() && fdoc.is_dict(fdoc.root()) {
+        fr := fdoc.root()
+        if fdoc.has(fr, "status") { ord_st = json_str_or(&fdoc, fdoc.get(fr, "status"), "") }
+        if fdoc.has(fr, "certificate") { cert_url = json_str_or(&fdoc, fdoc.get(fr, "certificate"), "") }
+    }
+    $last_ra := fin_r.retry_after
+    $op := 0
+    while (ord_st != "valid" || cert_url.len == 0) && op < 60 {
+        if ord_st == "invalid" {
+            >> errors.new("acme: order status became invalid during finalization")
+        }
+        op += 1
+        clamp_poll_sleep(last_ra)
+        or_r := acme_jws_post(&acct_priv, &jwk_canon, kid + "", new_nonce_url + "", $&nonce_box, order_url + "", &empty, "", cfg.insecure_tls, cfg.allow_loopback_http) or >>
+        last_ra = or_r.retry_after
+        if or_r.status != 200 {
+            >> errors.new("acme: order poll HTTP " + strconv.itoa(or_r.status))
+        }
+        pdoc := json.parse(&or_r.body)
+        if pdoc.ok() && pdoc.is_dict(pdoc.root()) {
+            pr := pdoc.root()
+            if pdoc.has(pr, "status") { ord_st = json_str_or(&pdoc, pdoc.get(pr, "status"), "") }
+            if pdoc.has(pr, "certificate") { cert_url = json_str_or(&pdoc, pdoc.get(pr, "certificate"), "") }
+        }
+    }
+    if ord_st != "valid" || cert_url.len == 0 {
+        >> errors.new("acme: order finalization timed out without certificate URL")
+    }
+    validate_acme_url(&cert_url, cfg.allow_loopback_http) or >>
+
+    dl_r := acme_jws_post(&acct_priv, &jwk_canon, kid + "", new_nonce_url + "", $&nonce_box, cert_url + "", &empty, "Accept: application/pem-certificate-chain\r\n", cfg.insecure_tls, cfg.allow_loopback_http) or >>
+    if dl_r.status != 200 || dl_r.body.len == 0 {
+        >> errors.new("acme: certificate download HTTP " + strconv.itoa(dl_r.status))
+    }
+    cert_pem := dl_r.body + ""
+
+    meta := parse_and_validate_cert_pair(&cert_pem, &key_pem) or >>
+    if !cert_covers_domains(&meta, &cfg.domains) {
+        >> errors.new("acme: issued certificate does not cover all configured domains")
+    }
+    now := time.now_time().unix()
+    if meta.not_after <= now {
+        >> errors.new("acme: issued certificate is already expired")
+    }
+
+    ensure_dir_mode(cfg.acme_dir + "", 448) or >>
+    write_atomic_mode(cfg.acme_dir + "/privkey.pem", &key_pem, 384) or >>
+    write_atomic_mode(cfg.acme_dir + "/fullchain.pem", &cert_pem, 420) or >>
+
+    cert_store_set(cert_ch, CertSnapshot{
+        enabled: true,
+        mode: "acme",
+        cert_pem: cert_pem + "",
+        key_pem: key_pem + "",
+        domains_csv: meta.domains_csv + "",
+        not_before: meta.not_before,
+        not_after: meta.not_after,
+        updated_at: now
+    })
+
+    $days_rem := (meta.not_after - now) / 86400
+    if days_rem < 0 { days_rem = 0 }
+    log_event_json(log_ch, now, "acme_cert_issued",
+        "\"domains\":" + domains_json_array(&cfg.domains) +
+        ",\"not_after\":" + strconv.itoa(meta.not_after) +
+        ",\"days_remaining\":" + strconv.itoa(days_rem))
+    << meta
+}
+
+pub fn acme_try_load_cached(cfg &AcmeConfig, cert_ch chan CertStoreMsg, log_ch chan string) bool {
+    cert_path := cfg.acme_dir + "/fullchain.pem"
+    key_path := cfg.acme_dir + "/privkey.pem"
+    cert_pem := os.read(cert_path + "") or (err) { << false }
+    key_pem := os.read(key_path + "") or (err) { << false }
+    if cert_pem.len == 0 || key_pem.len == 0 { << false }
+    meta := parse_and_validate_cert_pair(&cert_pem, &key_pem) or (err) { << false }
+    now := time.now_time().unix()
+    if meta.not_after <= now { << false }
+    if !cert_covers_domains(&meta, &cfg.domains) { << false }
+
+    cert_store_set(cert_ch, CertSnapshot{
+        enabled: true,
+        mode: "acme",
+        cert_pem: cert_pem + "",
+        key_pem: key_pem + "",
+        domains_csv: meta.domains_csv + "",
+        not_before: meta.not_before,
+        not_after: meta.not_after,
+        updated_at: now
+    })
+    $days_rem := (meta.not_after - now) / 86400
+    if days_rem < 0 { days_rem = 0 }
+    log_event_json(log_ch, now, "acme_cert_loaded",
+        "\"domains\":" + domains_json_array(&cfg.domains) +
+        ",\"not_after\":" + strconv.itoa(meta.not_after) +
+        ",\"days_remaining\":" + strconv.itoa(days_rem))
+    << true
+}
+
+pub fn acme_renew_loop(cfg AcmeConfig, chal_ch chan AcmeChalMsg, cert_ch chan CertStoreMsg, log_ch chan string) {
+    $backoff_sec := 0
+    while true {
+        $wait_sec := cfg.check_sec
+        if wait_sec < 1 { wait_sec = 1 }
+        if backoff_sec > 0 && backoff_sec < wait_sec {
+            wait_sec = backoff_sec
+        }
+        time.sleep(wait_sec * 1000000000)
+
+        snap := cert_store_get(cert_ch)
+        now := time.now_time().unix()
+        need := (!snap.enabled) || (snap.cert_pem.len == 0) || (snap.not_after <= now + cfg.renew_days * 86400) || (!snap_covers_domains(&snap.domains_csv, &cfg.domains))
+        if need {
+            _ := acme_issue_and_install(&cfg, chal_ch, cert_ch, log_ch) or (err) {
+                if backoff_sec == 0 {
+                    if cfg.check_sec <= 5 {
+                        backoff_sec = 1
+                    } else {
+                        backoff_sec = 5
+                    }
+                } else {
+                    backoff_sec = backoff_sec * 2
+                    if backoff_sec > 3600 { backoff_sec = 3600 }
+                }
+                emsg := err.msg()
+                log_event_json(log_ch, time.now_time().unix(), "acme_error",
+                    "\"error\":" + json.quote(&emsg) + ",\"backoff_sec\":" + strconv.itoa(backoff_sec))
+                ->
+            }
+            backoff_sec = 0
+        }
+    }
+}
