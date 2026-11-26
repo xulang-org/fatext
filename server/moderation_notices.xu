@@ -189,8 +189,11 @@ fn write_moderation_notice(hub $&HubState, aid string, body &string, now int) bo
     ensure_dir_mode(dir + "", 448) or (err) { << false }
     path := dir + "/" + aid + ".jsonl"
     previous := read_notice_history(path + "") or (err) { << false }
+    prev_lines := strings.split(&previous, "\n")
+    for i in 0:prev_lines.len {
+        if prev_lines[i] == *body { << true }
+    }
     line := *body + "\n"
-    if strings.contains(&previous, line + "") { << true }
     content := previous + line
     write_atomic_mode(path, &content, 384) or (err) { << false }
     _ := hub_push_to_agent(hub, aid, "moderation_notice", body)

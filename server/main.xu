@@ -342,7 +342,7 @@ fn handle_connection(fd int, req_seq int, peer_ip string, rcfg ConnRuntimeCfg, s
                 select {
                     _ := <-rep.sse_stop {
                         disc := "event: system\ndata: {\"kind\":\"disconnected\"}\n\n"
-                        _ := cc_write($&cc, &disc)
+                        _ := cc_write_timeout($&cc, &disc, SSE_WRITE_TIMEOUT_NS)
                         close_reason = "ctrl_close"
                         alive = false
                     }
@@ -356,13 +356,13 @@ fn handle_connection(fd int, req_seq int, peer_ip string, rcfg ConnRuntimeCfg, s
                             alive = false
                         } else if msg == SSE_CTRL_SHUTDOWN {
                             sd := "event: system\ndata: {\"kind\":\"shutdown\"}\n\n"
-                            _ := cc_write($&cc, &sd)
+                            _ := cc_write_timeout($&cc, &sd, SSE_WRITE_TIMEOUT_NS)
                             close_reason = "shutdown"
                             alive = false
                         } else if cc_peer_closed(&cc) {
                             close_reason = "peer_closed"
                             alive = false
-                        } else if cc_write($&cc, &msg) < 0 {
+                        } else if cc_write_timeout($&cc, &msg, SSE_WRITE_TIMEOUT_NS) < 0 {
                             close_reason = "write_error"
                             alive = false
                         } else {
@@ -378,7 +378,7 @@ fn handle_connection(fd int, req_seq int, peer_ip string, rcfg ConnRuntimeCfg, s
                             if ping_ticks >= 100 {
                                 ping_ticks = 0
                                 ping := ": ping\n\n"
-                                if cc_write($&cc, &ping) < 0 {
+                                if cc_write_timeout($&cc, &ping, SSE_WRITE_TIMEOUT_NS) < 0 {
                                     close_reason = "write_error"
                                     alive = false
                                 } else {
@@ -927,6 +927,12 @@ fn main() int {
         << 1
     }
     st.moderation_retention_days = moderation_retention_days
+    daily_friend_reqs := getenv_int_or("FATEXT_DAILY_FRIEND_REQUESTS", 20)
+    if daily_friend_reqs < 1 || daily_friend_reqs > 200 {
+        println("fatext-server: FATEXT_DAILY_FRIEND_REQUESTS must be 1..200")
+        << 1
+    }
+    st.daily_friend_req_limit = daily_friend_reqs
     init_public_moderation($&st, getenv_or("FATEXT_PUBLIC_POSTING", "open"))
 
     $ch_names := []string{}
@@ -966,9 +972,14 @@ fn main() int {
         println("fatext-server: invalid moderation API key")
         << 1
     }
-    moderation_pool := ModerationPool{jobs: chan ModerationJob{cap: 4}, slots: chan int{cap: 4}}
+    mod_workers := getenv_int_or("FATEXT_AI_MODERATION_WORKERS", 12)
+    if mod_workers < 1 || mod_workers > 64 {
+        println("fatext-server: FATEXT_AI_MODERATION_WORKERS must be 1..64")
+        << 1
+    }
+    moderation_pool := ModerationPool{jobs: chan ModerationJob{cap: mod_workers}, slots: chan int{cap: mod_workers}}
     if ai_moderation {
-        for worker in 0:4 {
+        for worker in 0:mod_workers {
             xu moderation_worker(moderation_pool.jobs, ai_endpoint + "", ai_key + "", ai_model + "")
         }
     }

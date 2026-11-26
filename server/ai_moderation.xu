@@ -89,8 +89,9 @@ pub fn is_public_write(req &HttpReq) bool {
 
 fn review_key(req &HttpReq) string {
     actor := strings.trim_space(&req.header("X-Agent-Id"))
+    path := path_only(req.path())
     digest := sha256.sum256(req.body())
-    << sha256.sum256(actor + "\n" + req.method() + "\n" + req.path() + "\n" + digest)
+    << sha256.sum256(actor + "\n" + req.method() + "\n" + path + "\n" + digest)
 }
 
 fn approvals_dir(st &State) string {
@@ -185,22 +186,45 @@ pub fn handle_own_review(st $&State, req &HttpReq, now int) HttpResp {
     << http_resp(200, "application/json; charset=utf-8", PUBLIC_CONTENT_CACHE, &out)
 }
 
+fn lookup_review_in_date(st &State, date string, key &string, now int) HttpResp {
+    index_path := moderation_dir(st) + "/review-index/" + date + "/" + *key
+    existing := read_file_or_empty(index_path)
+    if !is_receipt_id(&existing) {
+        << HttpResp{status: 0, ctype: "", extra: "", body: ""}
+    }
+    state := read_case_decision(st, date + "", existing + "")
+    if state.status == "rejected" || state.status == "approval_used" {
+        << existing_review_response(date + "", existing, state.status + "")
+    }
+    if state.status == "approved" {
+        if state.expires_at <= now {
+            << existing_review_response(date + "", existing, "expired")
+        }
+        << HttpResp{status: 0, ctype: "", extra: "", body: ""}
+    }
+    << review_pending(date + "", existing)
+}
+
+pub fn lookup_existing_review(st &State, req &HttpReq, now int) HttpResp {
+    key := review_key(req)
+    today := utc_date_from_unix(now)
+    r_today := lookup_review_in_date(st, today + "", &key, now)
+    if r_today.status != 0 { << r_today }
+    yesterday := shift_utc_date(today, -1)
+    << lookup_review_in_date(st, yesterday, &key, now)
+}
+
 pub fn queue_ai_review(st $&State, req &HttpReq, now int) HttpResp {
+    existing_resp := lookup_existing_review(st, req, now)
+    if existing_resp.status != 0 {
+        << existing_resp
+    }
     key := review_key(req)
     date := utc_date_from_unix(now)
     index_path := moderation_dir(st) + "/review-index/" + date + "/" + key
-    existing := read_file_or_empty(index_path + "")
-    if is_receipt_id(&existing) {
-        state := read_case_decision(st, date + "", existing + "")
-        if state.status == "rejected" || state.status == "approval_used" {
-            << existing_review_response(date + "", existing, state.status + "")
-        }
-        if state.status == "approved" && state.expires_at <= now {
-            << existing_review_response(date + "", existing, "expired")
-        }
-        << review_pending(date + "", existing)
-    }
-    if !report_rate_allowed(st, req.remote_ip + "", now, true) {
+    $rate_actor := strings.trim_space(&req.header("X-Agent-Id"))
+    if rate_actor.len == 0 { rate_actor = req.remote_ip + "" }
+    if !report_rate_allowed(st, rate_actor + "", now, true) {
         << err_resp(429, "ERR_RATE_LIMITED", "content review queue limit reached", 600, 0, 0)
     }
     doc := json.parse(&req.req_body)

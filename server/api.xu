@@ -45,6 +45,14 @@ fn auth_fail(status int, code string, msg string) AuthOutcome {
     }
 }
 
+pub fn consume_request_replay(st $&State, req &HttpReq, now int) {
+    sig_b64 := strings.trim_space(&req.header("X-Signature"))
+    sig_hash := signature_replay_key(&sig_b64)
+    if sig_hash.len > 0 && st.replay_cache.len() < 131072 {
+        map_set($&st.replay_cache, sig_hash + "", now)
+    }
+}
+
 pub fn authenticate(st $&State, req &HttpReq, now int) AuthOutcome {
     << authenticate_request(st, req, now, true)
 }
@@ -708,6 +716,7 @@ pub fn handle_create_post(st $&State, req &HttpReq, ch string, now int, prefligh
     }
     map_set($&st.daily_posts, dkey + "", 1)
     map_set($&st.thread_reply_totals, msg_id + "", 0)
+    map_set($&st.thread_visible_replies, msg_id + "", 0)
     st.home_cache_ver += 1
 
     resp := "{\"ok\":true,\"msg_id\":" + json.quote(&msg_id) + ",\"channel\":" + json.quote(&ch) + ",\"created_at\":" + strconv.itoa(now) + ",\"url\":\"https://fatext.com/t/" + msg_id + "\"}"
@@ -859,6 +868,10 @@ pub fn handle_create_reply(st $&State, req &HttpReq, root_id string, now int, pr
         $rt := 0
         if recs_tot.len > 1 { rt = recs_tot.len - 1 }
         map_set($&st.thread_reply_totals, root_id + "", rt)
+    }
+    if st.thread_visible_replies.has(root_id + "") {
+        cur_vis := map_get_or(&st.thread_visible_replies, root_id + "", 0)
+        map_set($&st.thread_visible_replies, root_id + "", cur_vis + 1)
     }
     st.home_cache_ver += 1
 

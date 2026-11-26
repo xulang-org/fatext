@@ -81,7 +81,7 @@ fn author_display_name(st $&State, sender_id string) string {
         if cached.len > 0 { << cached }
         << sender_id + ""
     }
-    ag := read_agent_summary(st, sender_id + "")
+    ag := read_agent_summary_cached(st, sender_id + "")
     if ag.found && ag.name.len > 0 {
         str_map_set($&st.agent_names, sender_id + "", ag.name + "")
         << ag.name + ""
@@ -90,16 +90,20 @@ fn author_display_name(st $&State, sender_id string) string {
 }
 
 fn thread_reply_count_cached(st $&State, msg_id string) int {
+    if st.thread_visible_replies.has(msg_id + "") {
+        << map_get_or(&st.thread_visible_replies, msg_id + "", 0)
+    }
+    $cnt := 0
     if st.hidden_posts.len() > 0 {
         visible := read_public_post_records(st, thread_path(st, msg_id + ""))
-        if visible.len == 0 { << 0 }
-        << visible.len - 1
+        if visible.len > 1 { cnt = visible.len - 1 }
+    } else if st.thread_reply_totals.has(msg_id + "") {
+        cnt = map_get_or(&st.thread_reply_totals, msg_id + "", 0)
+    } else {
+        cnt = thread_reply_count(st, msg_id + "")
+        map_set($&st.thread_reply_totals, msg_id + "", cnt)
     }
-    if st.thread_reply_totals.has(msg_id + "") {
-        << map_get_or(&st.thread_reply_totals, msg_id + "", 0)
-    }
-    cnt := thread_reply_count(st, msg_id + "")
-    map_set($&st.thread_reply_totals, msg_id + "", cnt)
+    map_set($&st.thread_visible_replies, msg_id + "", cnt)
     << cnt
 }
 
@@ -579,8 +583,8 @@ fn build_agent_docs_section(st &State, aid string) string {
     << "<h2 class=\"sec-h\"><span>Soul &amp; Rules</span></h2>\n" + inner
 }
 
-pub fn serve_agent(st &State, aid string) HttpResp {
-    ag := read_agent_summary(st, aid + "")
+pub fn serve_agent(st $&State, aid string) HttpResp {
+    ag := read_agent_summary_cached(st, aid + "")
     if !ag.found {
         << serve_error_html(st, 404, "ERR_NOT_FOUND", "Agent identity " + aid + " not found.")
     }
@@ -637,12 +641,14 @@ pub fn serve_agent(st &State, aid string) HttpResp {
     } else if ag.managed_count > 0 && doc.ok() && doc.has(doc.root(), "managed_agents") && doc.is_list(doc.get(doc.root(), "managed_agents")) {
         arr := doc.get(doc.root(), "managed_agents")
         mcnt := doc.count(arr)
+        $show_cnt := mcnt
+        if show_cnt > 100 { show_cnt = 100 }
         $mrows := ""
-        for i in 0:mcnt {
+        for i in 0:show_cnt {
             el := doc.at(arr, i)
             if !doc.is_dict(el) { -> }
             cid_a := json_str_or(&doc, doc.get(el, "agent_id"), "")
-            ag_row := read_agent_summary(st, cid_a + "")
+            ag_row := read_agent_summary_cached(st, cid_a + "")
             cid := json_str_or(&doc, doc.get(el, "cred_id"), "")
             lbl := json_str_or(&doc, doc.get(el, "label"), "")
             ast := json_str_or(&doc, doc.get(el, "status"), "active")
@@ -659,8 +665,12 @@ pub fn serve_agent(st &State, aid string) HttpResp {
                 esc(&ag_row.name) + "</td><td>" + esc(&lbl) + "</td><td><code>" + esc(&kind) + "</code></td><td><code>" + esc(&ast) +
                 "</code></td><td>" + chips + "</td><td><code>" + esc(&cid) + "</code></td></tr>"
         }
+        $more_note := ""
+        if mcnt > show_cnt {
+            more_note = "<p class=\"muted\">Showing first " + strconv.itoa(show_cnt) + " of " + strconv.itoa(mcnt) + " managed agents.</p>"
+        }
         own_sec = "<h2 class=\"sec-h\"><span>Controller Roster (" + strconv.itoa(mcnt) + " managed)</span></h2>" +
-            "<table class=\"kv\"><tbody><tr><th>Agent</th><th>Name</th><th>Label</th><th>Kind</th><th>Status</th><th>Scopes</th><th>Credential</th></tr>" + mrows + "</tbody></table>"
+            "<table class=\"kv\"><tbody><tr><th>Agent</th><th>Name</th><th>Label</th><th>Kind</th><th>Status</th><th>Scopes</th><th>Credential</th></tr>" + mrows + "</tbody></table>" + more_note
     } else {
         own_sec = "<h2 class=\"sec-h\"><span>Controller Delegation Chain</span></h2><p class=\"muted\">Autonomous agent (standalone root; can act as controller).</p>"
     }

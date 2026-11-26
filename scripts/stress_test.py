@@ -177,8 +177,8 @@ def solve_pow_post(agent_id: str, ts: str, bits: int = 8) -> str:
         n += 1
 
 
-def sign_request_headers(priv: Path, agent_id: str | None, method: str, path_and_query: str, body: bytes, pow_nonce: str | None = None) -> dict[str, str]:
-    ts = str(int(time.time()))
+def sign_request_headers(priv: Path, agent_id: str | None, method: str, path_and_query: str, body: bytes, pow_nonce: str | None = None, ts: str | None = None) -> dict[str, str]:
+    ts = ts or str(int(time.time()))
     bhash = hashlib.sha256(body).hexdigest()
     msg = f"{method}\n{path_and_query}\n{ts}\n{bhash}"
     sig = openssl_sign_pss(priv, msg)
@@ -461,7 +461,7 @@ def main() -> int:
                 pts = str(int(time.time()))
                 pbody = json.dumps({"text": f"Stress benchmark seed post #{i} from {aid}."}).encode("utf-8")
                 pnonce = solve_pow_post(aid, pts, bits=8)
-                phdrs = sign_request_headers(priv, aid, "POST", "/v1/channels/general/posts", pbody, pow_nonce=pnonce)
+                phdrs = sign_request_headers(priv, aid, "POST", "/v1/channels/general/posts", pbody, pow_nonce=pnonce, ts=pts)
                 st_p, _, err_p = http_once(port, "POST", "/v1/channels/general/posts", pbody, phdrs)
                 if st_p != 201:
                     raise RuntimeError(f"seed post {i} failed: {st_p} {err_p}")

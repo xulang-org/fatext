@@ -897,6 +897,106 @@ def main() -> int:
                 srv6b.terminate()
                 srv6b.wait(timeout=5)
 
+        print("[6c/7] Testing persistent daily friend request limit & UTF-8 note hardening...")
+        bad_fr_env = os.environ.copy()
+        bad_fr_env.update({
+            "FATEXT_ADDR": f"{HOST}:{free_tcp_port()}",
+            "FATEXT_DATA_DIR": str(td_p / "bad_fr_data"),
+            "FATEXT_WWW_DIR": str(WWW_DIR),
+            "FATEXT_TEMPLATES_DIR": str(TPL_DIR),
+            "FATEXT_DAILY_FRIEND_REQUESTS": "201",
+        })
+        r_bad_fr = subprocess.run([str(SERVER_BIN)], env=bad_fr_env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5.0)
+        assert_true(r_bad_fr.returncode != 0, f"invalid FATEXT_DAILY_FRIEND_REQUESTS must exit non-zero, got rc={r_bad_fr.returncode}")
+
+        p6c_port = free_tcp_port()
+        p6c_url = f"http://{HOST}:{p6c_port}"
+        p6c_data = td_p / "p6c_data"
+        p6c_data.mkdir(parents=True, exist_ok=True)
+        sd_sec_c = "sd-sec-r4-8812"
+        p6c_env = os.environ.copy()
+        p6c_env.update({
+            "FATEXT_ADDR": f"{HOST}:{p6c_port}",
+            "FATEXT_DATA_DIR": str(p6c_data),
+            "FATEXT_WWW_DIR": str(WWW_DIR),
+            "FATEXT_TEMPLATES_DIR": str(TPL_DIR),
+            "FATEXT_POW_BITS": "8",
+            "FATEXT_DAILY_FRIEND_REQUESTS": "3",
+            "FATEXT_SHUTDOWN_SECRET": sd_sec_c,
+        })
+        srv6c = subprocess.Popen([str(SERVER_BIN)], env=p6c_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            wait_http_ok(f"{p6c_url}/health")
+            homes_fr = {}
+            ids_fr = {}
+            for tag in ("a", "b", "c", "d"):
+                hp = td_p / f"fr_{tag}"
+                rc, out, err = run_cli(["--json", "init", "--name", f"Fr{tag.upper()}"], home=str(hp), api_url=p6c_url)
+                assert_eq(rc, 0, f"init Fr{tag} failed: {err}")
+                homes_fr[tag] = hp
+                ids_fr[tag] = json.loads(out.strip())["agent_id"]
+
+            # >256 UTF-8 chars or control chars in note rejected without consuming daily quota
+            for bad_note in ("你" * 257, "hello\x07world"):
+                st_bn, bn_j = signed_http(
+                    HOST, p6c_port, ids_fr["a"], homes_fr["a"] / "private.pem",
+                    "POST", "/v1/friends/request", json.dumps({"agent_id": ids_fr["b"], "note": bad_note}).encode("utf-8"),
+                )
+                assert_eq(st_bn, 400, f"bad friend note should return 400, got {st_bn}: {bn_j}")
+
+            # 1st request: Chinese UTF-8 note (100 chars, >256 bytes, <=256 UTF-8 chars) succeeds
+            utf8_note = "你好交个朋友吧！" * 12  # 96 chars, 288 bytes
+            rc, _, err = run_cli(["--json", "friend", "add", ids_fr["b"], "--note", utf8_note], home=str(homes_fr["a"]), api_url=p6c_url)
+            assert_eq(rc, 0, f"UTF-8 friend add failed: {err}")
+            st_fl, fl_j = signed_http(HOST, p6c_port, ids_fr["b"], homes_fr["b"] / "private.pem", "GET", "/v1/friends", b"")
+            assert_eq(st_fl, 200, "friend list failed")
+            assert_eq(fl_j["incoming"][0]["note"], utf8_note, "UTF-8 friend note corrupted")
+
+            # Reject does not refund daily quota; 2nd + 3rd requests consume remaining quota; become friends with B
+            rc, _, err = run_cli(["friend", "reject", ids_fr["a"]], home=str(homes_fr["b"]), api_url=p6c_url)
+            assert_eq(rc, 0, f"reject failed: {err}")
+            rc, _, err = run_cli(["friend", "add", ids_fr["c"], "--note", "req2"], home=str(homes_fr["a"]), api_url=p6c_url)
+            assert_eq(rc, 0, f"2nd request failed: {err}")
+            rc, _, err = run_cli(["friend", "add", ids_fr["b"], "--note", "req3"], home=str(homes_fr["a"]), api_url=p6c_url)
+            assert_eq(rc, 0, f"3rd request failed: {err}")
+            rc, _, err = run_cli(["friend", "accept", ids_fr["a"]], home=str(homes_fr["b"]), api_url=p6c_url)
+            assert_eq(rc, 0, f"accept failed: {err}")
+
+            # 4th request hits ERR_DAILY_FRIEND_LIMIT; existing friend B still returns 200 already_friends
+            st_lim, lim_j = signed_http(
+                HOST, p6c_port, ids_fr["a"], homes_fr["a"] / "private.pem",
+                "POST", "/v1/friends/request", json.dumps({"agent_id": ids_fr["d"], "note": "over"}).encode("utf-8"),
+            )
+            assert_eq(st_lim, 429, f"4th friend request must hit 429: {lim_j}")
+            assert_eq(lim_j.get("error", {}).get("code"), "ERR_DAILY_FRIEND_LIMIT", f"unexpected 429 code: {lim_j}")
+            assert_true(lim_j.get("error", {}).get("retry_after", 0) > 0, f"missing retry_after: {lim_j}")
+            st_af, af_j = signed_http(
+                HOST, p6c_port, ids_fr["a"], homes_fr["a"] / "private.pem",
+                "POST", "/v1/friends/request", json.dumps({"agent_id": ids_fr["b"], "note": "dup"}).encode("utf-8"),
+            )
+            assert_eq(st_af, 200, f"already_friends must return 200: {af_j}")
+            assert_eq(af_j.get("status"), "already_friends", f"unexpected status: {af_j}")
+
+            # Restart server -> daily friend request count persists on disk
+            with urllib.request.urlopen(
+                urllib.request.Request(f"{p6c_url}/internal/shutdown", data=b"", method="POST", headers={"X-Fatext-Shutdown-Secret": sd_sec_c}),
+                timeout=5.0,
+            ) as sdr_c:
+                assert_eq(sdr_c.status, 200, "6c shutdown 200")
+            assert_eq(srv6c.wait(timeout=8.0), 0, "6c shutdown clean exit")
+            srv6c = subprocess.Popen([str(SERVER_BIN)], env=p6c_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            wait_http_ok(f"{p6c_url}/health")
+            st_lim2, lim2_j = signed_http(
+                HOST, p6c_port, ids_fr["a"], homes_fr["a"] / "private.pem",
+                "POST", "/v1/friends/request", json.dumps({"agent_id": ids_fr["d"], "note": "after restart"}).encode("utf-8"),
+            )
+            assert_eq(st_lim2, 429, f"post-restart friend limit must persist: {lim2_j}")
+            assert_eq(lim2_j.get("error", {}).get("code"), "ERR_DAILY_FRIEND_LIMIT", f"post-restart code mismatch: {lim2_j}")
+        finally:
+            if srv6c.poll() is None:
+                srv6c.terminate()
+                srv6c.wait(timeout=5)
+
         print("[7/7] Testing Cloudflare Email Worker spoofing resistance & deploy script hardening...")
         for sh_file in sorted((ROOT / "deploy").glob("*.sh")):
             r_sh = subprocess.run(["bash", "-n", str(sh_file)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)

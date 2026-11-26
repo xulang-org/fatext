@@ -231,6 +231,25 @@ def main():
             assert signed_get(bob, review_path(changed_case))[1]["status"] == "rejected"
             status, retry = publish(bob, replies, reply + " changed")
             assert status == 422 and retry["status"] == "rejected" and retry["receipt"] == changed_case["receipt"]
+            calls_before_qs = len(Classifier.seen)
+            status_qs, retry_qs = publish(bob, replies + "?bypass=1", reply + " changed")
+            assert status_qs == 422 and retry_qs["status"] == "rejected" and retry_qs["receipt"] == changed_case["receipt"]
+            assert len(Classifier.seen) == calls_before_qs
+
+            calls_before_replay = len(Classifier.seen)
+            replay_body = json.dumps({"text": reply + " replay fixture"}).encode()
+            replay_hdrs = signed_headers(bob, "POST", replies, replay_body)
+            st_rep1, rep1 = submit("POST", replies, replay_body, replay_hdrs)
+            assert st_rep1 == 422 and rep1["error"]["code"] == "ERR_CONTENT_REVIEW", (st_rep1, rep1)
+            assert len(Classifier.seen) == calls_before_replay + 1
+            st_rep2, rep2 = submit("POST", replies, replay_body, replay_hdrs)
+            assert st_rep2 == 401 and rep2["error"]["code"] == "ERR_REPLAY", (st_rep2, rep2)
+            assert len(Classifier.seen) == calls_before_replay + 1
+
+            calls_before_friend = len(Classifier.seen)
+            fr_body = json.dumps({"agent_id": alice[1], "note": "Review fixture friend note"}).encode()
+            fr_st, _ = submit("POST", "/v1/friends/request", fr_body, signed_headers(bob, "POST", "/v1/friends/request", fr_body))
+            assert fr_st == 200 and len(Classifier.seen) == calls_before_friend
             admin("PUT", POLICY, {"mode": "readonly"})
             assert publish(bob, replies, reply)[0] == 403
             admin("PUT", POLICY, {"mode": "invite"})
@@ -248,6 +267,9 @@ def main():
 
             status, headers, page = request("GET", f"/report?thread={root}&message={rid}")
             assert status == 200 and b"<form" in page and "form-action 'self'" in headers["content-security-policy"]
+            bogus_fields = {"thread_id": root, "msg_id": "msg_01ZZZZZZZZZZZZZZZZZZZZZZZZ", "reason": "other", "details": "missing"}
+            for _ in range(7):
+                assert submit("POST", "/v1/reports", json.dumps(bogus_fields).encode(), {})[0] == 404
             fields = {"thread_id": root, "msg_id": rid, "reason": "privacy", "details": "Report fixture"}
             status, out = submit("POST", "/v1/reports", json.dumps(fields).encode(), {})
             assert status == 201, (status, out)

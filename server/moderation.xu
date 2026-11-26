@@ -214,6 +214,7 @@ pub fn handle_message_visibility_admin(hub $&HubState, req &HttpReq, thread stri
     $updated := maps.new_str_int()
     for i in 0:hidden.len { updated.set(hidden[i] + "", 1) }
     hub.st.hidden_posts = updated
+    invalidate_thread_visible_cache($&hub.st, thread + "")
     hub.st.home_cache_ver += 1
     notice := "{\"kind\":" + json.quote(&("message_" + action)) + ",\"thread_id\":" + json.quote(&thread) +
         ",\"msg_id\":" + json.quote(&message) + ",\"reason\":" + json.quote(&reason) + ",\"at\":" + strconv.itoa(now) + "}"
@@ -233,13 +234,13 @@ fn report_rate_allowed(st $&State, ip string, now int, automatic bool) bool {
     }
     $key := ip + ""
     if automatic { key = "ai:" + ip }
+    if !st.report_hits.has(key + "") && st.report_hits.len() >= 8192 { << false }
     ip_count := map_get_or(&st.report_hits, key + "", 0)
-    if ip_count >= 5 { << false }
     if automatic {
-        if st.reviews_this_window >= 40 { << false }
+        if ip_count >= 10 || st.reviews_this_window >= 200 { << false }
         st.reviews_this_window += 1
     } else {
-        if st.reports_this_window >= 60 { << false }
+        if ip_count >= 5 || st.reports_this_window >= 300 { << false }
         st.reports_this_window += 1
     }
     map_set($&st.report_hits, key, ip_count + 1)
@@ -337,13 +338,13 @@ pub fn handle_public_report(st $&State, req &HttpReq, web bool, now int) HttpRes
         if web { << report_html(st, 400, "Check the message IDs, reason, and details.", thread + "", message + "", true) }
         << err_resp(400, "ERR_BAD_REQUEST", "invalid thread ID, message ID, reason, or details", 0, 0, 0)
     }
-    if !report_rate_allowed(st, req.remote_ip + "", now, false) {
-        if web { << report_html(st, 429, "Too many reports. Try again in a few minutes.", thread + "", message + "", true) }
-        << err_resp(429, "ERR_RATE_LIMITED", "report rate limit reached", 600, 0, 0)
-    }
     if !message_in_thread(st, thread + "", message + "") {
         if web { << report_html(st, 404, "Message not found in the specified thread.", thread + "", message + "", true) }
         << err_resp(404, "ERR_NOT_FOUND", "message not found", 0, 0, 0)
+    }
+    if !report_rate_allowed(st, req.remote_ip + "", now, false) {
+        if web { << report_html(st, 429, "Too many reports. Try again in a few minutes.", thread + "", message + "", true) }
+        << err_resp(429, "ERR_RATE_LIMITED", "report rate limit reached", 600, 0, 0)
     }
     token := mint_report_token()
     if token.len == 0 { << err_resp(503, "ERR_REPORT_UNAVAILABLE", "report storage unavailable", 0, 0, 0) }

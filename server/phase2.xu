@@ -23,6 +23,8 @@ struct FriendsData {
     pub out_note []string
     pub out_ts []int
     pub blocks []string
+    pub req_day string
+    pub req_day_count int
 }
 
 fn empty_friends_data() FriendsData {
@@ -34,7 +36,9 @@ fn empty_friends_data() FriendsData {
         out_to: []string{},
         out_note: []string{},
         out_ts: []int{},
-        blocks: []string{}
+        blocks: []string{},
+        req_day: "",
+        req_day_count: 0
     }
 }
 
@@ -93,6 +97,9 @@ fn parse_friends_raw(raw &string, now int) FriendsData {
             if b.len > 0 { fd.blocks.push(b) }
         }
     }
+    fd.req_day = json_str_or(&doc, doc.get(r, "req_day"), "")
+    fd.req_day_count = json_int_or(&doc, doc.get(r, "req_day_count"), 0)
+    if fd.req_day_count < 0 { fd.req_day_count = 0 }
     << fd
 }
 
@@ -152,7 +159,9 @@ fn save_friends_data(st $&State, aid string, fd &FriendsData) int {
     doc_s := "{\"friends\":[" + strings.join(fr_s, ",") +
         "],\"incoming\":[" + strings.join(in_s, ",") +
         "],\"outgoing\":[" + strings.join(out_s, ",") +
-        "],\"blocks\":[" + strings.join(bl_s, ",") + "]}\n"
+        "],\"blocks\":[" + strings.join(bl_s, ",") +
+        "],\"req_day\":" + json.quote(&fd.req_day) +
+        ",\"req_day_count\":" + strconv.itoa(fd.req_day_count) + "}\n"
     rc := write_atomic(friends_path(st, aid + ""), &doc_s) or >>
     str_map_set($&st.friends_raw_cache, aid + "", doc_s)
     str_map_set($&st.agent_blocks_flat, aid + "", blocks_flat_str(&fd.blocks))
@@ -384,12 +393,12 @@ pub fn handle_friends_list(st $&State, req &HttpReq, now int) HttpResp {
     }
     $in_s := []string{}
     for i in 0:fd.in_from.len {
-        iag := read_agent_summary(st, fd.in_from[i] + "")
+        iag := read_agent_summary_cached(st, fd.in_from[i] + "")
         in_s.push("{\"from\":" + json.quote(&fd.in_from[i]) + ",\"from_name\":" + json.quote(&iag.name) + ",\"note\":" + json.quote(&fd.in_note[i]) + ",\"ts\":" + strconv.itoa(fd.in_ts[i]) + "}")
     }
     $out_s := []string{}
     for i in 0:fd.out_to.len {
-        oag := read_agent_summary(st, fd.out_to[i] + "")
+        oag := read_agent_summary_cached(st, fd.out_to[i] + "")
         out_s.push("{\"to\":" + json.quote(&fd.out_to[i]) + ",\"to_name\":" + json.quote(&oag.name) + ",\"note\":" + json.quote(&fd.out_note[i]) + ",\"ts\":" + strconv.itoa(fd.out_ts[i]) + "}")
     }
     << json_resp(200, "{\"friends\":[" + strings.join(fr_s, ",") + "],\"incoming\":[" + strings.join(in_s, ",") + "],\"outgoing\":[" + strings.join(out_s, ",") + "]}")
@@ -398,16 +407,21 @@ pub fn handle_friends_list(st $&State, req &HttpReq, now int) HttpResp {
 pub fn handle_friend_request(st $&State, req &HttpReq, now int) HttpResp {
     au := authenticate_scoped(st, req, now, "social")
     if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
+    if req.req_body.len > 4096 {
+        << err_resp(413, "ERR_PAYLOAD_TOO_LARGE", "friend request body exceeds 4096 bytes", 0, 0, 0)
+    }
     doc := json.parse(&req.body())
     if !doc.ok() || !doc.is_dict(doc.root()) { << err_resp(400, "ERR_BAD_REQUEST", "invalid JSON", 0, 0, 0) }
     r := doc.root()
     tid := json_str_or(&doc, doc.get(r, "agent_id"), "")
-    $note := json_str_or(&doc, doc.get(r, "note"), "")
-    if note.len > 256 { note = note[0:256] }
+    note := json_str_or(&doc, doc.get(r, "note"), "")
+    if has_forbidden_ctrl(&note) || utf8_char_count(&note) > 256 {
+        << err_resp(400, "ERR_BAD_REQUEST", "note must be <= 256 chars with no control chars", 0, 0, 0)
+    }
     if !is_valid_agent_id(tid + "") || tid == au.agent_id {
         << err_resp(400, "ERR_BAD_REQUEST", "invalid target agent_id", 0, 0, 0)
     }
-    tag := read_agent_summary(st, tid + "")
+    tag := read_agent_summary_cached(st, tid + "")
     if !tag.found { << err_resp(404, "ERR_NOT_FOUND", "target agent not found", 0, 0, 0) }
     if tag.status == "revoked" { << err_resp(403, "ERR_REVOKED", "target agent is revoked", 0, 0, 0) }
     if tag.controller_id.len > 0 && st.revoked.has(tag.controller_id + "") {
@@ -420,13 +434,22 @@ pub fn handle_friend_request(st $&State, req &HttpReq, now int) HttpResp {
         << err_resp(403, "ERR_AGENT_SUSPENDED", "target agent is suspended", 0, 0, 0)
     }
 
-    $my_fd := load_friends_data(st, au.agent_id + "", now)
-    $t_fd := load_friends_data(st, tid + "", now)
+    $my_fd := load_friends_data_cached(st, au.agent_id + "", now)
+    $t_fd := load_friends_data_cached(st, tid + "", now)
     if str_list_contains(&t_fd.blocks, au.agent_id + "") {
         << err_resp(403, "ERR_FORBIDDEN", "blocked by recipient", 0, 0, 0)
     }
     if str_list_contains(&my_fd.friends, tid + "") {
         << json_resp(200, "{\"ok\":true,\"status\":\"already_friends\"}")
+    }
+    today := utc_date_from_unix(now)
+    $day_cnt := 0
+    if my_fd.req_day == today { day_cnt = my_fd.req_day_count }
+    $limit := st.daily_friend_req_limit
+    if limit <= 0 { limit = 20 }
+    if day_cnt >= limit {
+        rst := next_utc_midnight_unix(now)
+        << err_resp(429, "ERR_DAILY_FRIEND_LIMIT", "daily limit: max " + strconv.itoa(limit) + " friend requests per UTC day", rst - now, rst, 0)
     }
     if !str_list_contains(&my_fd.out_to, tid + "") && my_fd.out_to.len >= 200 {
         << err_resp(429, "ERR_RATE_LIMITED", "outgoing friend request limit reached (max 200)", 0, 0, 0)
@@ -434,6 +457,8 @@ pub fn handle_friend_request(st $&State, req &HttpReq, now int) HttpResp {
     if !str_list_contains(&t_fd.in_from, au.agent_id + "") && t_fd.in_from.len >= 200 {
         << err_resp(429, "ERR_RATE_LIMITED", "recipient incoming friend request queue full", 0, 0, 0)
     }
+    my_fd.req_day = today + ""
+    my_fd.req_day_count = day_cnt + 1
     remove_out_req($&my_fd, tid + "")
     my_fd.out_to.push(tid + "")
     my_fd.out_note.push(note + "")

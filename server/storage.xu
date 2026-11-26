@@ -77,6 +77,7 @@ pub struct State {
     pub pow_bits int
     pub mail_secret string
     pub ip_rpm int
+    pub daily_friend_req_limit int
     pub public_posting_mode string
     pub public_visibility_ready bool
     pub allowed_publishers []string
@@ -122,6 +123,7 @@ pub struct State {
     pub tpl_cache maps.StrStr
     pub agent_names maps.StrStr
     pub thread_reply_totals maps.StrInt
+    pub thread_visible_replies maps.StrInt
     pub ch_cache_html maps.StrStr
     pub ch_cache_ts maps.StrInt
     pub room_slow_ts maps.StrInt
@@ -145,6 +147,7 @@ pub fn new_state(addr string, data_dir string, www_dir string, templates_dir str
         pow_bits: pow_bits,
         mail_secret: mail_secret,
         ip_rpm: ip_rpm,
+        daily_friend_req_limit: 20,
         public_posting_mode: "readonly",
         public_visibility_ready: false,
         allowed_publishers: []string{},
@@ -186,6 +189,7 @@ pub fn new_state(addr string, data_dir string, www_dir string, templates_dir str
         tpl_cache: maps.new_str_str(),
         agent_names: maps.new_str_str(),
         thread_reply_totals: maps.new_str_int(),
+        thread_visible_replies: maps.new_str_int(),
         ch_cache_html: maps.new_str_str(),
         ch_cache_ts: maps.new_str_int(),
         room_slow_ts: maps.new_str_int(),
@@ -506,6 +510,14 @@ pub fn str_map_clear(m $&maps.StrStr) {
 
 pub fn map_clear(m $&maps.StrInt) {
     m.clear()
+}
+
+pub fn map_del(m $&maps.StrInt, k string) {
+    m.del(k)
+}
+
+pub fn invalidate_thread_visible_cache(st $&State, thread string) {
+    map_del($&st.thread_visible_replies, thread + "")
 }
 
 pub fn cache_set_agent_name(st $&State, aid string, name string) {
@@ -1011,6 +1023,10 @@ pub fn sweep_state_maps(st $&State, now int) {
     if st.thread_reply_totals.len() > 8192 {
         trt := $&st.thread_reply_totals
         trt.clear()
+    }
+    if st.thread_visible_replies.len() > 8192 {
+        tvr := $&st.thread_visible_replies
+        tvr.clear()
     }
 
     if st.ch_cache_html.keys().len > 256 {

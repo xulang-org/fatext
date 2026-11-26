@@ -88,6 +88,9 @@ pub fn cc_read(cc $&ClientConn, max int) string {
     << net.conn_read(cc.fd, max) or >>
 }
 
+pub const HTTP_WRITE_TIMEOUT_NS = 15000000000
+pub const SSE_WRITE_TIMEOUT_NS = 10000000000
+
 pub fn cc_write(cc $&ClientConn, data &string) int {
     if cc.is_tls {
         << tls_write_q($&cc.tc, data) or (err) { << -1 }
@@ -95,6 +98,18 @@ pub fn cc_write(cc $&ClientConn, data &string) int {
     << net.conn_write(cc.fd, data) or (err) { << -1 }
 }
 
+pub fn cc_write_timeout(cc $&ClientConn, data &string, dur_ns int) int {
+    if dur_ns > 0 {
+        cc_set_sock_timeout(cc, dur_ns)
+    }
+    rc := cc_write(cc, data)
+    if dur_ns > 0 {
+        cc_set_sock_timeout(cc, 0)
+    }
+    << rc
+}
+
+// SO_NOSIGPIPE (macOS SOL_SOCKET=65535, SO_NOSIGPIPE=4130); Linux relies on signal.ignore(SIGPIPE).
 pub fn cc_disable_sigpipe(fd int) {
     if fd < 0 { << }
     _ := os.setsockopt_int(fd, 65535, 4130, 1) or (err) { << }
@@ -222,7 +237,7 @@ pub fn format_http_resp(r &HttpResp) string {
 
 pub fn write_http_resp_ka(cc $&ClientConn, r &HttpResp, keep_alive bool) int {
     wire := format_http_resp_ka_tls(r, keep_alive, cc.is_tls)
-    << cc_write(cc, &wire) or (err) { << -1 }
+    << cc_write_timeout(cc, &wire, HTTP_WRITE_TIMEOUT_NS)
 }
 
 pub fn write_http_resp(cc $&ClientConn, r &HttpResp) int {
@@ -237,7 +252,7 @@ pub fn wants_keep_alive(req &HttpReq) bool {
 
 pub fn write_sse_open(cc $&ClientConn) int {
     hdr := "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nX-Accel-Buffering: no\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n: connected\n\n"
-    << cc_write(cc, &hdr) or (err) { << -1 }
+    << cc_write_timeout(cc, &hdr, SSE_WRITE_TIMEOUT_NS)
 }
 
 fn is_strict_header_name(s &string) bool {
