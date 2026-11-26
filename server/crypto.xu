@@ -66,6 +66,13 @@ pub fn parse_spki_rsa_pem(pem_str &string) rsa.PublicKey {
     << rsa.PublicKey{n: n, e: e}
 }
 
+pub fn signature_replay_key(encoded &string) string {
+    if encoded.len > 684 { << "" }
+    sig := base64.decode_string(*encoded + "") or (err) { << "" }
+    if sig.len == 0 || base64.encode_to_string(sig + "") != *encoded { << "" }
+    << sha256.sum256(sig + "")
+}
+
 pub fn verify_pss_message(pk &rsa.PublicKey, msg &string, sig_b64 string) bool {
     trimmed := strings.trim_space(&sig_b64)
     if trimmed.len == 0 { << false }
@@ -110,12 +117,11 @@ pub fn is_uint64_decimal(s &string) bool {
     << true
 }
 
-pub fn verify_pow_register(pub_pem &string, ts string, nonce string, bits int) bool {
-    if !is_uint64_decimal(&nonce) { << false }
+pub fn registration_work_digest(pub_pem &string, ts string, nonce string) string {
+    if !is_uint64_decimal(&nonce) { << "" }
     pem_hex := sha256.sum256(pub_pem + "")
     input := pem_hex + ":" + ts + ":" + nonce
-    digest := sha256.sum256_bytes(input)
-    << leading_zero_bits(&digest) >= bits
+    << sha256.sum256_bytes(input)
 }
 
 pub fn verify_pow_post(agent_id string, ts string, nonce string, bits int) bool {

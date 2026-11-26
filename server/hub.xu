@@ -15,12 +15,16 @@ pub const HUB_METRIC_TLS = 4
 pub const HUB_METRIC_FLUSH = 5
 pub const HUB_METRIC_GC = 6
 pub const HUB_SHUTDOWN_DRAIN = 7
-pub const SSE_CTRL_CLOSE = "__FATEXT_SSE_CLOSE__"
+pub const HUB_MODERATION_PREFLIGHT = 8
+pub const HUB_ENTITY_STATS_UPDATE = 9
+pub const HUB_CONFIG_RELOAD = 10
 pub const SSE_CTRL_SHUTDOWN = "__FATEXT_SSE_SHUTDOWN__"
 
 pub struct SseClient {
     pub id int
     pub agent_id string
+    pub controller_id string
+    pub stop_ch chan int
     pub channels []string
     pub rooms []string
     pub ch chan string
@@ -31,6 +35,8 @@ pub struct HubReply {
     pub is_sse bool
     pub sse_id int
     pub sse_ch chan string
+    pub sse_expires_at int
+    pub sse_stop chan int
     pub queue_ms int
     pub handle_ms int
     pub err_code string
@@ -44,6 +50,7 @@ pub struct HubJob {
     pub sse_id int
     pub enqueued_ns int
     pub flag int
+    pub entity_stats EntityStatsCache
     pub reply_ch chan HubReply
 }
 
@@ -63,11 +70,14 @@ pub struct EntityStatsCache {
 pub struct HubState {
     pub st State
     pub clients []SseClient
+    pub sse_agent_counts maps.StrInt
     pub next_sse_id int
     pub ip_hits maps.StrInt
     pub ip_window int
     pub log_ch chan string
+    pub static_ch chan StaticJob
     pub webhook_ch chan string
+    pub webhooks_enabled bool
     pub log_dir string
     pub slow_ms int
     pub draining bool
@@ -80,9 +90,12 @@ pub struct HubState {
     pub cert_ch chan CertStoreMsg
     pub tls_cert_path string
     pub tls_key_path string
+    pub tls_trusted_host string
     pub metrics MetricsState
     pub cum_metrics MetricsState
     pub entity_cache EntityStatsCache
+    pub entity_cache_day string
+    pub ch_posts_today maps.StrInt
     pub pub_stats_ts int
     pub pub_stats_json string
 }
@@ -102,15 +115,30 @@ pub fn empty_entity_stats_cache() EntityStatsCache {
     }
 }
 
-pub fn new_hub_state(st State, log_ch chan string, webhook_ch chan string, log_dir string, slow_ms int, now int, max_sse int, max_sse_per_agent int, admin_secret string, admin_local_only bool, shutdown_enabled bool, cert_ch chan CertStoreMsg, tls_cert_path string, tls_key_path string) HubState {
+pub fn make_hub_job(kind int, req HttpReq, sse_id int, enqueued_ns int, flag int, reply_ch chan HubReply) HubJob {
+    << HubJob{
+        kind: kind,
+        req: req,
+        sse_id: sse_id,
+        enqueued_ns: enqueued_ns,
+        flag: flag,
+        entity_stats: empty_entity_stats_cache(),
+        reply_ch: reply_ch
+    }
+}
+
+pub fn new_hub_state(st State, log_ch chan string, static_ch chan StaticJob, webhook_ch chan string, webhooks_enabled bool, log_dir string, slow_ms int, now int, max_sse int, max_sse_per_agent int, admin_secret string, admin_local_only bool, shutdown_enabled bool, cert_ch chan CertStoreMsg, tls_cert_path string, tls_key_path string, tls_trusted_host string) HubState {
     << HubState{
         st: st,
         clients: []SseClient{},
+        sse_agent_counts: maps.new_str_int(),
         next_sse_id: 1,
         ip_hits: maps.new_str_int(),
         ip_window: 0,
         log_ch: log_ch,
+        static_ch: static_ch,
         webhook_ch: webhook_ch,
+        webhooks_enabled: webhooks_enabled,
         log_dir: log_dir,
         slow_ms: slow_ms,
         draining: false,
@@ -123,11 +151,29 @@ pub fn new_hub_state(st State, log_ch chan string, webhook_ch chan string, log_d
         cert_ch: cert_ch,
         tls_cert_path: tls_cert_path,
         tls_key_path: tls_key_path,
+        tls_trusted_host: tls_trusted_host,
         metrics: new_metrics_state(now),
         cum_metrics: new_metrics_state(now),
         entity_cache: empty_entity_stats_cache(),
+        entity_cache_day: utc_date_from_unix(now),
+        ch_posts_today: maps.new_str_int(),
         pub_stats_ts: 0,
         pub_stats_json: ""
+    }
+}
+
+fn sse_count_inc(hub $&HubState, aid string) {
+    cur := map_get_or(&hub.sse_agent_counts, aid + "", 0)
+    map_set($&hub.sse_agent_counts, aid + "", cur + 1)
+}
+
+fn sse_count_dec(hub $&HubState, aid string) {
+    cur := map_get_or(&hub.sse_agent_counts, aid + "", 0)
+    if cur <= 1 {
+        m := $&hub.sse_agent_counts
+        m.del(aid + "")
+    } else {
+        map_set($&hub.sse_agent_counts, aid + "", cur - 1)
     }
 }
 
@@ -135,9 +181,9 @@ fn empty_sse_ch() chan string {
     << chan string{cap: 1}
 }
 
-fn reply_http(resp HttpResp, queue_ms int, handle_ms int, err_code string, actor_type string, actor_id string) HubReply {
+pub fn reply_http(resp HttpResp, queue_ms int, handle_ms int, err_code string, actor_type string, actor_id string) HubReply {
     << HubReply{
-        resp: resp, is_sse: false, sse_id: 0, sse_ch: empty_sse_ch(),
+        resp: resp, is_sse: false, sse_id: 0, sse_ch: empty_sse_ch(), sse_expires_at: 0, sse_stop: chan int{cap: 1},
         queue_ms: queue_ms, handle_ms: handle_ms, err_code: err_code,
         actor_type: actor_type, actor_id: actor_id
     }
@@ -151,6 +197,9 @@ fn send_sse_msg(cli &SseClient, msg string) bool {
 }
 
 pub fn hub_push_to_agent(hub $&HubState, agent_id string, event_type string, data_json &string) int {
+    if map_get_or(&hub.sse_agent_counts, agent_id + "", 0) <= 0 {
+        << 0
+    }
     msg := "event: " + event_type + "\ndata: " + data_json + "\n\n"
     $sent := 0
     for i in 0:hub.clients.len {
@@ -166,18 +215,22 @@ pub fn hub_push_to_agent(hub $&HubState, agent_id string, event_type string, dat
     << sent
 }
 
-pub fn hub_disconnect_agent_count(hub $&HubState, agent_id string) int {
+pub fn hub_disconnect_agent_count(hub $&HubState, agent_id string, include_managed bool) int {
     $cnt := 0
     $next_clients := []SseClient{}
+    $dropped_aids := []string{}
     for i in 0:hub.clients.len {
         c := &hub.clients[i]
-        if c.agent_id == agent_id {
+        if c.agent_id == agent_id || (include_managed && c.controller_id == agent_id) {
             cnt += 1
-            _ := send_sse_msg(c, SSE_CTRL_CLOSE)
+            dropped_aids.push(c.agent_id + "")
+            c.stop_ch <- 1
         } else {
             next_clients.push(SseClient{
                 id: c.id,
                 agent_id: c.agent_id + "",
+                controller_id: c.controller_id + "",
+                stop_ch: c.stop_ch,
                 channels: clone_str_slice(&c.channels),
                 rooms: clone_str_slice(&c.rooms),
                 ch: c.ch
@@ -185,11 +238,14 @@ pub fn hub_disconnect_agent_count(hub $&HubState, agent_id string) int {
         }
     }
     hub.clients = next_clients
+    for k in 0:dropped_aids.len {
+        sse_count_dec(hub, dropped_aids[k] + "")
+    }
     << cnt
 }
 
 pub fn hub_disconnect_agent(hub $&HubState, agent_id string) {
-    _ := hub_disconnect_agent_count(hub, agent_id + "")
+    _ := hub_disconnect_agent_count(hub, agent_id + "", false)
 }
 
 pub fn hub_push_dm(hub $&HubState, to_id string, data_json &string) int {
@@ -197,12 +253,16 @@ pub fn hub_push_dm(hub $&HubState, to_id string, data_json &string) int {
 }
 
 pub fn hub_push_room_checked(hub $&HubState, room &RoomData, sender_id string, data_json &string, now int) int {
+    $rm_set := maps.new_str_int()
+    for mi in 0:room.members.len {
+        rm_set.set(room.members[mi].agent_id + "", 1)
+    }
     msg := "event: room\ndata: " + data_json + "\n\n"
     $sent := 0
     for i in 0:hub.clients.len {
         cid := hub.clients[i].agent_id + ""
         if cid == sender_id { -> }
-        if !room_has_member(room, cid + "") { -> }
+        if !rm_set.has(cid + "") { -> }
         if !(hub.clients[i].rooms.len == 0 || str_list_contains(&hub.clients[i].rooms, room.room_id + "")) { -> }
         if agent_blocks_sender_cached($&hub.st, cid + "", sender_id + "", now) { -> }
         if send_sse_msg(&hub.clients[i], msg + "") {
@@ -216,11 +276,15 @@ pub fn hub_push_room_checked(hub $&HubState, room &RoomData, sender_id string, d
 }
 
 pub fn hub_push_room_event(hub $&HubState, room &RoomData, data_json &string) int {
+    $rm_set := maps.new_str_int()
+    for mi in 0:room.members.len {
+        rm_set.set(room.members[mi].agent_id + "", 1)
+    }
     msg := "event: room_event\ndata: " + data_json + "\n\n"
     $sent := 0
     for i in 0:hub.clients.len {
         c := &hub.clients[i]
-        if !room_has_member(room, c.agent_id + "") { -> }
+        if !rm_set.has(c.agent_id + "") { -> }
         if str_list_contains(&c.rooms, room.room_id + "") || c.rooms.len == 0 {
             if send_sse_msg(c, msg + "") {
                 sent += 1
@@ -266,7 +330,7 @@ fn clear_map(m $&maps.StrInt) {
 fn check_ip_rate_limit(hub $&HubState, remote_ip string, now int) bool {
     if hub.st.ip_rpm <= 0 { << true }
     win := now / 60
-    if win != hub.ip_window {
+    if win != hub.ip_window || hub.ip_hits.len() > 16384 {
         hub.ip_window = win
         clear_map($&hub.ip_hits)
     }
@@ -364,7 +428,7 @@ fn run_mail_gc_pass(data_dir string, now int) int {
     << deleted
 }
 
-pub fn maintenance_loop(data_dir string, ch_names []string, log_ch chan string, jobs chan HubJob) {
+pub fn maintenance_loop(data_dir string, ch_names []string, log_ch chan string, jobs chan HubJob, moderation_retention_days int) {
     $last_anchor := ""
     $last_gc := 0
     tick := time.new_ticker(60000000000)
@@ -374,9 +438,22 @@ pub fn maintenance_loop(data_dir string, ch_names []string, log_ch chan string, 
         if last_anchor != today {
             last_anchor = today + ""
             yday := shift_utc_date(today + "", -1)
+            work_root := data_dir + "/registration-work"
+            dirs := read_dir_or_empty(work_root + "")
+            days := strings.split(&dirs, "\n")
+            for di in 0:days.len {
+                day := days[di] + ""
+                if is_valid_date(day + "") && strings.compare(&day, &yday) < 0 {
+                    _ := os.remove_all(work_root + "/" + day) or (err) { -> }
+                }
+            }
+            $cur_chs := read_channel_names_from_disk(data_dir + "")
+            if cur_chs.len == 0 {
+                cur_chs = clone_str_slice(&ch_names)
+            }
             $anchors := 0
-            for i in 0:ch_names.len {
-                ch := ch_names[i] + ""
+            for i in 0:cur_chs.len {
+                ch := cur_chs[i] + ""
                 y := yday[0:4]
                 m := yday[5:7]
                 p := data_dir + "/public/channels/" + ch + "/" + y + "/" + m + "/" + yday + ".jsonl"
@@ -398,9 +475,10 @@ pub fn maintenance_loop(data_dir string, ch_names []string, log_ch chan string, 
         if now - last_gc >= 3600 {
             t0 := time.now()
             last_gc = now
+            purge_moderation_records(data_dir + "", today + "", moderation_retention_days, now, log_ch)
             deleted := run_mail_gc_pass(data_dir + "", now)
             if deleted > 0 {
-                gc_job := HubJob{kind: HUB_METRIC_GC, req: empty_req(), sse_id: 0, enqueued_ns: 0, flag: deleted, reply_ch: chan HubReply{cap: 1}}
+                gc_job := make_hub_job(HUB_METRIC_GC, empty_req(), 0, 0, deleted, chan HubReply{cap: 1})
                 jobs <- gc_job
             }
             dur_ms := (time.now() - t0) / 1000000
@@ -411,10 +489,68 @@ pub fn maintenance_loop(data_dir string, ch_names []string, log_ch chan string, 
     }
 }
 
-fn dispatch_http(hub $&HubState, req &HttpReq, now int) HttpResp {
+fn config_snapshot_digest(data_dir string) string {
+    p1 := read_file_or_empty(data_dir + "/public/channels.json")
+    p2 := read_file_or_empty(data_dir + "/public/pins.json")
+    p3 := read_file_or_empty(data_dir + "/blacklist/banned_agents.jsonl")
+    p4 := read_file_or_empty(data_dir + "/keys/revoked.jsonl")
+    p5 := read_file_or_empty(data_dir + "/blacklist/banned_emails.txt")
+    raw := strconv.itoa(p1.len) + ":" + p1 + "\n" +
+        strconv.itoa(p2.len) + ":" + p2 + "\n" +
+        strconv.itoa(p3.len) + ":" + p3 + "\n" +
+        strconv.itoa(p4.len) + ":" + p4 + "\n" +
+        strconv.itoa(p5.len) + ":" + p5
+    << sha256.sum256(raw)
+}
+
+pub fn config_watch_loop(data_dir string, jobs chan HubJob) {
+    $last_digest := config_snapshot_digest(data_dir + "")
+    tick := time.new_ticker(1000000000)
+    while true {
+        _ := <-tick.c
+        cur := config_snapshot_digest(data_dir + "")
+        if cur != last_digest {
+            last_digest = cur
+            jobs <- make_hub_job(HUB_CONFIG_RELOAD, empty_req(), 0, 0, 0, chan HubReply{cap: 1})
+        }
+    }
+}
+
+pub fn entity_stats_loop(data_dir string, jobs chan HubJob) {
+    tick := time.new_ticker(30000000000)
+    while true {
+        _ := <-tick.c
+        now := time.now_time().unix()
+        chs := read_channel_names_from_disk(data_dir + "")
+        snap := compute_entity_stats(data_dir + "", &chs, now)
+        jobs <- HubJob{
+            kind: HUB_ENTITY_STATS_UPDATE,
+            req: empty_req(),
+            sse_id: 0,
+            enqueued_ns: 0,
+            flag: 0,
+            entity_stats: snap,
+            reply_ch: chan HubReply{cap: 1}
+        }
+    }
+}
+
+fn dispatch_http(hub $&HubState, req &HttpReq, now int, preflight bool, reviewed bool) HttpResp {
     method := req.method()
     path := path_only(req.path())
 
+    if path == "/report/status" || path == "/v1/reports/status" {
+        << handle_guest_report_status(&hub.st, req, path == "/report/status", now)
+    }
+    if path == "/v1/moderation/notices" {
+        << handle_moderation_notices($&hub.st, req, now)
+    }
+    if path == "/v1/moderation/review" {
+        << handle_own_review($&hub.st, req, now)
+    }
+    if path == "/report" || path == "/v1/reports" {
+        << handle_public_report($&hub.st, req, path == "/report", now)
+    }
     if method == "GET" && path == "/health" {
         << http_resp(200, "text/plain; charset=utf-8", "", &"ok\n")
     }
@@ -464,7 +600,22 @@ fn dispatch_http(hub $&HubState, req &HttpReq, now int) HttpResp {
 
     if path == "/v1/agents/register" {
         if method != "POST" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
-        << handle_register($&hub.st, req, now)
+        resp := handle_register($&hub.st, req, now)
+        if resp.status == 201 {
+            hub.entity_cache.agents_total += 1
+            hub.entity_cache.agents_active += 1
+            if strings.contains(&resp.body, "\"controller_id\":") {
+                hub.entity_cache.managed_agents_total += 1
+            }
+            rdoc := json.parse(&req.body())
+            if rdoc.ok() && rdoc.is_dict(rdoc.root()) && rdoc.has(rdoc.root(), "controller_only") {
+                if json_bool_or(&rdoc, rdoc.get(rdoc.root(), "controller_only"), false) {
+                    hub.entity_cache.controllers_total += 1
+                }
+            }
+            hub.pub_stats_ts = 0
+        }
+        << resp
     }
     if path == "/v1/agents/profile" {
         if method != "PUT" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
@@ -476,7 +627,15 @@ fn dispatch_http(hub $&HubState, req &HttpReq, now int) HttpResp {
     }
     if path == "/v1/agents/revoke" {
         if method != "POST" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
-        << handle_revoke(hub, req, now)
+        resp := handle_revoke(hub, req, now)
+        if resp.status == 200 {
+            hub.entity_cache.agents_revoked += 1
+            if hub.entity_cache.agents_active > 0 {
+                hub.entity_cache.agents_active -= 1
+            }
+            hub.pub_stats_ts = 0
+        }
+        << resp
     }
     if path == "/v1/agents/docs" {
         if method != "GET" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
@@ -508,15 +667,34 @@ fn dispatch_http(hub $&HubState, req &HttpReq, now int) HttpResp {
             }
             if act == "suspend" {
                 if method != "POST" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
-                << handle_ctl_suspend_agent(hub, req, aid, now)
+                ag_prev := read_agent_summary_cached($&hub.st, aid + "")
+                resp := handle_ctl_suspend_agent(hub, req, aid, now)
+                if resp.status == 200 && (!ag_prev.found || ag_prev.ownership_status != "suspended") {
+                    hub.entity_cache.agents_suspended += 1
+                }
+                << resp
             }
             if act == "resume" {
                 if method != "POST" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
-                << handle_ctl_resume_agent(hub, req, aid, now)
+                ag_prev := read_agent_summary_cached($&hub.st, aid + "")
+                resp := handle_ctl_resume_agent(hub, req, aid, now)
+                if resp.status == 200 && ag_prev.found && ag_prev.ownership_status == "suspended" && hub.entity_cache.agents_suspended > 0 {
+                    hub.entity_cache.agents_suspended -= 1
+                }
+                << resp
             }
             if act == "revoke" {
                 if method != "POST" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
-                << handle_ctl_revoke_agent(hub, req, aid, now)
+                was_rev := hub.st.revoked.has(aid + "")
+                resp := handle_ctl_revoke_agent(hub, req, aid, now)
+                if resp.status == 200 && !was_rev {
+                    hub.entity_cache.agents_revoked += 1
+                    if hub.entity_cache.agents_active > 0 {
+                        hub.entity_cache.agents_active -= 1
+                    }
+                    hub.pub_stats_ts = 0
+                }
+                << resp
             }
             if act == "policy" {
                 if method != "PUT" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
@@ -574,7 +752,11 @@ fn dispatch_http(hub $&HubState, req &HttpReq, now int) HttpResp {
         << handle_dm_send(hub, req, path[7:path.len], now)
     }
     if path == "/v1/rooms" || strings.has_prefix(&path, "/v1/rooms/") {
-        << handle_rooms_dispatch(hub, req, path + "", method + "", now)
+        resp := handle_rooms_dispatch(hub, req, path + "", method + "", now)
+        if path == "/v1/rooms" && method == "POST" && resp.status == 201 {
+            hub.entity_cache.rooms_total += 1
+        }
+        << resp
     }
 
     if path == "/v1/mail" {
@@ -596,8 +778,14 @@ fn dispatch_http(hub $&HubState, req &HttpReq, now int) HttpResp {
         if parts.len == 2 && parts[1] == "posts" {
             if method != "POST" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
             ch := parts[0] + ""
-            resp := handle_create_post($&hub.st, req, ch + "", now)
+            resp := handle_create_post($&hub.st, req, ch + "", now, preflight, reviewed)
             if resp.status == 201 {
+                ensure_entity_day_fresh(hub, now)
+                hub.entity_cache.posts_today += 1
+                cur_cp := map_get_or(&hub.ch_posts_today, ch + "", 0)
+                map_set($&hub.ch_posts_today, ch + "", cur_cp + 1)
+                rebuild_per_channel_today_json(hub)
+                hub.pub_stats_ts = 0
                 rdoc := json.parse(&resp.body)
                 if rdoc.ok() && rdoc.has(rdoc.root(), "msg_id") {
                     mid := json_str_or(&rdoc, rdoc.get(rdoc.root(), "msg_id"), "")
@@ -617,7 +805,7 @@ fn dispatch_http(hub $&HubState, req &HttpReq, now int) HttpResp {
         if parts.len == 2 && parts[1] == "replies" {
             if method != "POST" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
             tid := parts[0] + ""
-            resp := handle_create_reply($&hub.st, req, tid + "", now)
+            resp := handle_create_reply($&hub.st, req, tid + "", now, preflight, reviewed)
             if resp.status == 201 {
                 recs := read_jsonl_records(thread_path(&hub.st, tid + ""))
                 if recs.len > 0 {
@@ -708,12 +896,18 @@ pub struct ActorPair {
 }
 
 fn resolve_actor_type_id(req &HttpReq, resp &HttpResp) ActorPair {
+    p_only := path_only(req.path())
+    if resp.status == 401 {
+        << ActorPair{actor_type: "anon", actor_id: ""}
+    }
+    if (p_only == "/internal/metrics" || strings.has_prefix(&p_only, "/internal/admin/")) && (resp.status == 403 || resp.status == 404) {
+        << ActorPair{actor_type: "anon", actor_id: ""}
+    }
     aid := strings.trim_space(&req.header("X-Agent-Id"))
     if aid.len > 0 { << ActorPair{actor_type: "agent", actor_id: aid} }
     asec := strings.trim_space(&req.header("X-Fatext-Admin-Secret"))
     if asec.len > 0 { << ActorPair{actor_type: "admin", actor_id: ""} }
     auth_h := strings.trim_space(&req.header("Authorization"))
-    p_only := path_only(req.path())
     if auth_h.len > 0 && (p_only == "/internal/metrics" || strings.has_prefix(&p_only, "/internal/admin/")) {
         << ActorPair{actor_type: "admin", actor_id: ""}
     }
@@ -737,9 +931,31 @@ pub fn hub_loop(hub_init HubState, jobs chan HubJob) {
         job := <-jobs
         t_start := time.now()
         now := time.now_time().unix()
-        reload_configs_if_needed($&hub.st, now)
         sweep_state_maps($&hub.st, now)
 
+        if job.kind == HUB_CONFIG_RELOAD {
+            reload_configs($&hub.st, now)
+            rebuild_per_channel_today_json($&hub)
+            hub.pub_stats_ts = 0
+            ->
+        }
+        if job.kind == HUB_ENTITY_STATS_UPDATE {
+            es := &job.entity_stats
+            hub.entity_cache = EntityStatsCache{
+                ts: es.ts,
+                agents_total: es.agents_total,
+                agents_active: es.agents_active,
+                agents_revoked: es.agents_revoked,
+                agents_suspended: es.agents_suspended,
+                controllers_total: es.controllers_total,
+                managed_agents_total: es.managed_agents_total,
+                rooms_total: es.rooms_total,
+                posts_today: es.posts_today,
+                per_channel_today_json: es.per_channel_today_json + ""
+            }
+            sync_ch_posts_today_from_cache($&hub, now)
+            ->
+        }
         if job.kind == HUB_METRIC_FLUSH {
             acl := hub.clients.len
             lch := hub.log_ch
@@ -765,6 +981,8 @@ pub fn hub_loop(hub_init HubState, jobs chan HubJob) {
                 _ := send_sse_msg(&hub.clients[i], SSE_CTRL_SHUTDOWN)
             }
             hub.clients = []SseClient{}
+            sac := $&hub.sse_agent_counts
+            sac.clear()
             job.reply_ch <- reply_http(json_resp(200, "{\"ok\":true}"), 0, 0, "", "internal", "")
             ->
         }
@@ -777,26 +995,34 @@ pub fn hub_loop(hub_init HubState, jobs chan HubJob) {
 
         if job.kind == HUB_SSE_UNSUB {
             $next_clients := []SseClient{}
+            $unsub_aids := []string{}
             for i in 0:hub.clients.len {
                 c := &hub.clients[i]
                 if c.id != job.sse_id {
                     next_clients.push(SseClient{
                         id: c.id,
                         agent_id: c.agent_id + "",
+                        controller_id: c.controller_id + "",
+                        stop_ch: c.stop_ch,
                         channels: clone_str_slice(&c.channels),
                         rooms: clone_str_slice(&c.rooms),
                         ch: c.ch
                     })
+                } else {
+                    unsub_aids.push(c.agent_id + "")
                 }
             }
             hub.clients = next_clients
+            for k in 0:unsub_aids.len {
+                sse_count_dec($&hub, unsub_aids[k] + "")
+            }
             hub.metrics.sse_closed += 1
             job.reply_ch <- reply_http(json_resp(200, "{\"ok\":true}"), 0, 0, "", "", "")
             ->
         }
 
         admin_req := is_valid_admin_request(&hub, &job.req)
-        if !admin_req && !check_ip_rate_limit($&hub, job.req.remote_ip + "", now) {
+        if job.flag == 0 && !admin_req && !check_ip_rate_limit($&hub, job.req.remote_ip + "", now) {
             r429 := err_resp(429, "ERR_RATE_LIMITED", "IP rate limit exceeded", 60, now + 60, 0)
             slow := hub.slow_ms
             metrics_record_http($&hub.metrics, 429, job.req.req_body.len, r429.body.len, q_ms, 0, q_ms, slow)
@@ -818,10 +1044,14 @@ pub fn hub_loop(hub_init HubState, jobs chan HubJob) {
                 r_err := err_resp(au.status, au.code, au.message, 0, 0, 0)
                 aid_hdr := strings.trim_space(&job.req.header("X-Agent-Id"))
                 $atyp := "anon"
-                if aid_hdr.len > 0 { atyp = "agent" }
+                $alog_id := ""
+                if au.status != 401 && aid_hdr.len > 0 {
+                    atyp = "agent"
+                    alog_id = aid_hdr + ""
+                }
                 slow := hub.slow_ms
                 metrics_record_http($&hub.metrics, au.status, job.req.req_body.len, r_err.body.len, q_ms, h_ms, q_ms + h_ms, slow)
-                job.reply_ch <- reply_http(r_err, q_ms, h_ms, au.code + "", atyp, aid_hdr)
+                job.reply_ch <- reply_http(r_err, q_ms, h_ms, au.code + "", atyp, alog_id)
                 ->
             }
             if hub.draining {
@@ -841,12 +1071,7 @@ pub fn hub_loop(hub_init HubState, jobs chan HubJob) {
                 ->
             }
             if hub.max_sse_per_agent > 0 {
-                $agent_sse := 0
-                for ci in 0:hub.clients.len {
-                    if hub.clients[ci].agent_id == au.agent_id {
-                        agent_sse += 1
-                    }
-                }
+                agent_sse := map_get_or(&hub.sse_agent_counts, au.agent_id + "", 0)
                 if agent_sse >= hub.max_sse_per_agent {
                     h_ms := (time.now() - t_start) / 1000000
                     r429 := err_resp(429, "ERR_RATE_LIMITED", "too many concurrent SSE streams for agent", 5, now + 5, 0)
@@ -861,14 +1086,18 @@ pub fn hub_loop(hub_init HubState, jobs chan HubJob) {
             ch := chan string{cap: 64}
             chs := parse_csv_query_param(job.req.path(), "channels")
             rms := parse_csv_query_param(job.req.path(), "rooms")
+            stop_ch := chan int{cap: 1}
             cli := SseClient{
                 id: sid,
                 agent_id: au.agent_id + "",
+                controller_id: au.agent.controller_id + "",
+                stop_ch: stop_ch,
                 channels: chs,
                 rooms: rms,
                 ch: ch
             }
             hub.clients.push(cli)
+            sse_count_inc($&hub, au.agent_id + "")
             hub.metrics.sse_opened += 1
             if hub.clients.len > hub.metrics.peak_sse {
                 hub.metrics.peak_sse = hub.clients.len
@@ -884,6 +1113,8 @@ pub fn hub_loop(hub_init HubState, jobs chan HubJob) {
                 is_sse: true,
                 sse_id: sid,
                 sse_ch: ch,
+                sse_expires_at: au.agent.cred_expires_at,
+                sse_stop: stop_ch,
                 queue_ms: q_ms,
                 handle_ms: h_ms,
                 err_code: "",
@@ -893,7 +1124,26 @@ pub fn hub_loop(hub_init HubState, jobs chan HubJob) {
             ->
         }
 
-        resp := dispatch_http($&hub, &job.req, now)
+        if job.kind == HUB_MODERATION_PREFLIGHT {
+            resp := dispatch_http($&hub, &job.req, now, true, false)
+            if resp.status == 200 && moderation_approval(&hub.st, &job.req, now) {
+                job.reply_ch <- reply_http(json_resp(204, ""), q_ms, 0, "", "agent", job.req.header("X-Agent-Id"))
+            } else {
+                ec := extract_err_code(resp.status, &resp.body)
+                job.reply_ch <- reply_http(http_resp(resp.status, resp.ctype + "", resp.extra + "", &resp.body), q_ms, 0, ec, "agent", job.req.header("X-Agent-Id"))
+            }
+            ->
+        }
+
+        $resp := json_resp(200, "{}")
+        if job.flag == MODERATION_FLAG {
+            resp = dispatch_http($&hub, &job.req, now, true, false)
+            if resp.status == 200 { resp = queue_ai_review($&hub.st, &job.req, now) }
+        } else if job.flag == MODERATION_UNAVAILABLE {
+            resp = err_resp(503, "ERR_MODERATION_UNAVAILABLE", "public content moderation unavailable", 5, 0, 0)
+        } else {
+            resp = dispatch_http($&hub, &job.req, now, false, job.flag == MODERATION_REVIEWED)
+        }
         $h_ms := (time.now() - t_start) / 1000000
         if h_ms < 0 { h_ms = 0 }
         ec := extract_err_code(resp.status, &resp.body)

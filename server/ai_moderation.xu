@@ -1,0 +1,310 @@
+@main
+
+#crypto/sha256
+#encoding/json
+#net/http
+#os
+#strconv
+#strings
+
+pub const MODERATION_ALLOW = 1
+pub const MODERATION_FLAG = 2
+pub const MODERATION_UNAVAILABLE = 3
+pub const MODERATION_REVIEWED = 4
+
+pub struct ModerationJob {
+    pub text string
+    pub result chan int
+}
+
+pub fn valid_moderation_endpoint(endpoint &string) bool {
+    if strings.has_prefix(endpoint, "https://") {
+        << extract_https_host(endpoint).len > 0
+    }
+    if !strings.has_prefix(endpoint, "http://") { << false }
+    as_https := "https://" + endpoint[7:endpoint.len]
+    host := extract_https_host(&as_https)
+    << host == "127.0.0.1" || host == "::1"
+}
+
+pub fn moderation_worker(ch chan ModerationJob, endpoint string, secret string, model string) {
+    while true {
+        job := <-ch
+        job.result <- classify_public_text(endpoint + "", secret + "", &model, &job.text)
+    }
+}
+
+fn classify_public_text(endpoint string, secret string, model &string, input &string) int {
+    if endpoint.len == 0 { << MODERATION_UNAVAILABLE }
+    $client := http.new_client()
+    client.set_timeout(6000000000)
+    client.max_redirects = -1
+    client.max_response_bytes = 32768
+    $headers := "Content-Type: application/json\r\n"
+    if secret.len > 0 {
+        headers = headers + "Authorization: Bearer " + secret + "\r\n"
+    }
+    body := "{\"model\":" + json.quote(model) + ",\"input\":" + json.quote(input) + "}"
+    resp := client.do_extra("POST", endpoint, headers, &body) or (err) { << MODERATION_UNAVAILABLE }
+    client.close_idle_connections()
+    if resp.status_code != 200 { << MODERATION_UNAVAILABLE }
+    raw := resp.body()
+    doc := json.parse(&raw)
+    if !doc.ok() || !doc.is_dict(doc.root()) { << MODERATION_UNAVAILABLE }
+    results := doc.get(doc.root(), "results")
+    if !doc.is_list(results) || doc.count(results) != 1 { << MODERATION_UNAVAILABLE }
+    item := doc.at(results, 0)
+    if !doc.is_dict(item) { << MODERATION_UNAVAILABLE }
+    val := doc.get(item, "flagged")
+    if !doc.is_bool(val) { << MODERATION_UNAVAILABLE }
+    flagged := doc.as_bool(val) or (err) { << MODERATION_UNAVAILABLE }
+    if flagged { << MODERATION_FLAG }
+    << MODERATION_ALLOW
+}
+
+pub struct ModerationPool {
+    pub jobs chan ModerationJob
+    pub slots chan int
+}
+
+pub fn get_moderation_verdict(pool &ModerationPool, input string) int {
+    select {
+        pool.slots <- 1 {}
+        else { << MODERATION_UNAVAILABLE }
+    }
+    result := chan int{cap: 1}
+    pool.jobs <- ModerationJob{text: input, result: result}
+    verdict := <-result
+    _ := <-pool.slots
+    << verdict
+}
+
+pub fn is_public_write(req &HttpReq) bool {
+    if req.method() != "POST" { << false }
+    path := path_only(req.path())
+    parts := strings.split(&path, "/")
+    if parts.len != 5 || parts[1] != "v1" { << false }
+    << (parts[2] == "channels" && parts[4] == "posts") || (parts[2] == "threads" && parts[4] == "replies")
+}
+
+fn review_key(req &HttpReq) string {
+    actor := strings.trim_space(&req.header("X-Agent-Id"))
+    digest := sha256.sum256(req.body())
+    << sha256.sum256(actor + "\n" + req.method() + "\n" + req.path() + "\n" + digest)
+}
+
+fn approvals_dir(st &State) string {
+    << moderation_dir(st) + "/approvals"
+}
+
+struct ReviewApproval {
+    available bool
+    date string
+    receipt string
+}
+
+fn empty_review_approval() ReviewApproval {
+    << ReviewApproval{available: false, date: "", receipt: ""}
+}
+
+fn parse_approval_pointer(st &State, raw &string, now int) ReviewApproval {
+    parts := strings.split(raw, "/")
+    if parts.len != 2 || !case_date_retained(st, &parts[0], now) || !is_receipt_id(&parts[1]) {
+        << empty_review_approval()
+    }
+    decision := read_case_decision(st, parts[0] + "", parts[1] + "")
+    if decision.status != "approved" || decision.expires_at <= now { << empty_review_approval() }
+    << ReviewApproval{available: true, date: parts[0] + "", receipt: parts[1] + ""}
+}
+
+fn find_review_approval(st &State, key string, now int) ReviewApproval {
+    today := utc_date_from_unix(now)
+    dir := approvals_dir(st)
+    current := read_file_or_empty(dir + "/" + today + "/" + key)
+    if current.len > 0 { << parse_approval_pointer(st, &current, now) }
+    yesterday := shift_utc_date(today, -1)
+    previous := read_file_or_empty(dir + "/" + yesterday + "/" + key)
+    if previous.len > 0 { << parse_approval_pointer(st, &previous, now) }
+
+    // Keep one-time approvals already issued by the previous release usable.
+    legacy := read_file_or_empty(dir + "/" + key)
+    expires := strconv.atoi(&legacy) or (err) { << empty_review_approval() }
+    << ReviewApproval{available: expires > now, date: "", receipt: ""}
+}
+
+pub fn moderation_approval(st &State, req &HttpReq, now int) bool {
+    << find_review_approval(st, review_key(req), now).available
+}
+
+pub fn consume_moderation_approval(st &State, req &HttpReq, now int) bool {
+    key := review_key(req)
+    approval := find_review_approval(st, key + "", now)
+    if !approval.available { << false }
+    if approval.receipt.len == 0 {
+        _ := os.remove(approvals_dir(st) + "/" + key) or (err) { << false }
+        << true
+    }
+    previous := read_case_decision(st, approval.date + "", approval.receipt + "")
+    used := CaseDecision{status: "approval_used", reason: previous.reason + "", decided_at: previous.decided_at, expires_at: 0}
+    << save_case_decision(st, approval.date + "", approval.receipt + "", &used)
+}
+
+fn legacy_review_expiry(raw &string) int {
+    << strconv.atoi(raw) or (err) { << 0 }
+}
+
+pub fn handle_own_review(st $&State, req &HttpReq, now int) HttpResp {
+    if req.method() != "GET" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+    au := authenticate_scoped(st, req, now, "")
+    if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
+    date := query_param_str(req.path(), "date", "")
+    id := query_param_str(req.path(), "receipt", "")
+    if !case_date_retained(st, &date, now) || !is_receipt_id(&id) {
+        << err_resp(404, "ERR_NOT_FOUND", "review not found", 0, 0, 0)
+    }
+    raw := read_file_or_empty(report_path(st, date + "", id + ""))
+    report := json.parse(&raw)
+    if !report.ok() || json_str_or(&report, report.get(report.root(), "source"), "") != "ai" ||
+       json_str_or(&report, report.get(report.root(), "agent_id"), "") != au.agent_id {
+        << err_resp(404, "ERR_NOT_FOUND", "review not found", 0, 0, 0)
+    }
+    $state := read_case_decision(st, date + "", id + "")
+    if state.status == "approved" && state.expires_at <= now { state.status = "expired" }
+    if state.status == "pending" {
+        key := json_str_or(&report, report.get(report.root(), "review_key"), "")
+        if is_valid_sha256_hex(&key) {
+            legacy := read_file_or_empty(approvals_dir(st) + "/" + key)
+            expires := legacy_review_expiry(&legacy)
+            if expires > now {
+                state.status = "approved"
+                state.expires_at = expires
+            }
+        }
+    }
+    out := decision_json(&state)
+    << http_resp(200, "application/json; charset=utf-8", PUBLIC_CONTENT_CACHE, &out)
+}
+
+pub fn queue_ai_review(st $&State, req &HttpReq, now int) HttpResp {
+    key := review_key(req)
+    date := utc_date_from_unix(now)
+    index_path := moderation_dir(st) + "/review-index/" + date + "/" + key
+    existing := read_file_or_empty(index_path + "")
+    if is_receipt_id(&existing) {
+        state := read_case_decision(st, date + "", existing + "")
+        if state.status == "rejected" || state.status == "approval_used" {
+            << existing_review_response(date + "", existing, state.status + "")
+        }
+        if state.status == "approved" && state.expires_at <= now {
+            << existing_review_response(date + "", existing, "expired")
+        }
+        << review_pending(date + "", existing)
+    }
+    if !report_rate_allowed(st, req.remote_ip + "", now, true) {
+        << err_resp(429, "ERR_RATE_LIMITED", "content review queue limit reached", 600, 0, 0)
+    }
+    doc := json.parse(&req.req_body)
+    if !doc.ok() { << err_resp(400, "ERR_BAD_REQUEST", "invalid public request", 0, 0, 0) }
+    input := json_str_or(&doc, doc.get(doc.root(), "text"), "")
+    aid := strings.trim_space(&req.header("X-Agent-Id"))
+    path := path_only(req.path())
+    body := "{\"source\":\"ai\",\"agent_id\":" + json.quote(&aid) + ",\"target\":" + json.quote(&path) +
+        ",\"review_key\":" + json.quote(&key) + ",\"text\":" + json.quote(&input) +
+        ",\"created_at\":" + strconv.itoa(now) + "}\n"
+    id := save_report(st, date + "", &body)
+    if id.len == 0 {
+        << err_resp(503, "ERR_MODERATION_UNAVAILABLE", "content review is unavailable", 0, 0, 0)
+    }
+    mkdir_all_quiet(moderation_dir(st) + "/review-index/" + date)
+    write_atomic_quiet(index_path, &id)
+    << review_pending(date, id)
+}
+
+fn review_pending(date string, id string) HttpResp {
+    detail := "Content was queued for review. Receipt " + date + "/" + id
+    out := "{\"error\":{\"code\":\"ERR_CONTENT_REVIEW\",\"message\":" + json.quote(&detail) + "}," +
+        "\"receipt\":" + json.quote(&id) + ",\"date\":" + json.quote(&date) + "}"
+    << http_resp(422, "application/json; charset=utf-8", PUBLIC_CONTENT_CACHE, &out)
+}
+
+fn existing_review_response(date string, id string, status string) HttpResp {
+    detail := "Review status " + status + ". Receipt " + date + "/" + id
+    out := "{\"error\":{\"code\":\"ERR_CONTENT_REVIEW\",\"message\":" + json.quote(&detail) + "}," +
+        "\"receipt\":" + json.quote(&id) + ",\"date\":" + json.quote(&date) + ",\"status\":" + json.quote(&status) + "}"
+    << http_resp(422, "application/json; charset=utf-8", PUBLIC_CONTENT_CACHE, &out)
+}
+
+fn remove_review_approval(path string) bool {
+    _ := os.remove(path) or (err) { << os.is_not_exist(err.msg()) }
+    << true
+}
+
+pub fn handle_ai_review_admin(hub $&HubState, req &HttpReq, date string, id string, now int) HttpResp {
+    if req.method() != "PUT" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+    if !case_date_retained(&hub.st, &date, now) || !is_receipt_id(&id) {
+        << err_resp(400, "ERR_BAD_REQUEST", "invalid date or receipt", 0, 0, 0)
+    }
+    raw := os.read(report_path(&hub.st, date + "", id + "")) or (err) {
+        << err_resp(404, "ERR_NOT_FOUND", "review not found", 0, 0, 0)
+    }
+    report := json.parse(&raw)
+    if !report.ok() || json_str_or(&report, report.get(report.root(), "source"), "") != "ai" {
+        << err_resp(404, "ERR_NOT_FOUND", "review not found", 0, 0, 0)
+    }
+    key := json_str_or(&report, report.get(report.root(), "review_key"), "")
+    if !is_valid_sha256_hex(&key) {
+        << err_resp(500, "ERR_INTERNAL", "review record is invalid", 0, 0, 0)
+    }
+    doc := json.parse(&req.req_body)
+    if !doc.ok() || !doc.is_dict(doc.root()) {
+        << err_resp(400, "ERR_BAD_REQUEST", "decision must be a JSON object", 0, 0, 0)
+    }
+    action := json_str_or(&doc, doc.get(doc.root(), "action"), "")
+    reason := json_str_or(&doc, doc.get(doc.root(), "reason"), "")
+    if (action != "approve" && action != "reject") || !is_valid_tag(&reason) {
+        << err_resp(400, "ERR_BAD_REQUEST", "action must be approve or reject and reason must be a short code", 0, 0, 0)
+    }
+    author := json_str_or(&report, report.get(report.root(), "agent_id"), "")
+    if !is_valid_agent_id(author + "") {
+        << err_resp(500, "ERR_INTERNAL", "review author is invalid", 0, 0, 0)
+    }
+    previous := read_case_decision(&hub.st, date + "", id + "")
+    if previous.status == "approval_used" {
+        << err_resp(409, "ERR_CONFLICT", "review approval has already been used", 0, 0, 0)
+    }
+    $status := "rejected"
+    if action == "approve" { status = "approved" }
+    if previous.status == status && previous.reason == reason {
+        << review_decision_response(hub, author, date, id, action, &previous, now)
+    }
+    if !remove_review_approval(approvals_dir(&hub.st) + "/" + key) {
+        << err_resp(500, "ERR_INTERNAL", "could not revoke legacy approval", 0, 0, 0)
+    }
+    $decision := CaseDecision{status: "rejected", reason: reason + "", decided_at: now, expires_at: 0}
+    if action == "approve" {
+        dir := approvals_dir(&hub.st) + "/" + utc_date_from_unix(now)
+        os.mkdir_all(dir + "") or (err) {
+            << err_resp(500, "ERR_INTERNAL", "could not save review approval", 0, 0, 0)
+        }
+        // The pointer grants permission only after the decision is committed.
+        pointer := date + "/" + id
+        write_atomic_mode(dir + "/" + key, &pointer, 384) or (err) {
+            << err_resp(500, "ERR_INTERNAL", "could not save review approval", 0, 0, 0)
+        }
+        decision.status = "approved"
+        decision.expires_at = now + 86400
+    }
+    if !save_case_decision(&hub.st, date + "", id + "", &decision) {
+        << err_resp(500, "ERR_INTERNAL", "could not save review decision", 0, 0, 0)
+    }
+    log_admin_action(hub, req, now, "review_" + action, id + "", reason)
+    << review_decision_response(hub, author, date, id, action, &decision, now)
+}
+
+fn review_decision_response(hub $&HubState, author string, date string, id string, action string, decision &CaseDecision, now int) HttpResp {
+    notice := "{\"kind\":\"review_decision\",\"receipt\":" + json.quote(&id) +
+        ",\"date\":" + json.quote(&date) + ",\"decision\":" + decision_json(decision) + "}"
+    recorded := record_moderation_notice(hub, author, &notice, decision.decided_at, now)
+    << json_resp(200, "{\"receipt\":" + json.quote(&id) + ",\"action\":" + json.quote(&action) +
+        ",\"decision\":" + decision_json(decision) + ",\"notice_recorded\":" + recorded + "}")
+}

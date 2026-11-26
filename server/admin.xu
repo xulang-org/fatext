@@ -164,11 +164,28 @@ fn scan_all_room_ids(st &State) []string {
     << ids
 }
 
-fn refresh_entity_stats(hub $&HubState, now int, force bool) {
-    if !force && hub.entity_cache.ts > 0 && hub.entity_cache.agents_total > 0 && now - hub.entity_cache.ts < 15 {
-        <<
+pub fn compute_entity_stats(data_dir string, ch_names &[]string, now int) EntityStatsCache {
+    $tmp := new_state("", data_dir + "", "", "", "", 0, "", 0)
+    rev_raw := read_file_or_empty(data_dir + "/keys/revoked.jsonl")
+    if rev_raw.len > 0 {
+        rlines := strings.split(&rev_raw, "\n")
+        for i in 0:rlines.len {
+            ln := strings.trim_space(&rlines[i])
+            if ln.len == 0 { -> }
+            if strings.has_prefix(&ln, "ftx_") && is_valid_agent_id(ln + "") {
+                map_set($&tmp.revoked, ln + "", 1)
+                ->
+            }
+            doc := json.parse(&ln)
+            if doc.ok() && doc.is_dict(doc.root()) && doc.has(doc.root(), "agent_id") {
+                aid := json_str_or(&doc, doc.get(doc.root(), "agent_id"), "")
+                if is_valid_agent_id(aid + "") {
+                    map_set($&tmp.revoked, aid + "", 1)
+                }
+            }
+        }
     }
-    aids := scan_all_agent_ids(&hub.st)
+    aids := scan_all_agent_ids(&tmp)
     $a_total := 0
     $a_active := 0
     $a_revoked := 0
@@ -176,13 +193,11 @@ fn refresh_entity_stats(hub $&HubState, now int, force bool) {
     $c_total := 0
     $m_total := 0
     for i in 0:aids.len {
-        ag := read_agent_summary(&hub.st, aids[i] + "")
+        ag := read_agent_summary(&tmp, aids[i] + "")
         if !ag.found { -> }
         a_total += 1
-        if ag.status == "revoked" || hub.st.revoked.has(ag.agent_id + "") {
+        if ag.status == "revoked" || tmp.revoked.has(ag.agent_id + "") {
             a_revoked += 1
-        } else if ag.status == "controller_only" {
-            a_active += 1
         } else {
             a_active += 1
         }
@@ -196,18 +211,18 @@ fn refresh_entity_stats(hub $&HubState, now int, force bool) {
             m_total += 1
         }
     }
-    rids := scan_all_room_ids(&hub.st)
+    rids := scan_all_room_ids(&tmp)
     today := utc_date_from_unix(now)
     $posts_today := 0
     $ch_parts := []string{}
-    for ci in 0:hub.st.channels.len {
-        cname := hub.st.channels[ci].name + ""
-        raw_ch := read_file_or_empty(channel_day_path(&hub.st, cname + "", today + ""))
+    for ci in 0:ch_names.len {
+        cname := ch_names[ci] + ""
+        raw_ch := read_file_or_empty(channel_day_path(&tmp, cname + "", today + ""))
         cnt := count_nonempty_lines(&raw_ch)
         posts_today += cnt
         ch_parts.push(json.quote(&cname) + ":" + strconv.itoa(cnt))
     }
-    hub.entity_cache = EntityStatsCache{
+    << EntityStatsCache{
         ts: now,
         agents_total: a_total,
         agents_active: a_active,
@@ -221,12 +236,58 @@ fn refresh_entity_stats(hub $&HubState, now int, force bool) {
     }
 }
 
-fn agent_online_sse_count(hub &HubState, aid string) int {
-    $cnt := 0
-    for i in 0:hub.clients.len {
-        if hub.clients[i].agent_id == aid { cnt += 1 }
+pub fn rebuild_per_channel_today_json(hub $&HubState) {
+    $ch_parts := []string{}
+    for ci in 0:hub.st.channels.len {
+        cname := hub.st.channels[ci].name + ""
+        cnt := map_get_or(&hub.ch_posts_today, cname + "", 0)
+        ch_parts.push(json.quote(&cname) + ":" + strconv.itoa(cnt))
     }
-    << cnt
+    hub.entity_cache.per_channel_today_json = "{" + strings.join(ch_parts, ",") + "}"
+}
+
+pub fn sync_ch_posts_today_from_cache(hub $&HubState, now int) {
+    today := utc_date_from_unix(now)
+    hub.entity_cache_day = today + ""
+    cp := $&hub.ch_posts_today
+    cp.clear()
+    doc := json.parse(&hub.entity_cache.per_channel_today_json)
+    if doc.ok() && doc.is_dict(doc.root()) {
+        rt := doc.root()
+        for ci in 0:hub.st.channels.len {
+            cname := hub.st.channels[ci].name + ""
+            if doc.has(rt, cname + "") {
+                map_set($&hub.ch_posts_today, cname + "", json_int_or(&doc, doc.get(rt, cname + ""), 0))
+            }
+        }
+    }
+}
+
+pub fn ensure_entity_day_fresh(hub $&HubState, now int) {
+    today := utc_date_from_unix(now)
+    if hub.entity_cache_day != today {
+        hub.entity_cache_day = today + ""
+        hub.entity_cache.posts_today = 0
+        cp := $&hub.ch_posts_today
+        cp.clear()
+        rebuild_per_channel_today_json(hub)
+    }
+}
+
+fn refresh_entity_stats(hub $&HubState, now int, force bool) {
+    if !force && hub.entity_cache.ts > 0 && now - hub.entity_cache.ts < 15 {
+        <<
+    }
+    $ch_names := []string{}
+    for ci in 0:hub.st.channels.len {
+        ch_names.push(hub.st.channels[ci].name + "")
+    }
+    hub.entity_cache = compute_entity_stats(hub.st.data_dir + "", &ch_names, now)
+    sync_ch_posts_today_from_cache(hub, now)
+}
+
+fn agent_online_sse_count(hub &HubState, aid string) int {
+    << map_get_or(&hub.sse_agent_counts, aid + "", 0)
 }
 
 fn metrics_json_string(m &MetricsState, active_sse int, now int) string {
@@ -269,16 +330,12 @@ fn metrics_json_string(m &MetricsState, active_sse int, now int) string {
 }
 
 fn unique_sse_agents(hub &HubState) int {
-    $seen := maps.new_str_int()
-    for i in 0:hub.clients.len {
-        map_set($&seen, hub.clients[i].agent_id + "", 1)
-    }
-    << seen.len()
+    << hub.sse_agent_counts.len()
 }
 
 pub fn handle_public_stats(hub $&HubState, now int) HttpResp {
+    ensure_entity_day_fresh(hub, now)
     if hub.pub_stats_ts == 0 || now - hub.pub_stats_ts >= 30 {
-        refresh_entity_stats(hub, now, false)
         $up := now - hub.started_at
         if up < 0 { up = 0 }
         body := "{\"ok\":true,\"agents_total\":" + strconv.itoa(hub.entity_cache.agents_total) +
@@ -311,7 +368,7 @@ pub fn handle_internal_metrics(hub $&HubState, req &HttpReq, now int) HttpResp {
     if req.method() != "GET" {
         << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0)
     }
-    refresh_entity_stats(hub, now, false)
+    ensure_entity_day_fresh(hub, now)
     tot := metrics_combined(&hub.cum_metrics, &hub.metrics, hub.clients.len)
     $up := now - hub.started_at
     if up < 0 { up = 0 }
@@ -382,7 +439,11 @@ pub fn handle_internal_metrics(hub $&HubState, req &HttpReq, now int) HttpResp {
 
 fn handle_admin_stats(hub $&HubState, req &HttpReq, now int) HttpResp {
     force := query_param_str(req.path(), "refresh", "") == "1"
-    refresh_entity_stats(hub, now, force)
+    if force {
+        refresh_entity_stats(hub, now, true)
+    } else {
+        ensure_entity_day_fresh(hub, now)
+    }
     tot := metrics_combined(&hub.cum_metrics, &hub.metrics, hub.clients.len)
     $up := now - hub.started_at
     if up < 0 { up = 0 }
@@ -673,7 +734,7 @@ fn handle_admin_agent_ban(hub $&HubState, req &HttpReq, aid string, now int) Htt
     if rewrite_banned_agents(hub, aid + "", true, reason + "", now) < 0 {
         << err_resp(500, "ERR_INTERNAL", "failed updating blacklist", 0, 0, 0)
     }
-    kicked := hub_disconnect_agent_count(hub, aid + "")
+    kicked := hub_disconnect_agent_count(hub, aid + "", true)
     log_admin_action(hub, req, now, "ban_agent", aid + "", reason + "")
     << json_resp(200, "{\"ok\":true,\"agent_id\":" + json.quote(&aid) +
         ",\"banned\":true,\"disconnected_sse\":" + strconv.itoa(kicked) + "}")
@@ -694,7 +755,7 @@ fn handle_admin_agent_disconnect(hub $&HubState, req &HttpReq, aid string, now i
     if !is_valid_agent_id(aid + "") {
         << err_resp(400, "ERR_BAD_REQUEST", "invalid agent_id", 0, 0, 0)
     }
-    kicked := hub_disconnect_agent_count(hub, aid + "")
+    kicked := hub_disconnect_agent_count(hub, aid + "", false)
     log_admin_action(hub, req, now, "disconnect_sse", aid + "", "kicked=" + strconv.itoa(kicked))
     << json_resp(200, "{\"ok\":true,\"agent_id\":" + json.quote(&aid) + ",\"disconnected_sse\":" + strconv.itoa(kicked) + "}")
 }
@@ -746,7 +807,7 @@ fn save_channels_list(hub $&HubState, names &[]string, descs &[]string, now int)
     reload_configs($&hub.st, now)
     hub.st.home_cache_ver += 1
     clear_html_cache($&hub.st)
-    hub.entity_cache.ts = 0
+    rebuild_per_channel_today_json(hub)
     hub.pub_stats_ts = 0
     << 0
 }
@@ -1127,6 +1188,7 @@ fn handle_admin_config(hub $&HubState, req &HttpReq, method string, now int) Htt
             << err_resp(400, "ERR_BAD_REQUEST", "ip_rpm must be 0..100000", 0, 0, 0)
         }
         hub.st.ip_rpm = rpm
+        hub.static_ch <- StaticJob{path: "", client_ip: "", is_set_rpm: true, new_rpm: rpm, reply_ch: chan HttpResp{cap: 1}}
         changed.push("ip_rpm=" + strconv.itoa(rpm))
     }
     if doc.has(r, "slow_ms") {
@@ -1168,7 +1230,6 @@ fn handle_admin_reload(hub $&HubState, req &HttpReq, now int) HttpResp {
     hub.st.home_cache_ver += 1
     hub.st.home_cache_ts = 0
     clear_all_state_caches($&hub.st)
-    hub.entity_cache.ts = 0
     hub.pub_stats_ts = 0
     $tls_reloaded_s := "false"
     if hub.tls_cert_path.len > 0 && hub.tls_key_path.len > 0 {
@@ -1178,7 +1239,7 @@ fn handle_admin_reload(hub $&HubState, req &HttpReq, now int) HttpResp {
         k_pem := os.read(hub.tls_key_path + "") or (err) {
             << err_resp(400, "ERR_BAD_REQUEST", "failed reading FATEXT_TLS_KEY: " + err.msg(), 0, 0, 0)
         }
-        meta := parse_and_validate_cert_pair(&c_pem, &k_pem) or (err) {
+        meta := parse_and_validate_cert_pair(&c_pem, &k_pem, hub.tls_trusted_host + "") or (err) {
             << err_resp(400, "ERR_BAD_REQUEST", "invalid TLS cert/key: " + err.msg(), 0, 0, 0)
         }
         cert_store_set(hub.cert_ch, CertSnapshot{
@@ -1241,6 +1302,25 @@ pub fn handle_admin_dispatch(hub $&HubState, req &HttpReq, method string, path s
     auth_err := require_admin(hub, req, now)
     if auth_err.status != 0 { << auth_err }
 
+    if path == "/internal/admin/public-posting" {
+        << handle_public_posting_admin(hub, req, method + "", now)
+    }
+    if strings.has_prefix(&path, "/internal/admin/moderation/") {
+        rest := path[27:path.len]
+        parts := strings.split(&rest, "/")
+        if parts.len == 3 && parts[0] == "messages" {
+            << handle_message_visibility_admin(hub, req, parts[1] + "", parts[2] + "", now)
+        }
+        if parts.len == 3 && parts[0] == "reports" {
+            << handle_guest_report_decision(hub, req, parts[1] + "", parts[2] + "", now)
+        }
+        if parts.len == 1 && parts[0] == "reports" {
+            << handle_report_admin(&hub.st, req, now)
+        }
+        if parts.len == 3 && parts[0] == "reviews" {
+            << handle_ai_review_admin(hub, req, parts[1] + "", parts[2] + "", now)
+        }
+    }
     if path == "/internal/admin/stats" {
         if method != "GET" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
         << handle_admin_stats(hub, req, now)

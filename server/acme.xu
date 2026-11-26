@@ -105,7 +105,7 @@ fn truncate_acme_str(s &string, max_len int) string {
     << s[0:max_len] + "...(truncated)"
 }
 
-pub fn parse_and_validate_cert_pair(cert_pem &string, key_pem &string) CertMeta {
+pub fn parse_and_validate_cert_pair(cert_pem &string, key_pem &string, trusted_host string) CertMeta {
     $cert_ders := []string{}
     $rem := cert_pem + ""
     while rem.len > 0 {
@@ -125,8 +125,10 @@ pub fn parse_and_validate_cert_pair(cert_pem &string, key_pem &string) CertMeta 
         >> errors.new("tls: no CERTIFICATE PEM block found")
     }
     cert := x509.parse_certificate(cert_ders[0] + "") or >>
+    $intermediates := x509.new_cert_pool()
     for ci in 1:cert_ders.len {
-        _ := x509.parse_certificate(cert_ders[ci] + "") or >>
+        issuer := x509.parse_certificate(cert_ders[ci] + "") or >>
+        intermediates.add(issuer)
     }
     priv := decode_rsa_private_pem(key_pem) or >>
     want_spki := encode_rsa_spki_der(&priv.public) or >>
@@ -134,14 +136,25 @@ pub fn parse_and_validate_cert_pair(cert_pem &string, key_pem &string) CertMeta 
         >> errors.new("tls: certificate public key does not match private key")
     }
 
-    now_v := time.now_time().unix()
+    now := time.now_time()
+    now_v := now.unix()
     nb := cert.not_before.unix()
     na := cert.not_after.unix()
     if na <= nb {
         >> errors.new("tls: certificate has invalid validity window")
     }
-    if nb > now_v + 300 {
+    if nb > now_v {
         >> errors.new("tls: certificate is not yet valid")
+    }
+    if na <= now_v {
+        >> errors.new("tls: certificate is expired")
+    }
+    if trusted_host.len > 0 {
+        if cert.dns_names.len == 0 {
+            >> errors.new("tls: certificate must have a DNS subjectAltName")
+        }
+        roots := x509.system_cert_pool()
+        cert.verify_with_pools(trusted_host, now, &roots, &intermediates) or >>
     }
 
     $dns_list := []string{}
@@ -151,12 +164,6 @@ pub fn parse_and_validate_cert_pair(cert_pem &string, key_pem &string) CertMeta 
         if d.len > 0 && !seen.has(d + "") {
             map_set($&seen, d + "", 1)
             dns_list.push(d)
-        }
-    }
-    if dns_list.len == 0 && cert.subject.common_name.len > 0 {
-        cn := strings.to_lower(&strings.trim_space(&cert.subject.common_name))
-        if cn.len > 0 {
-            dns_list.push(cn)
         }
     }
     $for_csv := []string{}
@@ -259,6 +266,7 @@ pub fn acme_chal_get(ch chan AcmeChalMsg, token string) string {
 }
 
 pub struct AcmeConfig {
+    pub trusted_host string
     pub domains []string
     pub email string
     pub acme_dir string
@@ -863,14 +871,11 @@ pub fn acme_issue_and_install(cfg &AcmeConfig, chal_ch chan AcmeChalMsg, cert_ch
     }
     cert_pem := dl_r.body + ""
 
-    meta := parse_and_validate_cert_pair(&cert_pem, &key_pem) or >>
+    meta := parse_and_validate_cert_pair(&cert_pem, &key_pem, cfg.trusted_host + "") or >>
     if !cert_covers_domains(&meta, &cfg.domains) {
         >> errors.new("acme: issued certificate does not cover all configured domains")
     }
     now := time.now_time().unix()
-    if meta.not_after <= now {
-        >> errors.new("acme: issued certificate is already expired")
-    }
 
     ensure_dir_mode(cfg.acme_dir + "", 448) or >>
     write_atomic_mode(cfg.acme_dir + "/privkey.pem", &key_pem, 384) or >>
@@ -902,9 +907,8 @@ pub fn acme_try_load_cached(cfg &AcmeConfig, cert_ch chan CertStoreMsg, log_ch c
     cert_pem := os.read(cert_path + "") or (err) { << false }
     key_pem := os.read(key_path + "") or (err) { << false }
     if cert_pem.len == 0 || key_pem.len == 0 { << false }
-    meta := parse_and_validate_cert_pair(&cert_pem, &key_pem) or (err) { << false }
+    meta := parse_and_validate_cert_pair(&cert_pem, &key_pem, cfg.trusted_host + "") or (err) { << false }
     now := time.now_time().unix()
-    if meta.not_after <= now { << false }
     if !cert_covers_domains(&meta, &cfg.domains) { << false }
 
     cert_store_set(cert_ch, CertSnapshot{

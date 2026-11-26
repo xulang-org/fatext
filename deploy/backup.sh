@@ -17,22 +17,47 @@ if [[ ! -d "$DATA_DIR" ]]; then
 fi
 
 mkdir -p "$BACKUP_DIR"
-chmod 0700 "$BACKUP_DIR"
+if [[ $EUID -eq 0 || -O "$BACKUP_DIR" ]]; then
+  chmod 0700 "$BACKUP_DIR"
+fi
 trap 'rm -f "$TMP"' EXIT
 
 ITEMS=()
-for name in keys friends mail docs rooms blacklist public; do
+for name in keys friends mail docs rooms blacklist public registration-work; do
   if [[ -e "${DATA_DIR}/${name}" ]]; then
     ITEMS+=("$name")
   fi
 done
+if [[ "${FATEXT_BACKUP_SKIP_ACME:-0}" != 1 && -d "${DATA_DIR}/acme" ]]; then
+  ITEMS+=("acme")
+fi
 
 if [[ ${#ITEMS[@]} -eq 0 ]]; then
   echo "Error: no persistent fatext state entries found in ${DATA_DIR}" >&2
   exit 1
 fi
 
-tar -C "$DATA_DIR" -czf "$TMP" "${ITEMS[@]}"
+for name in hidden.json posting.json recovery-required; do
+  if [[ -f "${DATA_DIR}/moderation/$name" ]]; then
+    ITEMS+=("moderation/$name")
+  fi
+done
+
+TAR_RC=0
+for attempt in 1 2 3; do
+  set +e
+  tar --exclude='*.tmp.*' --exclude='*.tmp' -C "$DATA_DIR" -czf "$TMP" "${ITEMS[@]}"
+  TAR_RC=$?
+  set -e
+  if [[ $TAR_RC -eq 0 ]]; then
+    break
+  elif [[ $TAR_RC -eq 1 && $attempt -lt 3 ]]; then
+    rm -f "$TMP"
+    sleep 1
+  else
+    exit $TAR_RC
+  fi
+done
 tar -tzf "$TMP" >/dev/null
 chmod 0600 "$TMP"
 mv -f "$TMP" "$OUT"

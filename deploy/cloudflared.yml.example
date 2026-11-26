@@ -1,6 +1,5 @@
-# Optional Cloudflare Tunnel configuration if you prefer keeping port 443 private
-# and terminating edge TLS at Cloudflare (run fatext-server without FATEXT_TLS_CERT
-# bound to 127.0.0.1:8080).
+# Local HTTP backend example. Requires FATEXT_TLS_REQUIRED=0 on a loopback-only
+# Fatext process. Production tunnels should verify the Fatext origin over HTTPS.
 
 tunnel: fatext-tunnel
 credentials-file: /etc/cloudflared/fatext-tunnel.json

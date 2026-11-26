@@ -19,7 +19,8 @@ Tests:
      and adding a new SAN domain triggers automatic re-issuance.
   8. Static TLS cert hot-reload via POST /internal/admin/reload (bad cert/key rejected atomically
      without disrupting active cert; valid new cert hot-swapped live).
-  9. Mutual-exclusion startup guard (FATEXT_ACME_DOMAINS + FATEXT_TLS_CERT/KEY fails closed).
+  9. Required native TLS rejects missing config, wrong names and untrusted chains.
+     The graceful-stop hook verifies the configured hostname before sending its secret.
 """
 
 from __future__ import annotations
@@ -762,6 +763,11 @@ def stop_proc(proc: subprocess.Popen) -> None:
             proc.wait()
 
 
+def assert_startup_rejected(env: dict[str, str], expected: str) -> None:
+    result = subprocess.run([str(SERVER_BIN)], env=env, capture_output=True, text=True, timeout=5.0)
+    assert result.returncode != 0 and expected in result.stdout, (expected, result.stdout, result.stderr)
+
+
 def http_port80_raw(port: int, method: str, path: str, host_hdr: str) -> tuple[int, dict[str, str], bytes]:
     conn = http.client.HTTPConnection(HOST, port, timeout=5.0)
     conn.request(method, path, headers={"Host": host_hdr})
@@ -997,6 +1003,29 @@ def main() -> int:
             finally:
                 stop_proc(proc3)
 
+            strict_acme_env = dict(srv_env_expand)
+            strict_acme_env.update({
+                "FATEXT_TLS_REQUIRED": "1",
+                "FATEXT_PUBLIC_HOST": "app.fatext.test",
+                "SSL_CERT_FILE": str(ca.root_crt),
+            })
+            assert_startup_rejected(strict_acme_env, "disallowed http URL")
+            assert_startup_rejected({**strict_acme_env, "FATEXT_ACME_STAGING": "1"}, "disallows ACME staging")
+            assert_startup_rejected({**strict_acme_env, "FATEXT_ACME_INSECURE_TLS": "1"}, "insecure ACME TLS")
+            assert_startup_rejected({
+                **strict_acme_env, "FATEXT_PUBLIC_HOST": "unknown.fatext.test",
+            }, "FATEXT_ACME_DOMAINS must include FATEXT_PUBLIC_HOST")
+            # Require a verified cache hit without contacting a real CA.
+            strict_acme_env["FATEXT_ACME_DIRECTORY_URL"] = "https://acme.fatext.invalid/directory"
+            strict_acme_env["FATEXT_ACME_CHECK_SEC"] = "21600"
+            with subprocess.Popen([str(SERVER_BIN)], env=strict_acme_env, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE) as strict_acme_proc:
+                try:
+                    t_strict = wait_https_ready(https_port, "app.fatext.test", ca.root_crt, strict_acme_proc)
+                    assert_eq(t_strict["serial_hex"], t_exp["serial_hex"], "strict ACME uses the trusted cache")
+                finally:
+                    stop_proc(strict_acme_proc)
+
             # --- Phase 8: Static TLS cert hot-reload via POST /internal/admin/reload ---
             print("[8/8] Testing static TLS cert hot-reload via POST /internal/admin/reload...")
             sa_serial, sa_crt, sa_key = ca.issue_static_cert(["static.fatext.test"], 30)
@@ -1012,6 +1041,9 @@ def main() -> int:
             st_env = os.environ.copy()
             st_env.update({
                 "FATEXT_ADDR": f"{HOST}:{st_https_port}",
+                "FATEXT_TLS_REQUIRED": "1",
+                "FATEXT_PUBLIC_HOST": "static.fatext.test",
+                "SSL_CERT_FILE": str(ca.root_crt),
                 "FATEXT_TLS_CERT": str(st_crt_p),
                 "FATEXT_TLS_KEY": str(st_key_p),
                 "FATEXT_DATA_DIR": str(st_data_dir),
@@ -1019,7 +1051,17 @@ def main() -> int:
                 "FATEXT_TEMPLATES_DIR": str(TPL_DIR),
                 "FATEXT_POW_BITS": str(POW_BITS),
                 "FATEXT_ADMIN_SECRET": ADMIN_SECRET,
+                "FATEXT_SHUTDOWN_SECRET": "tls-verified-shutdown-fixture",
             })
+            no_tls_env = dict(st_env)
+            no_tls_env.pop("FATEXT_TLS_CERT")
+            no_tls_env.pop("FATEXT_TLS_KEY")
+            assert_startup_rejected(no_tls_env, "FATEXT_TLS_REQUIRED needs native TLS")
+            assert_startup_rejected({**st_env, "FATEXT_PUBLIC_HOST": "unknown.fatext.test"}, "not valid for")
+            st_crt_p.write_text(sa_crt.split("-----END CERTIFICATE-----", 1)[0] + "-----END CERTIFICATE-----\n",
+                                encoding="utf-8")
+            assert_startup_rejected(st_env, "unknown authority")
+            st_crt_p.write_text(sa_crt, encoding="utf-8")
             proc4 = subprocess.Popen([str(SERVER_BIN)], env=st_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             try:
                 ts_a = wait_https_ready(st_https_port, "static.fatext.test", ca.root_crt, proc4)
@@ -1035,8 +1077,22 @@ def main() -> int:
                 _, _, _, ts_still_a = sni_https_request(st_https_port, "static.fatext.test", ca.root_crt, "GET", "/health")
                 assert_eq(int(ts_still_a["serial_hex"], 16), sa_serial, "failed reload must leave active Cert A untouched")
 
+                # A trusted, matching key pair for another domain cannot replace the active cert.
+                st_key_p.write_text(dummy_key, encoding="utf-8")
+                st_crt_p.write_text(dummy_crt, encoding="utf-8")
+                rc_name, _, body_name, _ = sni_https_request(
+                    st_https_port, "static.fatext.test", ca.root_crt, "POST", "/internal/admin/reload", b"",
+                    {"X-Fatext-Admin-Secret": ADMIN_SECRET},
+                )
+                assert rc_name == 400 and b"not valid for" in body_name, (rc_name, body_name)
+                _, _, _, tls_after_name_error = sni_https_request(
+                    st_https_port, "static.fatext.test", ca.root_crt, "GET", "/health",
+                )
+                assert_eq(int(tls_after_name_error["serial_hex"], 16), sa_serial, "wrong domain must leave Cert A active")
+
                 # Now write matching Cert B + Key B -> reload must return 200 & swap immediately!
                 st_crt_p.write_text(sb_crt, encoding="utf-8")
+                st_key_p.write_text(sb_key, encoding="utf-8")
                 rc_ok, _, rel_b, _ = sni_https_request(
                     st_https_port, "static.fatext.test", ca.root_crt, "POST", "/internal/admin/reload", b"",
                     {"X-Fatext-Admin-Secret": ADMIN_SECRET},
@@ -1058,6 +1114,13 @@ def main() -> int:
                 assert_eq(rc_corrupt, 400, "corrupted intermediate certificate reload must return 400")
                 _, _, _, ts_still_b = sni_https_request(st_https_port, "static.fatext.test", ca.root_crt, "GET", "/health")
                 assert_eq(int(ts_still_b["serial_hex"], 16), sb_serial, "failed chain reload must leave active Cert B untouched")
+
+                stop_hook = ["bash", str(ROOT / "deploy" / "graceful_stop.sh")]
+                subprocess.run(stop_hook, env={**st_env, "FATEXT_PUBLIC_HOST": "wrong.fatext.test"},
+                               check=True, timeout=8)
+                assert proc4.poll() is None, "shutdown hook accepted a certificate for the wrong host"
+                subprocess.run(stop_hook, env=st_env, check=True, timeout=8)
+                assert_eq(proc4.wait(timeout=5), 0, "shutdown hook must use the validated TLS connection")
             finally:
                 stop_proc(proc4)
 
@@ -1142,6 +1205,11 @@ def main() -> int:
             held_socks = []
             try:
                 wait_https_ready(iso_https, "static.fatext.test", ca.root_crt, proc5)
+                redir_status, redir_headers, _ = http_port80_raw(
+                    iso_http, "GET", "/health", "www.static.fatext.test",
+                )
+                assert_eq(redir_status, 301, "uncertified alias redirects to the configured public hostname")
+                assert_eq(redir_headers.get("location"), "https://static.fatext.test/health", "redirect uses valid name")
                 for _ in range(2):
                     held_socks.append(socket.create_connection((HOST, iso_http), timeout=5.0))
                 time.sleep(0.1)

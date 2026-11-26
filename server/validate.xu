@@ -577,17 +577,18 @@ pub fn is_safe_webhook_url_static(s &string) bool {
     << true
 }
 
-pub fn is_safe_webhook_url_resolved(s &string) bool {
-    if !is_safe_webhook_url_static(s) { << false }
-    host := extract_https_host(s)
-    if net.parse_ip(&host).len > 0 { << true }
-    ips := net.lookup_ip(host + "") or (err) { << false }
-    if ips.len == 0 { << false }
+// Return the numeric address that the TLS transport must actually dial.
+pub fn resolve_public_webhook_ip(url_s &string) string {
+    if !is_safe_webhook_url_static(url_s) { << "" }
+    host := extract_https_host(url_s)
+    literal := net.parse_ip(&host)
+    if literal.len > 0 { << net.ip_string(&literal) }
+    ips := net.lookup_ip(host + "") or (err) { << "" }
+    if ips.len == 0 { << "" }
     for i in 0:ips.len {
-        ip := ips[i] + ""
-        if !is_public_ip_bytes(&ip) { << false }
+        if !is_public_ip_bytes(&ips[i]) { << "" }
     }
-    << true
+    << net.ip_string(&ips[0])
 }
 
 fn ext_err(code string, msg string) ExtValidation {

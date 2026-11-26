@@ -98,33 +98,110 @@ pub fn const_time_str_eq(a &string, b &string) bool {
     << diff == 0
 }
 
+struct InflightMsg {
+    delta int
+    is_wait bool
+    reply_ch chan int
+}
+
+fn inflight_loop(ch chan InflightMsg) {
+    $active := 0
+    $waiters := []chan int{}
+    while true {
+        msg := <-ch
+        if msg.is_wait {
+            if active <= 0 {
+                msg.reply_ch <- 1
+            } else {
+                waiters.push(msg.reply_ch)
+            }
+        } else {
+            active += msg.delta
+            if active < 0 { active = 0 }
+            if active == 0 && waiters.len > 0 {
+                for i in 0:waiters.len {
+                    waiters[i] <- 1
+                }
+                waiters = []chan int{}
+            }
+        }
+    }
+}
+
+fn inflight_add(ch chan InflightMsg, delta int) {
+    ch <- InflightMsg{delta: delta, is_wait: false, reply_ch: chan int{cap: 1}}
+}
+
+fn wait_inflight_zero(ch chan InflightMsg, timeout_ms int) {
+    wch := chan int{cap: 1}
+    ch <- InflightMsg{delta: 0, is_wait: true, reply_ch: wch}
+    if timeout_ms <= 0 {
+        _ := <-wch
+        <<
+    }
+    tick := time.new_ticker(timeout_ms * 1000000)
+    select {
+        _ := <-wch {}
+        _ := <-tick.c {}
+    }
+    tick.stop()
+}
+
+fn acquire_job_token(tokens chan string, timeout_ms int) bool {
+    $got := false
+    select {
+        _ := <-tokens { got = true }
+        else {}
+    }
+    if got { << true }
+    if timeout_ms <= 0 { << false }
+    tick := time.new_ticker(timeout_ms * 1000000)
+    select {
+        _ := <-tokens { got = true }
+        _ := <-tick.c {}
+    }
+    tick.stop()
+    << got
+}
+
+fn release_job_token(tokens chan string) {
+    tokens <- "1"
+}
+
 struct ConnRuntimeCfg {
     tls_on bool
     tls_hs_ns int
     cert_ch chan CertStoreMsg
     slow_ms int
     trust_proxy bool
+    proxy_header string
     shutdown_secret string
+    ai_moderation bool
+    moderation_pool ModerationPool
+    access_ch chan string
+    job_tokens chan string
+    queue_timeout_ms int
+    inflight_ch chan InflightMsg
 }
 
 fn handle_connection_guarded(fd int, req_seq int, peer_ip string, rcfg ConnRuntimeCfg, gate_ch chan ConnGateMsg, static_ch chan StaticJob, jobs chan HubJob, log_ch chan string, sig_ch chan int) {
-    handle_connection(fd, req_seq, peer_ip + "", rcfg.tls_on, rcfg.tls_hs_ns, rcfg.cert_ch, static_ch, jobs, log_ch, rcfg.slow_ms, rcfg.trust_proxy, rcfg.shutdown_secret + "", sig_ch)
+    handle_connection(fd, req_seq, peer_ip + "", rcfg, static_ch, jobs, log_ch, sig_ch)
     release_conn_slot(gate_ch, peer_ip + "")
 }
 
-fn handle_connection(fd int, req_seq int, peer_ip string, tls_on bool, tls_hs_ns int, cert_ch chan CertStoreMsg, static_ch chan StaticJob, jobs chan HubJob, log_ch chan string, slow_ms int, trust_proxy bool, shutdown_secret string, sig_ch chan int) {
+fn handle_connection(fd int, req_seq int, peer_ip string, rcfg ConnRuntimeCfg, static_ch chan StaticJob, jobs chan HubJob, log_ch chan string, sig_ch chan int) {
     cc_disable_sigpipe(fd)
     t0_ns := time.now()
     req_prefix := "r_" + strconv.itoa(req_seq)
 
     $cc := cc_from_tcp(fd, peer_ip + "")
     $tls_ms := 0
-    if tls_on {
-        csnap := cert_store_get(cert_ch)
-        if !csnap.enabled || csnap.cert_pem.len == 0 || csnap.key_pem.len == 0 {
-            jobs <- HubJob{kind: HUB_METRIC_TLS, req: empty_req(), sse_id: 0, enqueued_ns: 0, flag: 0, reply_ch: chan HubReply{cap: 1}}
-            now_err := time.now_time().unix()
-            no_msg := "no active TLS certificate"
+    if rcfg.tls_on {
+        csnap := cert_store_get(rcfg.cert_ch)
+        now_err := time.now_time().unix()
+        if !csnap.enabled || now_err < csnap.not_before || csnap.not_after <= now_err {
+            jobs <- make_hub_job(HUB_METRIC_TLS, empty_req(), 0, 0, 0, chan HubReply{cap: 1})
+            no_msg := "no currently valid TLS certificate"
             log_event_json(log_ch, now_err, "tls_handshake_fail",
                 "\"req_id\":" + json.quote(&req_prefix) + ",\"ip\":" + json.quote(&peer_ip) +
                 ",\"tls_ms\":0,\"error\":" + json.quote(&no_msg))
@@ -132,10 +209,10 @@ fn handle_connection(fd int, req_seq int, peer_ip string, tls_on bool, tls_hs_ns
             <<
         }
         t_tls0 := time.now()
-        cc = cc_from_tls(fd, &csnap.cert_pem, &csnap.key_pem, peer_ip + "", tls_hs_ns) or (err) {
+        cc = cc_from_tls(fd, &csnap.cert_pem, &csnap.key_pem, peer_ip + "", rcfg.tls_hs_ns) or (err) {
             tls_ms = (time.now() - t_tls0) / 1000000
             if tls_ms < 0 { tls_ms = 0 }
-            jobs <- HubJob{kind: HUB_METRIC_TLS, req: empty_req(), sse_id: 0, enqueued_ns: 0, flag: 0, reply_ch: chan HubReply{cap: 1}}
+            jobs <- make_hub_job(HUB_METRIC_TLS, empty_req(), 0, 0, 0, chan HubReply{cap: 1})
             now_err := time.now_time().unix()
             emsg := err.msg()
             log_event_json(log_ch, now_err, "tls_handshake_fail",
@@ -146,7 +223,7 @@ fn handle_connection(fd int, req_seq int, peer_ip string, tls_on bool, tls_hs_ns
         }
         tls_ms = (time.now() - t_tls0) / 1000000
         if tls_ms < 0 { tls_ms = 0 }
-        jobs <- HubJob{kind: HUB_METRIC_TLS, req: empty_req(), sse_id: 0, enqueued_ns: 0, flag: 1, reply_ch: chan HubReply{cap: 1}}
+        jobs <- make_hub_job(HUB_METRIC_TLS, empty_req(), 0, 0, 1, chan HubReply{cap: 1})
     }
 
     $req_n := 0
@@ -186,14 +263,14 @@ fn handle_connection(fd int, req_seq int, peer_ip string, tls_on bool, tls_hs_ns
                 "\"req_id\":" + json.quote(&req_id) + ",\"ip\":" + json.quote(&peer_ip) +
                 ",\"tls_ms\":" + strconv.itoa(req_tls_ms) + ",\"read_ms\":" + strconv.itoa(rm) +
                 ",\"error\":" + json.quote(&read_err))
-            log_access_json(log_ch, slow_ms, now_r, req_id + "", "?", "/invalid", 400, "ERR_BAD_REQUEST",
-                tls_on, peer_ip + "", "anon", "", 0, r.body.len, req_tls_ms, rm, 0, 0, w_ms, tot_ms, tot_us)
+            log_access_json(rcfg.access_ch, rcfg.slow_ms, now_r, req_id + "", "?", "/invalid", 400, "ERR_BAD_REQUEST",
+                rcfg.tls_on, peer_ip + "", "anon", "", 0, r.body.len, req_tls_ms, rm, 0, 0, w_ms, tot_ms, tot_us)
             <-
         }
         $read_ms := (time.now() - t_read0) / 1000000
         if read_ms < 0 { read_ms = 0 }
 
-        client_ip := effective_client_ip(peer_ip + "", &req, trust_proxy)
+        client_ip := effective_client_ip(peer_ip + "", &req, rcfg.trust_proxy, rcfg.proxy_header + "")
         req.remote_ip = client_ip + ""
         meth := req.method()
         raw_p := req.path()
@@ -202,8 +279,22 @@ fn handle_connection(fd int, req_seq int, peer_ip string, tls_on bool, tls_hs_ns
 
         reply_ch := chan HubReply{cap: 1}
         if path_only(raw_p + "") == "/v1/stream" {
-            jobs <- HubJob{kind: HUB_SSE_SUB, req: req, sse_id: 0, enqueued_ns: time.now(), flag: 0, reply_ch: reply_ch}
+            if !acquire_job_token(rcfg.job_tokens, rcfg.queue_timeout_ms) {
+                r503 := err_resp(503, "ERR_OVERLOADED", "server request queue full", 2, 0, 0)
+                t_w0 := time.now()
+                _ := write_http_resp_ka($&cc, &r503, false)
+                $w_ms := (time.now() - t_w0) / 1000000
+                if w_ms < 0 { w_ms = 0 }
+                $tot_us := (time.now() - req_t0) / 1000
+                if tot_us < 0 { tot_us = 0 }
+                log_access_json(rcfg.access_ch, rcfg.slow_ms, time.now_time().unix(), req_id + "", meth + "", route + "",
+                    503, "ERR_OVERLOADED", rcfg.tls_on, client_ip + "", "anon", "",
+                    req_bytes, r503.body.len, req_tls_ms, read_ms, rcfg.queue_timeout_ms, 0, w_ms, tot_us / 1000, tot_us)
+                <-
+            }
+            jobs <- make_hub_job(HUB_SSE_SUB, req, 0, time.now(), 0, reply_ch)
             rep := <-reply_ch
+            release_job_token(rcfg.job_tokens)
             if !rep.is_sse {
                 t_w0 := time.now()
                 _ := write_http_resp_ka($&cc, &rep.resp, false)
@@ -211,8 +302,8 @@ fn handle_connection(fd int, req_seq int, peer_ip string, tls_on bool, tls_hs_ns
                 if w_ms < 0 { w_ms = 0 }
                 $tot_us := (time.now() - req_t0) / 1000
                 if tot_us < 0 { tot_us = 0 }
-                log_access_json(log_ch, slow_ms, time.now_time().unix(), req_id + "", meth + "", route + "",
-                    rep.resp.status, rep.err_code + "", tls_on, client_ip + "", rep.actor_type + "", rep.actor_id + "",
+                log_access_json(rcfg.access_ch, rcfg.slow_ms, time.now_time().unix(), req_id + "", meth + "", route + "",
+                    rep.resp.status, rep.err_code + "", rcfg.tls_on, client_ip + "", rep.actor_type + "", rep.actor_id + "",
                     req_bytes, rep.resp.body.len, req_tls_ms, read_ms, rep.queue_ms, rep.handle_ms, w_ms, tot_us / 1000, tot_us)
                 <-
             }
@@ -224,12 +315,12 @@ fn handle_connection(fd int, req_seq int, peer_ip string, tls_on bool, tls_hs_ns
             if tot_us < 0 { tot_us = 0 }
             $open_status := 200
             if open_rc < 0 { open_status = 499 }
-            log_access_json(log_ch, slow_ms, time.now_time().unix(), req_id + "", meth + "", route + "",
-                open_status, "", tls_on, client_ip + "", rep.actor_type + "", rep.actor_id + "",
+            log_access_json(rcfg.access_ch, rcfg.slow_ms, time.now_time().unix(), req_id + "", meth + "", route + "",
+                open_status, "", rcfg.tls_on, client_ip + "", rep.actor_type + "", rep.actor_id + "",
                 req_bytes, 0, req_tls_ms, read_ms, rep.queue_ms, rep.handle_ms, w_ms, tot_us / 1000, tot_us)
             if open_rc < 0 {
                 unsub_ch := chan HubReply{cap: 1}
-                jobs <- HubJob{kind: HUB_SSE_UNSUB, req: empty_req(), sse_id: rep.sse_id, enqueued_ns: time.now(), flag: 0, reply_ch: unsub_ch}
+                jobs <- make_hub_job(HUB_SSE_UNSUB, empty_req(), rep.sse_id, time.now(), 0, unsub_ch)
                 _ := <-unsub_ch
                 log_event_json(log_ch, time.now_time().unix(), "sse_close",
                     "\"sse_id\":" + strconv.itoa(rep.sse_id) + ",\"agent_id\":" + json.quote(&rep.actor_id) +
@@ -244,12 +335,24 @@ fn handle_connection(fd int, req_seq int, peer_ip string, tls_on bool, tls_hs_ns
             $close_reason := "peer_closed"
             $alive := true
             while alive {
+                if rep.sse_expires_at > 0 && time.now_time().unix() >= rep.sse_expires_at {
+                    close_reason = "credential_expired"
+                    <-
+                }
+                select {
+                    _ := <-rep.sse_stop {
+                        disc := "event: system\ndata: {\"kind\":\"disconnected\"}\n\n"
+                        _ := cc_write($&cc, &disc)
+                        close_reason = "ctrl_close"
+                        alive = false
+                    }
+                    else {}
+                }
+                if !alive { <- }
                 select {
                     msg := <-rep.sse_ch {
-                        if msg == SSE_CTRL_CLOSE {
-                            disc := "event: system\ndata: {\"kind\":\"disconnected\"}\n\n"
-                            _ := cc_write($&cc, &disc)
-                            close_reason = "ctrl_close"
+                        if rep.sse_expires_at > 0 && time.now_time().unix() >= rep.sse_expires_at {
+                            close_reason = "credential_expired"
                             alive = false
                         } else if msg == SSE_CTRL_SHUTDOWN {
                             sd := "event: system\ndata: {\"kind\":\"shutdown\"}\n\n"
@@ -290,7 +393,7 @@ fn handle_connection(fd int, req_seq int, peer_ip string, tls_on bool, tls_hs_ns
             $sse_dur := (time.now() - sse_t0) / 1000000
             if sse_dur < 0 { sse_dur = 0 }
             unsub_ch := chan HubReply{cap: 1}
-            jobs <- HubJob{kind: HUB_SSE_UNSUB, req: empty_req(), sse_id: rep.sse_id, enqueued_ns: time.now(), flag: 0, reply_ch: unsub_ch}
+            jobs <- make_hub_job(HUB_SSE_UNSUB, empty_req(), rep.sse_id, time.now(), 0, unsub_ch)
             _ := <-unsub_ch
             log_event_json(log_ch, time.now_time().unix(), "sse_close",
                 "\"sse_id\":" + strconv.itoa(rep.sse_id) + ",\"agent_id\":" + json.quote(&rep.actor_id) +
@@ -301,7 +404,8 @@ fn handle_connection(fd int, req_seq int, peer_ip string, tls_on bool, tls_hs_ns
 
         ka := wants_keep_alive(&req) && req_n + 1 < 200
         req_p_only := path_only(raw_p + "")
-        if meth == "POST" && req_p_only == "/internal/shutdown" && shutdown_secret.len > 0 {
+        inflight_add(rcfg.inflight_ch, 1)
+        if meth == "POST" && req_p_only == "/internal/shutdown" && rcfg.shutdown_secret.len > 0 {
             now_sd := time.now_time().unix()
             if !is_loopback_ip_str(&peer_ip) {
                 r := err_resp(403, "ERR_FORBIDDEN", "shutdown endpoint is loopback-only", 0, 0, 0)
@@ -311,15 +415,16 @@ fn handle_connection(fd int, req_seq int, peer_ip string, tls_on bool, tls_hs_ns
                 if w_ms < 0 { w_ms = 0 }
                 $tot_us := (time.now() - req_t0) / 1000
                 if tot_us < 0 { tot_us = 0 }
+                inflight_add(rcfg.inflight_ch, -1)
                 log_event_json(log_ch, now_sd, "shutdown_auth_fail",
                     "\"ip\":" + json.quote(&client_ip) + ",\"peer_ip\":" + json.quote(&peer_ip) + ",\"reason\":\"non_loopback\"")
-                log_access_json(log_ch, slow_ms, now_sd, req_id + "", meth + "", route + "",
-                    403, "ERR_FORBIDDEN", tls_on, client_ip + "", "anon", "",
+                log_access_json(rcfg.access_ch, rcfg.slow_ms, now_sd, req_id + "", meth + "", route + "",
+                    403, "ERR_FORBIDDEN", rcfg.tls_on, client_ip + "", "anon", "",
                     req_bytes, r.body.len, req_tls_ms, read_ms, 0, 0, w_ms, tot_us / 1000, tot_us)
                 <-
             }
             got_sec := req.header("X-Fatext-Shutdown-Secret")
-            if !const_time_str_eq(&got_sec, &shutdown_secret) {
+            if !const_time_str_eq(&got_sec, &rcfg.shutdown_secret) {
                 r := err_resp(403, "ERR_FORBIDDEN", "invalid shutdown secret", 0, 0, 0)
                 t_w0 := time.now()
                 _ := write_http_resp_ka($&cc, &r, false)
@@ -327,12 +432,13 @@ fn handle_connection(fd int, req_seq int, peer_ip string, tls_on bool, tls_hs_ns
                 if w_ms < 0 { w_ms = 0 }
                 $tot_us := (time.now() - req_t0) / 1000
                 if tot_us < 0 { tot_us = 0 }
+                inflight_add(rcfg.inflight_ch, -1)
                 $sd_reason := "bad_secret"
                 if got_sec.len == 0 { sd_reason = "missing_secret" }
                 log_event_json(log_ch, now_sd, "shutdown_auth_fail",
                     "\"ip\":" + json.quote(&client_ip) + ",\"peer_ip\":" + json.quote(&peer_ip) + ",\"reason\":" + json.quote(&sd_reason))
-                log_access_json(log_ch, slow_ms, now_sd, req_id + "", meth + "", route + "",
-                    403, "ERR_FORBIDDEN", tls_on, client_ip + "", "anon", "",
+                log_access_json(rcfg.access_ch, rcfg.slow_ms, now_sd, req_id + "", meth + "", route + "",
+                    403, "ERR_FORBIDDEN", rcfg.tls_on, client_ip + "", "anon", "",
                     req_bytes, r.body.len, req_tls_ms, read_ms, 0, 0, w_ms, tot_us / 1000, tot_us)
                 <-
             }
@@ -343,10 +449,11 @@ fn handle_connection(fd int, req_seq int, peer_ip string, tls_on bool, tls_hs_ns
             if w_ms < 0 { w_ms = 0 }
             $tot_us := (time.now() - req_t0) / 1000
             if tot_us < 0 { tot_us = 0 }
+            inflight_add(rcfg.inflight_ch, -1)
             log_event_json(log_ch, now_sd, "shutdown_requested",
                 "\"peer_ip\":" + json.quote(&peer_ip))
-            log_access_json(log_ch, slow_ms, now_sd, req_id + "", meth + "", route + "",
-                200, "", tls_on, client_ip + "", "internal", "shutdown",
+            log_access_json(rcfg.access_ch, rcfg.slow_ms, now_sd, req_id + "", meth + "", route + "",
+                200, "", rcfg.tls_on, client_ip + "", "internal", "shutdown",
                 req_bytes, r.body.len, req_tls_ms, read_ms, 0, 0, w_ms, tot_us / 1000, tot_us)
             select {
                 sig_ch <- signal.SIGTERM {}
@@ -357,7 +464,7 @@ fn handle_connection(fd int, req_seq int, peer_ip string, tls_on bool, tls_hs_ns
         if meth == "GET" && is_static_or_dl_path(&req_p_only) {
             t_st0 := time.now()
             st_rch := chan HttpResp{cap: 1}
-            static_ch <- StaticJob{path: req_p_only, client_ip: client_ip + "", reply_ch: st_rch}
+            static_ch <- StaticJob{path: req_p_only, client_ip: client_ip + "", is_set_rpm: false, new_rpm: 0, reply_ch: st_rch}
             sresp := <-st_rch
             if sresp.status != 0 {
                 $sh_ms := (time.now() - t_st0) / 1000000
@@ -368,11 +475,12 @@ fn handle_connection(fd int, req_seq int, peer_ip string, tls_on bool, tls_hs_ns
                 if w_ms < 0 { w_ms = 0 }
                 $tot_us := (time.now() - req_t0) / 1000
                 if tot_us < 0 { tot_us = 0 }
+                inflight_add(rcfg.inflight_ch, -1)
                 $secode := ""
                 if sresp.status == 429 { secode = "ERR_RATE_LIMITED" }
                 else if sresp.status >= 400 { secode = "ERR_NOT_FOUND" }
-                log_access_json(log_ch, slow_ms, time.now_time().unix(), req_id + "", meth + "", route + "",
-                    sresp.status, secode, tls_on, client_ip + "", "anon", "",
+                log_access_json(rcfg.access_ch, rcfg.slow_ms, time.now_time().unix(), req_id + "", meth + "", route + "",
+                    sresp.status, secode, rcfg.tls_on, client_ip + "", "anon", "",
                     req_bytes, sresp.body.len, req_tls_ms, read_ms, 0, sh_ms, w_ms, tot_us / 1000, tot_us)
                 req_n += 1
                 if !ka || w_rc < 0 {
@@ -381,8 +489,7 @@ fn handle_connection(fd int, req_seq int, peer_ip string, tls_on bool, tls_hs_ns
                 ->
             }
         }
-        jobs <- HubJob{kind: HUB_HTTP, req: req, sse_id: 0, enqueued_ns: time.now(), flag: 0, reply_ch: reply_ch}
-        rep := <-reply_ch
+        rep := submit_http_request(req, jobs, rcfg.job_tokens, rcfg.queue_timeout_ms, reply_ch, rcfg.ai_moderation, rcfg.moderation_pool)
         req_n += 1
         t_w0 := time.now()
         w_rc := write_http_resp_ka($&cc, &rep.resp, ka)
@@ -390,14 +497,48 @@ fn handle_connection(fd int, req_seq int, peer_ip string, tls_on bool, tls_hs_ns
         if w_ms < 0 { w_ms = 0 }
         $tot_us := (time.now() - req_t0) / 1000
         if tot_us < 0 { tot_us = 0 }
-        log_access_json(log_ch, slow_ms, time.now_time().unix(), req_id + "", meth + "", route + "",
-            rep.resp.status, rep.err_code + "", tls_on, client_ip + "", rep.actor_type + "", rep.actor_id + "",
+        inflight_add(rcfg.inflight_ch, -1)
+        log_access_json(rcfg.access_ch, rcfg.slow_ms, time.now_time().unix(), req_id + "", meth + "", route + "",
+            rep.resp.status, rep.err_code + "", rcfg.tls_on, client_ip + "", rep.actor_type + "", rep.actor_id + "",
             req_bytes, rep.resp.body.len, req_tls_ms, read_ms, rep.queue_ms, rep.handle_ms, w_ms, tot_us / 1000, tot_us)
         if !ka || w_rc < 0 {
             <-
         }
     }
     cc_close($&cc)
+}
+
+fn submit_http_request(req HttpReq, jobs chan HubJob, job_tokens chan string, queue_timeout_ms int, reply_ch chan HubReply, ai_moderation bool, moderation_pool ModerationPool) HubReply {
+    $verdict := 0
+    if ai_moderation && is_public_write(&req) {
+        probe := HttpReq{req_method: req.method(), req_path: req.path(), req_body: req.body(),
+            hdr_names: clone_str_slice(&req.hdr_names), hdr_vals: clone_str_slice(&req.hdr_vals),
+            remote_ip: req.remote_ip + "", peer_ip: req.peer_ip + ""}
+        if !acquire_job_token(job_tokens, queue_timeout_ms) {
+            r503 := err_resp(503, "ERR_OVERLOADED", "server request queue full", 2, 0, 0)
+            << reply_http(r503, queue_timeout_ms, 0, "ERR_OVERLOADED", "anon", "")
+        }
+        jobs <- make_hub_job(HUB_MODERATION_PREFLIGHT, probe, 0, time.now(), 0, reply_ch)
+        checked := <-reply_ch
+        release_job_token(job_tokens)
+        if checked.resp.status == 204 {
+            verdict = MODERATION_REVIEWED
+        } else if checked.resp.status == 200 {
+            payload := json.parse(&req.req_body)
+            value := json_str_or(&payload, payload.get(payload.root(), "text"), "")
+            verdict = get_moderation_verdict(&moderation_pool, value)
+        } else {
+            << checked
+        }
+    }
+    if !acquire_job_token(job_tokens, queue_timeout_ms) {
+        r503 := err_resp(503, "ERR_OVERLOADED", "server request queue full", 2, 0, 0)
+        << reply_http(r503, queue_timeout_ms, 0, "ERR_OVERLOADED", "anon", "")
+    }
+    jobs <- make_hub_job(HUB_HTTP, req, 0, time.now(), verdict, reply_ch)
+    rep := <-reply_ch
+    release_job_token(job_tokens)
+    << rep
 }
 
 fn is_allowed_redirect_path(rpath &string) bool {
@@ -420,9 +561,6 @@ fn resolve_allowed_redirect_host(raw_host &string, https_host string, allowed_ho
         if h == allowed_hosts[i] {
             << h
         }
-    }
-    if h == https_host || h == "www." + https_host {
-        << h
     }
     << https_host + ""
 }
@@ -500,16 +638,32 @@ fn handle_redirect_conn_guarded(fd int, peer_ip string, https_host string, allow
     release_conn_slot(gate_ch, peer_ip + "")
 }
 
-fn redirect_loop(redir_addr string, https_host string, allowed_hosts []string, chal_ch chan AcmeChalMsg, gate_ch chan ConnGateMsg, log_ch chan string, ready_ch chan int) {
+fn redirect_loop(redir_addr string, https_host string, allowed_hosts []string, chal_ch chan AcmeChalMsg, gate_ch chan ConnGateMsg, log_ch chan string, redir_stop chan int, ready_ch chan int) {
     lfd := net.listen(redir_addr + "") or (err) {
         println("fatext-server: redirect/HTTP-01 listen failed: " + err.msg())
-        ready_ch <- 0
+        ready_ch <- -1
         <<
     }
-    ready_ch <- 1
-    while true {
+    ready_ch <- lfd
+    $running := true
+    while running {
+        select {
+            _ := <-redir_stop {
+                running = false
+            }
+            else {}
+        }
+        if !running { -> }
         fd := net.accept(lfd) or (err) {
-            time.sleep(10000000)
+            select {
+                _ := <-redir_stop {
+                    running = false
+                }
+                else {}
+            }
+            if running {
+                time.sleep(10000000)
+            }
             ->
         }
         peer_ip := resolve_peer_ip(fd)
@@ -528,7 +682,7 @@ fn metrics_ticker_loop(interval_sec int, jobs chan HubJob) {
     tick := time.new_ticker(ns)
     while true {
         _ := <-tick.c
-        jobs <- HubJob{kind: HUB_METRIC_FLUSH, req: empty_req(), sse_id: 0, enqueued_ns: 0, flag: 0, reply_ch: chan HubReply{cap: 1}}
+        jobs <- make_hub_job(HUB_METRIC_FLUSH, empty_req(), 0, 0, 0, chan HubReply{cap: 1})
     }
 }
 
@@ -540,12 +694,12 @@ fn watch_signal_quiet(ch chan int, sig int) {
     _ := signal.notify(ch, sig) or (err) { << }
 }
 
-fn shutdown_watcher_loop(sig_ch chan int, accept_stop chan int, lfd int, drain_ms int, jobs chan HubJob, log_ch chan string, flush_done chan int) {
+fn shutdown_watcher_loop(sig_ch chan int, accept_stop chan int, redir_stop chan int, lfd int, redir_lfd int, drain_ms int, shutdown_wait_ms int, jobs chan HubJob, log_ch chan string, flush_done chan int, inflight_ch chan InflightMsg) {
     sig := <-sig_ch
     time.sleep(30000000)
 
     d_rch := chan HubReply{cap: 1}
-    jobs <- HubJob{kind: HUB_SHUTDOWN_DRAIN, req: empty_req(), sse_id: 0, enqueued_ns: 0, flag: 0, reply_ch: d_rch}
+    jobs <- make_hub_job(HUB_SHUTDOWN_DRAIN, empty_req(), 0, 0, 0, d_rch)
     dtick := time.new_ticker(1000000000)
     select {
         _ := <-d_rch {}
@@ -557,7 +711,13 @@ fn shutdown_watcher_loop(sig_ch chan int, accept_stop chan int, lfd int, drain_m
         accept_stop <- 1 {}
         else {}
     }
+    select {
+        redir_stop <- 1 {}
+        else {}
+    }
     close_raw_fd_quiet(lfd)
+    close_raw_fd_quiet(redir_lfd)
+    wait_inflight_zero(inflight_ch, shutdown_wait_ms)
     if drain_ms > 0 {
         time.sleep(drain_ms * 1000000)
     }
@@ -566,7 +726,7 @@ fn shutdown_watcher_loop(sig_ch chan int, accept_stop chan int, lfd int, drain_m
     log_event_json(log_ch, now, "server_stop", "\"signal\":" + strconv.itoa(sig))
 
     m_rch := chan HubReply{cap: 1}
-    m_job := HubJob{kind: HUB_METRIC_FLUSH, req: empty_req(), sse_id: 0, enqueued_ns: 0, flag: 1, reply_ch: m_rch}
+    m_job := make_hub_job(HUB_METRIC_FLUSH, empty_req(), 0, 0, 1, m_rch)
     jobs <- m_job
     mtick := time.new_ticker(500000000)
     select {
@@ -611,6 +771,7 @@ fn main() int {
     ip_rpm := getenv_int_or("FATEXT_IP_RPM", 600)
     tls_cert_path := os.getenv("FATEXT_TLS_CERT")
     tls_key_path := os.getenv("FATEXT_TLS_KEY")
+    tls_required := getenv_int_or("FATEXT_TLS_REQUIRED", 0) != 0
     $redir_addr := os.getenv("FATEXT_HTTP_REDIRECT_ADDR")
     raw_public_host := os.getenv("FATEXT_PUBLIC_HOST")
     $public_host := strings.to_lower(&getenv_or("FATEXT_PUBLIC_HOST", "fatext.com"))
@@ -633,6 +794,19 @@ fn main() int {
     metrics_interval_sec := getenv_int_or("FATEXT_METRICS_INTERVAL_SEC", 60)
     stdout_mirror := getenv_int_or("FATEXT_LOG_STDOUT", 0) != 0
     trust_proxy := getenv_int_or("FATEXT_TRUST_PROXY", 0) != 0
+    proxy_header := strings.to_lower(&strings.trim_space(&getenv_or("FATEXT_PROXY_HEADER", "auto")))
+    if proxy_header != "auto" && proxy_header != "xff" && proxy_header != "x-real-ip" && proxy_header != "cf" {
+        println("fatext-server: invalid FATEXT_PROXY_HEADER (expected auto|xff|x-real-ip|cf)")
+        << 1
+    }
+    $max_queue := getenv_int_or("FATEXT_MAX_QUEUE", 512)
+    if max_queue < 16 { max_queue = 16 }
+    $queue_timeout_ms := getenv_int_or("FATEXT_QUEUE_TIMEOUT_MS", 200)
+    if queue_timeout_ms < 10 { queue_timeout_ms = 10 }
+    $webhook_workers := getenv_int_or("FATEXT_WEBHOOK_WORKERS", 12)
+    if webhook_workers < 1 { webhook_workers = 1 }
+    if webhook_workers > 64 { webhook_workers = 64 }
+    shutdown_wait_ms := getenv_int_or("FATEXT_SHUTDOWN_WAIT_MS", 2000)
     max_conns := getenv_int_or("FATEXT_MAX_CONNS", 4096)
     max_conns_per_ip := getenv_int_or("FATEXT_MAX_CONNS_PER_IP", 64)
     redir_max_conns := getenv_int_or("FATEXT_REDIRECT_MAX_CONNS", 512)
@@ -654,6 +828,14 @@ fn main() int {
         println("fatext-server: FATEXT_TLS_CERT and FATEXT_TLS_KEY must both be set")
         << 1
     }
+    if tls_required && !has_static_tls && !acme_on {
+        println("fatext-server: FATEXT_TLS_REQUIRED needs native TLS configured")
+        << 1
+    }
+    if tls_required && acme_on && (acme_staging || acme_insecure_tls) {
+        println("fatext-server: FATEXT_TLS_REQUIRED disallows ACME staging and insecure ACME TLS")
+        << 1
+    }
 
     $tls_on := false
     $tls_mode := "off"
@@ -662,7 +844,27 @@ fn main() int {
     $acme_dir_url := ACME_PROD_DIR
     if acme_staging { acme_dir_url = ACME_STAGING_DIR }
     if acme_dir_override.len > 0 { acme_dir_url = acme_dir_override + "" }
-    allow_loopback_http := acme_dir_override.len > 0
+    allow_loopback_http := !tls_required && acme_dir_override.len > 0
+
+    if acme_on {
+        acme_domains = parse_acme_domains(&acme_domains_raw) or (err) {
+            println("fatext-server: " + err.msg())
+            << 1
+        }
+        if raw_public_host.len == 0 { public_host = acme_domains[0] + "" }
+    }
+    $trusted_host := ""
+    if tls_required {
+        if !is_valid_acme_domain(&public_host) {
+            println("fatext-server: FATEXT_PUBLIC_HOST must be a DNS hostname when TLS is required")
+            << 1
+        }
+        if acme_on && !str_list_contains(&acme_domains, public_host + "") {
+            println("fatext-server: FATEXT_ACME_DOMAINS must include FATEXT_PUBLIC_HOST")
+            << 1
+        }
+        trusted_host = public_host + ""
+    }
 
     now_boot := time.now_time().unix()
     if tls_cert_path.len > 0 && tls_key_path.len > 0 {
@@ -674,7 +876,7 @@ fn main() int {
             println("fatext-server: failed reading FATEXT_TLS_KEY: " + err.msg())
             << 1
         }
-        cmeta := parse_and_validate_cert_pair(&cert_pem, &key_pem) or (err) {
+        cmeta := parse_and_validate_cert_pair(&cert_pem, &key_pem, trusted_host + "") or (err) {
             println("fatext-server: invalid FATEXT_TLS_CERT/KEY: " + err.msg())
             << 1
         }
@@ -691,16 +893,9 @@ fn main() int {
             updated_at: now_boot
         }
     } else if acme_on {
-        acme_domains = parse_acme_domains(&acme_domains_raw) or (err) {
-            println("fatext-server: " + err.msg())
-            << 1
-        }
         validate_acme_url(&acme_dir_url, allow_loopback_http) or (err) {
             println("fatext-server: invalid ACME directory URL: " + err.msg())
             << 1
-        }
-        if raw_public_host.len == 0 {
-            public_host = acme_domains[0] + ""
         }
         if redir_addr.len == 0 {
             redir_addr = "0.0.0.0:80"
@@ -711,7 +906,7 @@ fn main() int {
 
     $allowed_hosts := []string{}
     allowed_hosts.push(public_host + "")
-    allowed_hosts.push("www." + public_host)
+    if !tls_required { allowed_hosts.push("www." + public_host) }
     for di in 0:acme_domains.len {
         d_s := acme_domains[di] + ""
         if !str_list_contains(&allowed_hosts, d_s + "") {
@@ -726,6 +921,13 @@ fn main() int {
 
     $st := new_state(addr + "", data_dir + "", www_dir + "", tpl_dir + "", dl_dir + "", pow_bits, mail_secret + "", ip_rpm)
     init_state($&st)
+    moderation_retention_days := getenv_int_or("FATEXT_MODERATION_RETENTION_DAYS", 30)
+    if moderation_retention_days < 1 || moderation_retention_days > 3650 {
+        println("fatext-server: FATEXT_MODERATION_RETENTION_DAYS must be 1..3650")
+        << 1
+    }
+    st.moderation_retention_days = moderation_retention_days
+    init_public_moderation($&st, getenv_or("FATEXT_PUBLIC_POSTING", "open"))
 
     $ch_names := []string{}
     for ci in 0:st.channels.len {
@@ -733,23 +935,64 @@ fn main() int {
     }
 
     log_ch := chan string{cap: 1024}
+    access_ch := chan string{cap: 2048}
     flush_done := chan int{cap: 1}
-    xu logger_loop(log_dir + "", retain_days, stdout_mirror, log_ch, flush_done)
+    xu logger_loop(log_dir + "", retain_days, stdout_mirror, log_ch, access_ch, flush_done)
 
-    webhook_ch := chan string{cap: 128}
-    for wi in 0:4 {
-        _ := wi
-        xu webhook_worker_loop(webhook_ch)
+    webhook_ch := chan string{cap: 256}
+    signer_socket := os.getenv("FATEXT_WEBHOOK_SIGNER_SOCKET")
+    if signer_socket.len > 0 {
+        for wi in 0:webhook_workers {
+            xu webhook_worker_loop(webhook_ch, signer_socket + "")
+        }
+    }
+
+    ai_key := os.getenv("FATEXT_AI_MODERATION_API_KEY")
+    ai_model := getenv_or("FATEXT_AI_MODERATION_MODEL", "omni-moderation-latest")
+    $ai_endpoint := os.getenv("FATEXT_AI_MODERATION_URL")
+    ai_moderation := getenv_int_or("FATEXT_AI_MODERATION_REQUIRED", 0) == 1 || ai_endpoint.len > 0 || ai_key.len > 0
+    if ai_endpoint.len == 0 && ai_key.len > 0 {
+        ai_endpoint = "https://api.openai.com/v1/moderations"
+    }
+    if ai_endpoint.len > 0 && !valid_moderation_endpoint(&ai_endpoint) {
+        println("fatext-server: moderation endpoint must use HTTPS or loopback HTTP")
+        << 1
+    }
+    if ai_key.len > 0 && !strings.has_prefix(&ai_endpoint, "https://") {
+        println("fatext-server: moderation API keys require an HTTPS endpoint")
+        << 1
+    }
+    if has_forbidden_ctrl(&ai_key) || strings.contains(&ai_key, "\r") || strings.contains(&ai_key, "\n") {
+        println("fatext-server: invalid moderation API key")
+        << 1
+    }
+    moderation_pool := ModerationPool{jobs: chan ModerationJob{cap: 4}, slots: chan int{cap: 4}}
+    if ai_moderation {
+        for worker in 0:4 {
+            xu moderation_worker(moderation_pool.jobs, ai_endpoint + "", ai_key + "", ai_model + "")
+        }
     }
 
     now0 := time.now_time().unix()
-    hub := new_hub_state(st, log_ch, webhook_ch, log_dir + "", slow_ms, now0, max_sse, max_sse_per_agent, admin_secret + "", admin_local_only, shutdown_secret.len > 0, cert_ch, tls_cert_path + "", tls_key_path + "")
-    jobs := chan HubJob{cap: 128}
-    xu hub_loop(hub, jobs)
-    xu maintenance_loop(data_dir + "", ch_names, log_ch, jobs)
-
-    static_ch := chan StaticJob{cap: 64}
+    static_ch := chan StaticJob{cap: 128}
     xu static_loop(www_dir + "", dl_dir + "", ip_rpm, static_ch)
+
+    $hub := new_hub_state(st, log_ch, static_ch, webhook_ch, signer_socket.len > 0, log_dir + "", slow_ms, now0, max_sse, max_sse_per_agent, admin_secret + "", admin_local_only, shutdown_secret.len > 0, cert_ch, tls_cert_path + "", tls_key_path + "", trusted_host + "")
+    hub.entity_cache = compute_entity_stats(data_dir + "", &ch_names, now0)
+    sync_ch_posts_today_from_cache($&hub, now0)
+
+    jobs := chan HubJob{cap: max_queue + 64}
+    job_tokens := chan string{cap: max_queue}
+    for _ in 0:max_queue {
+        job_tokens <- "1"
+    }
+    xu hub_loop(hub, jobs)
+    xu config_watch_loop(data_dir + "", jobs)
+    xu entity_stats_loop(data_dir + "", jobs)
+    xu maintenance_loop(data_dir + "", ch_names, log_ch, jobs, moderation_retention_days)
+
+    inflight_ch := chan InflightMsg{cap: 256}
+    xu inflight_loop(inflight_ch)
 
     gate_ch := chan ConnGateMsg{cap: 128}
     xu conn_guard_loop(max_conns, max_conns_per_ip, gate_ch)
@@ -758,13 +1001,15 @@ fn main() int {
         xu metrics_ticker_loop(metrics_interval_sec, jobs)
     }
 
+    $redir_lfd := -1
+    redir_stop := chan int{cap: 1}
     if tls_on && redir_addr.len > 0 {
         redir_gate_ch := chan ConnGateMsg{cap: 64}
         xu conn_guard_loop(redir_max_conns, redir_max_conns_per_ip, redir_gate_ch)
         redir_ready := chan int{cap: 1}
-        xu redirect_loop(redir_addr + "", public_host + "", clone_str_slice(&allowed_hosts), chal_ch, redir_gate_ch, log_ch, redir_ready)
-        rok := <-redir_ready
-        if acme_on && rok == 0 {
+        xu redirect_loop(redir_addr + "", public_host + "", clone_str_slice(&allowed_hosts), chal_ch, redir_gate_ch, log_ch, redir_stop, redir_ready)
+        redir_lfd = <-redir_ready
+        if acme_on && redir_lfd < 0 {
             err_msg := "ACME HTTP-01 listener failed to bind " + redir_addr
             log_event_json(log_ch, time.now_time().unix(), "acme_error", "\"error\":" + json.quote(&err_msg))
             flush_logs_before_exit(log_ch, flush_done)
@@ -776,6 +1021,7 @@ fn main() int {
 
     if acme_on {
         acme_cfg := AcmeConfig{
+            trusted_host: trusted_host + "",
             domains: clone_str_slice(&acme_domains),
             email: acme_email + "",
             acme_dir: acme_dir + "",
@@ -806,7 +1052,13 @@ fn main() int {
                 _ := acme_issue_and_install(&acme_cfg, chal_ch, cert_ch, log_ch) or (err) {
                     last_err = err.msg()
                     if try_n < 3 {
-                        time.sleep(1000000000)
+                        if allow_loopback_http {
+                            time.sleep(try_n * 1000000000)
+                        } else if try_n == 1 {
+                            time.sleep(5000000000)
+                        } else {
+                            time.sleep(15000000000)
+                        }
                     }
                     ->
                 }
@@ -833,7 +1085,7 @@ fn main() int {
     accept_stop := chan int{cap: 1}
     watch_signal_quiet(sig_ch, signal.SIGINT)
     watch_signal_quiet(sig_ch, signal.SIGTERM)
-    xu shutdown_watcher_loop(sig_ch, accept_stop, lfd, drain_ms, jobs, log_ch, flush_done)
+    xu shutdown_watcher_loop(sig_ch, accept_stop, redir_stop, lfd, redir_lfd, drain_ms, shutdown_wait_ms, jobs, log_ch, flush_done, inflight_ch)
 
     $scheme := "http"
     $tls_s := "false"
@@ -893,7 +1145,14 @@ fn main() int {
             cert_ch: cert_ch,
             slow_ms: slow_ms,
             trust_proxy: trust_proxy,
-            shutdown_secret: shutdown_secret + ""
+            proxy_header: proxy_header + "",
+            shutdown_secret: shutdown_secret + "",
+            ai_moderation: ai_moderation,
+            moderation_pool: moderation_pool,
+            access_ch: access_ch,
+            job_tokens: job_tokens,
+            queue_timeout_ms: queue_timeout_ms,
+            inflight_ch: inflight_ch
         }
         xu handle_connection_guarded(fd, req_seq, peer_ip + "", rcfg, gate_ch, static_ch, jobs, log_ch, sig_ch)
     }

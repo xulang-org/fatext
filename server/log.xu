@@ -276,15 +276,183 @@ fn cleanup_old_logs(log_dir string, today string, retain_days int) {
 
 pub const LOG_CTRL_FLUSH = "__FATEXT_LOG_FLUSH__"
 
-pub fn logger_loop(log_dir string, retain_days int, stdout_mirror bool, ch chan string, flush_done chan int) {
-    if log_dir.len > 0 {
-        mkdir_all_quiet(log_dir + "")
+struct DailyLogFiles {
+    acc os.File
+    ev os.File
+    met os.File
+}
+
+fn open_daily_log_files(log_dir string, date string) DailyLogFiles {
+    $acc := os.open_append(log_dir + "/access-" + date + ".jsonl") or >>
+    $ev := os.open_append(log_dir + "/events-" + date + ".jsonl") or (err) {
+        close_file_quiet($&acc)
+        >> err
     }
+    $met := os.open_append(log_dir + "/metrics-" + date + ".jsonl") or (err) {
+        close_file_quiet($&acc)
+        close_file_quiet($&ev)
+        >> err
+    }
+    << DailyLogFiles{acc: acc, ev: ev, met: met}
+}
+
+fn close_daily_log_files(logs $&DailyLogFiles) {
+    close_file_quiet($&logs.acc)
+    close_file_quiet($&logs.ev)
+    close_file_quiet($&logs.met)
+}
+
+fn reopen_and_write_log(old $&os.File, path string, line string) os.File {
+    close_file_quiet(old)
+    $nf := os.open_append(path) or >>
+    nf.write(line + "\n") or (err) {
+        close_file_quiet($&nf)
+        >> err
+    }
+    << nf
+}
+
+fn write_daily_log(logs $&DailyLogFiles, log_dir string, date string, stream string, line string) {
+    p := log_dir + "/" + stream + "-" + date + ".jsonl"
+    if stream == "access" {
+        logs.acc.write(line + "\n") or (err) {
+            logs.acc = reopen_and_write_log($&logs.acc, p, line) or (e2) {
+                append_jsonl_quiet(p, line)
+                <<
+            }
+            <<
+        }
+        <<
+    }
+    if stream == "events" {
+        logs.ev.write(line + "\n") or (err) {
+            logs.ev = reopen_and_write_log($&logs.ev, p, line) or (e2) {
+                append_jsonl_quiet(p, line)
+                <<
+            }
+            <<
+        }
+        <<
+    }
+    if stream == "metrics" {
+        logs.met.write(line + "\n") or (err) {
+            logs.met = reopen_and_write_log($&logs.met, p, line) or (e2) {
+                append_jsonl_quiet(p, line)
+                <<
+            }
+            <<
+        }
+        <<
+    }
+    append_jsonl_quiet(p, line)
+}
+
+fn recv_next_log(log_ch chan string, access_ch chan string) string {
+    $out := ""
+    $got := false
+    select {
+        tagged := <-log_ch {
+            out = tagged
+            got = true
+        }
+        else {}
+    }
+    if got { << out }
+    select {
+        tagged := <-log_ch { out = tagged }
+        tagged := <-access_ch { out = tagged }
+    }
+    << out
+}
+
+fn logger_loop_fallback(log_dir string, retain_days int, stdout_mirror bool, log_ch chan string, access_ch chan string, flush_done chan int) {
     $last_date := ""
     while true {
-        tagged := <-ch
+        tagged := recv_next_log(log_ch, access_ch)
         if tagged == LOG_CTRL_FLUSH {
             flush_done <- 1
+            ->
+        }
+        tidx := strings.index_of(&tagged, "\t")
+        if tidx <= 0 || tidx + 1 >= tagged.len { -> }
+        stream := tagged[0:tidx]
+        line := tagged[(tidx + 1):tagged.len]
+        if log_dir.len > 0 {
+            now := time.now_time().unix()
+            today := utc_date_from_unix(now)
+            if today != last_date {
+                last_date = today + ""
+                cleanup_old_logs(log_dir + "", today + "", retain_days)
+            }
+            fpath := log_dir + "/" + stream + "-" + today + ".jsonl"
+            append_jsonl_quiet(fpath, line + "")
+        }
+        if stdout_mirror {
+            println("[" + stream + "] " + line)
+        }
+    }
+}
+
+pub fn logger_loop(log_dir string, retain_days int, stdout_mirror bool, log_ch chan string, access_ch chan string, flush_done chan int) {
+    if log_dir.len == 0 {
+        logger_loop_fallback("", retain_days, stdout_mirror, log_ch, access_ch, flush_done)
+        <<
+    }
+    mkdir_all_quiet(log_dir + "")
+    $last_date := utc_date_from_unix(time.now_time().unix())
+    cleanup_old_logs(log_dir + "", last_date + "", retain_days)
+    $logs := open_daily_log_files(log_dir + "", last_date + "") or (err) {
+        logger_loop_fallback(log_dir + "", retain_days, stdout_mirror, log_ch, access_ch, flush_done)
+        <<
+    }
+    while true {
+        tagged := recv_next_log(log_ch, access_ch)
+        if tagged == LOG_CTRL_FLUSH {
+            $extra_flushes := 0
+            $more_hi := true
+            while more_hi {
+                select {
+                    hi := <-log_ch {
+                        if hi == LOG_CTRL_FLUSH {
+                            extra_flushes += 1
+                        } else {
+                            hi_idx := strings.index_of(&hi, "\t")
+                            if hi_idx > 0 && hi_idx + 1 < hi.len {
+                                hs := hi[0:hi_idx]
+                                hl := hi[(hi_idx + 1):hi.len]
+                                write_daily_log($&logs, log_dir + "", last_date + "", hs + "", hl + "")
+                                if stdout_mirror { println("[" + hs + "] " + hl) }
+                            }
+                        }
+                    }
+                    else { more_hi = false }
+                }
+            }
+            $more_ac := true
+            while more_ac {
+                select {
+                    ac := <-access_ch {
+                        ac_idx := strings.index_of(&ac, "\t")
+                        if ac_idx > 0 && ac_idx + 1 < ac.len {
+                            as_s := ac[0:ac_idx]
+                            al := ac[(ac_idx + 1):ac.len]
+                            write_daily_log($&logs, log_dir + "", last_date + "", as_s + "", al + "")
+                            if stdout_mirror { println("[" + as_s + "] " + al) }
+                        }
+                    }
+                    else { more_ac = false }
+                }
+            }
+            close_daily_log_files($&logs)
+            logs = open_daily_log_files(log_dir + "", last_date + "") or (err) {
+                flush_done <- 1
+                logger_loop_fallback(log_dir + "", retain_days, stdout_mirror, log_ch, access_ch, flush_done)
+                <<
+            }
+            flush_done <- 1
+            for _ in 0:extra_flushes {
+                flush_done <- 1
+            }
             ->
         }
         tidx := strings.index_of(&tagged, "\t")
@@ -294,15 +462,18 @@ pub fn logger_loop(log_dir string, retain_days int, stdout_mirror bool, ch chan 
         now := time.now_time().unix()
         today := utc_date_from_unix(now)
         if today != last_date {
+            close_daily_log_files($&logs)
             last_date = today + ""
-            if log_dir.len > 0 {
-                cleanup_old_logs(log_dir + "", today + "", retain_days)
+            cleanup_old_logs(log_dir + "", today + "", retain_days)
+            logs = open_daily_log_files(log_dir + "", last_date + "") or (err) {
+                fpath := log_dir + "/" + stream + "-" + today + ".jsonl"
+                append_jsonl_quiet(fpath, line + "")
+                if stdout_mirror { println("[" + stream + "] " + line) }
+                logger_loop_fallback(log_dir + "", retain_days, stdout_mirror, log_ch, access_ch, flush_done)
+                <<
             }
         }
-        if log_dir.len > 0 {
-            fpath := log_dir + "/" + stream + "-" + today + ".jsonl"
-            append_jsonl_quiet(fpath, line + "")
-        }
+        write_daily_log($&logs, log_dir + "", today + "", stream + "", line + "")
         if stdout_mirror {
             println("[" + stream + "] " + line)
         }
@@ -340,12 +511,25 @@ pub fn resolve_peer_ip(fd int) string {
     << extract_host_from_sockaddr_str(raw)
 }
 
-pub fn effective_client_ip(peer_ip string, req &HttpReq, trust_proxy bool) string {
+pub fn effective_client_ip(peer_ip string, req &HttpReq, trust_proxy bool, proxy_header string) string {
     if !trust_proxy || !is_trusted_proxy_ip(&peer_ip) { << peer_ip + "" }
-    cf := strings.trim_space(&req.header("CF-Connecting-IP"))
-    if is_valid_ip_literal(&cf) { << cf }
-    xri := strings.trim_space(&req.header("X-Real-IP"))
-    if is_valid_ip_literal(&xri) { << xri }
+    mode := strings.to_lower(&strings.trim_space(&proxy_header))
+    if mode == "cf" {
+        cf := strings.trim_space(&req.header("CF-Connecting-IP"))
+        if is_valid_ip_literal(&cf) { << cf }
+        << peer_ip + ""
+    }
+    if mode == "x-real-ip" {
+        xri := strings.trim_space(&req.header("X-Real-IP"))
+        if is_valid_ip_literal(&xri) { << xri }
+        << peer_ip + ""
+    }
+    if mode != "xff" {
+        cf := strings.trim_space(&req.header("CF-Connecting-IP"))
+        if is_valid_ip_literal(&cf) { << cf }
+        xri := strings.trim_space(&req.header("X-Real-IP"))
+        if is_valid_ip_literal(&xri) { << xri }
+    }
     xff := strings.trim_space(&req.header("X-Forwarded-For"))
     if xff.len == 0 { << peer_ip + "" }
     parts := strings.split(&xff, ",")
@@ -379,9 +563,14 @@ pub fn normalize_route(raw_path string) string {
        path == "/v1/agents/revoke" || path == "/v1/agents/docs" || path == "/v1/ctl/agents" ||
        path == "/v1/friends" || path == "/v1/friends/request" || path == "/v1/friends/accept" ||
        path == "/v1/friends/reject" || path == "/v1/blocks" || path == "/v1/mail" || path == "/v1/stream" ||
-       path == "/v1/rooms" {
+       path == "/v1/rooms" || path == "/report" || path == "/v1/reports" || path == "/report/status" || path == "/v1/reports/status" ||
+       path == "/v1/moderation/notices" || path == "/v1/moderation/review" {
         << path
     }
+    if path == "/internal/admin/public-posting" || path == "/internal/admin/moderation/reports" { << path }
+    if strings.has_prefix(&path, "/internal/admin/moderation/messages/") { << "/internal/admin/moderation/messages/{thread_id}/{msg_id}" }
+    if strings.has_prefix(&path, "/internal/admin/moderation/reports/") { << "/internal/admin/moderation/reports/{date}/{receipt}" }
+    if strings.has_prefix(&path, "/internal/admin/moderation/reviews/") { << "/internal/admin/moderation/reviews/{date}/{receipt}" }
     if strings.has_prefix(&path, "/internal/admin/") {
         rest := path[16:path.len]
         parts := strings.split(&rest, "/")

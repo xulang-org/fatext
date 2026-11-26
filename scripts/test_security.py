@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import base64
 import hashlib
 import http.client
@@ -288,8 +289,89 @@ def test_restore_rejects_symlinks(td_p: Path) -> None:
     assert_true("unsafe entry type" in res.stderr, f"expected unsafe entry type message, got {res.stderr}")
 
 
+def test_backup_restore_acme_and_tmp(td_p: Path) -> None:
+    print("[3b/7] deploy/backup.sh & restore.sh acme permissions + *.tmp exclusion...")
+    import stat as pystat
+
+    src_data = td_p / "bkp_src_data"
+    bkps_dir = td_p / "bkp_out"
+    dst_data = td_p / "bkp_dst_data"
+    (src_data / "keys" / "ab").mkdir(parents=True, exist_ok=True)
+    (src_data / "keys" / "ab" / "ftx_ab0000000001.json").write_text("{\"agent_id\":\"ftx_ab0000000001\"}\n", encoding="utf-8")
+    (src_data / "keys" / "ab" / "stale.json.tmp.999").write_text("partial", encoding="utf-8")
+    (src_data / "acme").mkdir(parents=True, exist_ok=True)
+    (src_data / "acme" / "fullchain.pem").write_text("CERT", encoding="utf-8")
+    (src_data / "acme" / "privkey.pem").write_text("KEY", encoding="utf-8")
+    (src_data / "acme" / "account.json").write_text("{}", encoding="utf-8")
+
+    r_bkp = subprocess.run(
+        ["bash", str(ROOT / "deploy" / "backup.sh"), str(src_data), str(bkps_dir)],
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10.0,
+    )
+    assert_eq(r_bkp.returncode, 0, f"backup.sh failed: {r_bkp.stderr}")
+    tars = list(bkps_dir.glob("fatext-*.tar.gz"))
+    assert_eq(len(tars), 1, f"expected 1 backup tarball, got {tars}")
+
+    r_rst = subprocess.run(
+        ["bash", str(ROOT / "deploy" / "restore.sh"), str(tars[0]), str(dst_data)],
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10.0,
+    )
+    assert_eq(r_rst.returncode, 0, f"restore.sh failed: {r_rst.stderr}")
+    assert_true(not (dst_data / "keys" / "ab" / "stale.json.tmp.999").exists(), "*.tmp.* must be excluded from backup")
+    assert_true((dst_data / "acme" / "privkey.pem").is_file(), "acme/privkey.pem must be restored")
+    assert_eq(pystat.S_IMODE((dst_data / "acme").stat().st_mode), 0o700, "restored acme dir must be 0700")
+    assert_eq(pystat.S_IMODE((dst_data / "acme" / "privkey.pem").stat().st_mode), 0o600, "restored acme privkey.pem must be 0600")
+    assert_eq(pystat.S_IMODE((dst_data / "acme" / "fullchain.pem").stat().st_mode), 0o600, "restored acme fullchain.pem must be 0600")
+
+    service_bkps = td_p / "service_bkp_out"
+    subprocess.run(
+        ["bash", str(ROOT / "deploy" / "backup.sh"), str(src_data), str(service_bkps)],
+        env={**os.environ, "FATEXT_BACKUP_SKIP_ACME": "1"}, check=True, capture_output=True, timeout=10.0,
+    )
+    manifest = subprocess.check_output(["tar", "-tzf", str(next(service_bkps.glob("*.tar.gz")))], text=True)
+    assert_true("keys/ab/ftx_ab0000000001.json" in manifest, "periodic backup must include agent data")
+    assert_true(not any(name.startswith("acme/") for name in manifest.splitlines()),
+                "periodic backup must exclude the ACME directory")
+
+
+def test_webhook_signature(td_p: Path) -> None:
+    key = td_p / "official.pem"
+    pub = td_p / "official.pub.pem"
+    subprocess.run(
+        ["/usr/bin/openssl", "genpkey", "-algorithm", "RSA",
+         "-pkeyopt", "rsa_keygen_bits:2048", "-out", str(key)],
+        check=True, capture_output=True,
+    )
+    subprocess.run(
+        ["/usr/bin/openssl", "pkey", "-in", str(key), "-pubout", "-out", str(pub)],
+        check=True, capture_output=True,
+    )
+    target = b"/events?format=json"
+    digest = hashlib.sha256(b'{"event":"mail"}').hexdigest().encode()
+    signer = [sys.executable, "-I", str(ROOT / "deploy" / "webhook_signer.py")]
+    env = {**os.environ, "CREDENTIALS_DIRECTORY": str(td_p)}
+    result = subprocess.run(signer, input=target + b"\n" + digest + b"\n",
+                            env=env, capture_output=True, check=True, timeout=5)
+    ts, encoded = result.stdout.strip().split(b" ")
+    assert_true(abs(time.time() - int(ts)) < 10, "signer returns a fresh timestamp")
+    sig_path = td_p / "webhook.sig"
+    sig_path.write_bytes(base64.b64decode(encoded, validate=True))
+    verify = ["/usr/bin/openssl", "dgst", "-sha256", "-verify", str(pub),
+              "-sigopt", "rsa_padding_mode:pss", "-sigopt", "rsa_pss_saltlen:32",
+              "-sigopt", "rsa_mgf1_md:sha256", "-signature", str(sig_path)]
+    request = b"POST\n" + target + b"\n" + ts + b"\n" + digest
+    subprocess.run(verify, input=b"fatext-webhook-v1\n" + request,
+                   check=True, capture_output=True, timeout=5)
+    result = subprocess.run(verify, input=request, capture_output=True, timeout=5)
+    assert_true(result.returncode != 0, "webhook signatures use a separate signing context")
+    print("Webhook signing checks passed.")
+
+
 def main() -> int:
-    if not SERVER_BIN.is_file() or not CLI_BIN.is_file():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--without-cli", action="store_true", help="run checks that do not require the CLI")
+    args = parser.parse_args()
+    if not SERVER_BIN.is_file() or (not args.without_cli and not CLI_BIN.is_file()):
         print("Missing built server or cli binary", file=sys.stderr)
         return 1
 
@@ -297,6 +379,10 @@ def main() -> int:
         td_p = Path(td)
         test_tls_redirect_and_headers(td_p)
         test_restore_rejects_symlinks(td_p)
+        test_backup_restore_acme_and_tmp(td_p)
+        test_webhook_signature(td_p)
+        if args.without_cli:
+            return 0
 
         print("[4/7] Testing SSRF, SSR single-pass, XFF right-to-left, SSE compaction, room/post/mail bounds...")
         port = free_tcp_port()
@@ -594,6 +680,66 @@ def main() -> int:
             assert_eq(st_tr, 403, f"transfer to banned agent rejected: {tr_j}")
             assert_eq(tr_j.get("error", {}).get("code"), "ERR_AGENT_BANNED", f"unexpected error code: {tr_j}")
 
+            # DM to banned M2 -> 403 ERR_AGENT_BANNED
+            st_dm_ban, dm_ban_j = signed_http(HOST, p6_port, id_m1, h_m1 / "private.pem", "POST", f"/v1/dm/{id_m2}", b'{"v":1,"ek":"a","iv":"b","ct":"c"}')
+            assert_eq(st_dm_ban, 403, f"DM to banned agent rejected: {dm_ban_j}")
+            assert_eq(dm_ban_j.get("error", {}).get("code"), "ERR_AGENT_BANNED", f"unexpected DM banned code: {dm_ban_j}")
+
+            # Docs PUT rate limit (>10/min per agent -> 429 ERR_RATE_LIMITED)
+            for dv in range(1, 12):
+                content = f"# Soul v{dv}\n"
+                csha = hashlib.sha256(content.encode("utf-8")).hexdigest()
+                uat = int(time.time())
+                canon = json.dumps(
+                    {
+                        "agent_id": id_m1,
+                        "content_sha256": csha,
+                        "kind": "soul",
+                        "locked": False,
+                        "signer_id": id_m1,
+                        "signer_key_version": 1,
+                        "updated_at": uat,
+                        "version": dv,
+                        "visibility": "public",
+                    },
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+                with tempfile.NamedTemporaryFile() as dmf:
+                    dmf.write(canon)
+                    dmf.flush()
+                    dsig = base64.b64encode(
+                        subprocess.check_output(
+                            [
+                                "/usr/bin/openssl", "dgst", "-sha256",
+                                "-sigopt", "rsa_padding_mode:pss",
+                                "-sigopt", "rsa_pss_saltlen:32",
+                                "-sigopt", "rsa_mgf1_md:sha256",
+                                "-sign", str(h_m1 / "private.pem"), dmf.name,
+                            ]
+                        )
+                    ).decode("ascii")
+                d_body = json.dumps({
+                    "version": dv,
+                    "visibility": "public",
+                    "format": "markdown",
+                    "locked": False,
+                    "content": content,
+                    "content_sha256": csha,
+                    "updated_at": uat,
+                    "signature": dsig,
+                }).encode("utf-8")
+                st_doc, doc_j = signed_http(HOST, p6_port, id_m1, h_m1 / "private.pem", "PUT", "/v1/agents/docs/soul", d_body)
+                if dv <= 10:
+                    assert_eq(st_doc, 200, f"doc PUT v{dv} failed: {doc_j}")
+                else:
+                    assert_eq(st_doc, 429, f"11th doc PUT within 60s must hit 429: {doc_j}")
+                    assert_eq(doc_j.get("error", {}).get("code"), "ERR_RATE_LIMITED", f"unexpected doc 429 code: {doc_j}")
+
+            # Unauthenticated 401 probe with forged X-Agent-Id must log actor_type="anon", actor_id=""
+            st_forged, _ = signed_http(HOST, p6_port, "ftx_forged00000001", h_m1 / "private.pem", "GET", "/v1/friends", b"")
+            assert_eq(st_forged, 401, "forged X-Agent-Id 401")
+
             # Granting controller credential to banned M2 -> 403 ERR_AGENT_BANNED
             _, cid_out, _ = run_cli(["--json", "whoami"], home=str(h_c2), api_url=p6_url)
             id_c2 = json.loads(cid_out.strip())["agent_id"]
@@ -637,10 +783,119 @@ def main() -> int:
             assert_true('"kind":"shutdown_auth_fail"' in ev6, "missing shutdown_auth_fail audit event")
             assert_true('"kind":"shutdown_requested"' in ev6, "missing shutdown_requested audit event")
             assert_true(bad_tok not in ev6 and adm_sec not in ev6 and sd_sec not in ev6 and bad_sd_tok not in ev6, "secrets leaked into events log!")
+
+            acc6 = [json.loads(ln) for p in p6_logs.glob("access-*.jsonl") for ln in p.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            forged_entries = [e for e in acc6 if e.get("route") == "/v1/friends" and e.get("status") == 401]
+            assert_true(len(forged_entries) >= 1, "missing 401 /v1/friends access log entry")
+            assert_true(all(e.get("actor_type") == "anon" and e.get("actor_id") == "" for e in forged_entries), f"401 attributed forged actor: {forged_entries}")
+            bad_adm_entries = [e for e in acc6 if e.get("route") == "/internal/admin/stats" and e.get("status") == 403]
+            assert_true(len(bad_adm_entries) >= 1 and all(e.get("actor_type") == "anon" for e in bad_adm_entries), f"403 admin probe attributed as admin: {bad_adm_entries}")
         finally:
             if srv6.poll() is None:
                 srv6.terminate()
                 srv6.wait(timeout=5)
+
+        print("[6b/7] Testing FATEXT_PROXY_HEADER validation/isolation and mail_ingest received_at clamping...")
+        bad_ph_env = os.environ.copy()
+        bad_ph_env.update({
+            "FATEXT_ADDR": f"{HOST}:{free_tcp_port()}",
+            "FATEXT_DATA_DIR": str(td_p / "bad_ph_data"),
+            "FATEXT_WWW_DIR": str(WWW_DIR),
+            "FATEXT_TEMPLATES_DIR": str(TPL_DIR),
+            "FATEXT_PROXY_HEADER": "bogus",
+        })
+        r_bad_ph = subprocess.run([str(SERVER_BIN)], env=bad_ph_env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5.0)
+        assert_true(r_bad_ph.returncode != 0, f"invalid FATEXT_PROXY_HEADER must exit non-zero, got rc={r_bad_ph.returncode}")
+
+        p6b_port = free_tcp_port()
+        p6b_url = f"http://{HOST}:{p6b_port}"
+        p6b_data = td_p / "p6b_data"
+        p6b_logs = td_p / "p6b_logs"
+        p6b_data.mkdir(parents=True, exist_ok=True)
+        p6b_logs.mkdir(parents=True, exist_ok=True)
+        m_sec_b = "mail-sec-r3-5521"
+        sd_sec_b = "sd-sec-r3-5521"
+        p6b_env = os.environ.copy()
+        p6b_env.update({
+            "FATEXT_ADDR": f"{HOST}:{p6b_port}",
+            "FATEXT_DATA_DIR": str(p6b_data),
+            "FATEXT_LOG_DIR": str(p6b_logs),
+            "FATEXT_WWW_DIR": str(WWW_DIR),
+            "FATEXT_TEMPLATES_DIR": str(TPL_DIR),
+            "FATEXT_POW_BITS": "8",
+            "FATEXT_TRUST_PROXY": "1",
+            "FATEXT_PROXY_HEADER": "x-real-ip",
+            "FATEXT_MAIL_INTERNAL_SECRET": m_sec_b,
+            "FATEXT_SHUTDOWN_SECRET": sd_sec_b,
+        })
+        srv6b = subprocess.Popen([str(SERVER_BIN)], env=p6b_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            wait_http_ok(f"{p6b_url}/health")
+            h_mail = td_p / "h_mail"
+            rc, m_out, m_err = run_cli(["--json", "init", "--name", "MailClamp"], home=str(h_mail), api_url=p6b_url)
+            assert_eq(rc, 0, f"init MailClamp failed: {m_err}")
+            aid_mc = json.loads(m_out.strip())["agent_id"]
+            rc, _, m_err2 = run_cli(["--json", "profile", "set", "--accept-email", "true"], home=str(h_mail), api_url=p6b_url)
+            # Wait: 60s register->profile cooldown applies unless restarted or wait; check:
+            if rc != 0:
+                srv6b.terminate()
+                srv6b.wait(timeout=5)
+                srv6b = subprocess.Popen([str(SERVER_BIN)], env=p6b_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                wait_http_ok(f"{p6b_url}/health")
+                rc, _, m_err2 = run_cli(["--json", "profile", "set", "--accept-email", "true"], home=str(h_mail), api_url=p6b_url)
+            assert_eq(rc, 0, f"enable accept_email failed: {m_err2}")
+
+            with urllib.request.urlopen(
+                urllib.request.Request(
+                    f"{p6b_url}/health",
+                    headers={
+                        "CF-Connecting-IP": "198.51.100.1",
+                        "X-Forwarded-For": "198.51.100.2",
+                        "X-Real-IP": "203.0.113.77",
+                    },
+                ),
+                timeout=5.0,
+            ) as hr:
+                assert_eq(hr.status, 200, "x-real-ip health 200")
+
+            now_mc = int(time.time())
+            for bad_rat in (now_mc + 9999999, now_mc - 9999999):
+                m_req = urllib.request.Request(
+                    f"{p6b_url}/internal/mail/ingest",
+                    data=json.dumps({
+                        "to_agent_id": aid_mc,
+                        "from": "sender@example.com",
+                        "subject": "clamp-test",
+                        "raw_snippet": "hello",
+                        "received_at": bad_rat,
+                    }).encode("utf-8"),
+                    method="POST",
+                    headers={"Content-Type": "application/json", "X-Internal-Secret": m_sec_b},
+                )
+                with urllib.request.urlopen(m_req, timeout=5.0) as mr:
+                    assert_eq(mr.status, 201, f"mail_ingest clamp status for {bad_rat}")
+
+            with urllib.request.urlopen(
+                urllib.request.Request(f"{p6b_url}/internal/shutdown", data=b"", method="POST", headers={"X-Fatext-Shutdown-Secret": sd_sec_b}),
+                timeout=5.0,
+            ) as sdr_b:
+                assert_eq(sdr_b.status, 200, "6b shutdown 200")
+            assert_eq(srv6b.wait(timeout=8.0), 0, "6b shutdown clean exit")
+
+            acc6b = [json.loads(ln) for p in p6b_logs.glob("access-*.jsonl") for ln in p.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            ips6b = {e.get("ip") for e in acc6b if e.get("route") == "/health"}
+            assert_true("203.0.113.77" in ips6b, f"x-real-ip expected 203.0.113.77 in {ips6b}")
+            assert_true("198.51.100.1" not in ips6b and "198.51.100.2" not in ips6b, f"FATEXT_PROXY_HEADER=x-real-ip leaked CF/XFF: {ips6b}")
+
+            mail_files = list((p6b_data / "mail").rglob("*.json"))
+            assert_eq(len(mail_files), 2, f"expected 2 ingested mail files, got {mail_files}")
+            for mf in mail_files:
+                rat_saved = json.loads(mf.read_text(encoding="utf-8"))["received_at"]
+                assert_true(abs(rat_saved - int(time.time())) <= 15, f"received_at was not clamped: {rat_saved}")
+        finally:
+            if srv6b.poll() is None:
+                srv6b.terminate()
+                srv6b.wait(timeout=5)
 
         print("[7/7] Testing Cloudflare Email Worker spoofing resistance & deploy script hardening...")
         for sh_file in sorted((ROOT / "deploy").glob("*.sh")):

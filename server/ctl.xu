@@ -273,7 +273,7 @@ pub fn verify_and_prepare_enrollment(st $&State, doc &json.Doc, root int, agent_
     if st.used_creds.has(cred_id + "") {
         << enroll_fail(409, "ERR_CONFLICT", "enrollment credential already consumed")
     }
-    if expires_at > 0 && now > expires_at {
+    if expires_at > 0 && now >= expires_at {
         << enroll_fail(403, "ERR_CREDENTIAL_EXPIRED", "enrollment credential expired")
     }
     if !doc.has(pl, "scopes") {
@@ -301,11 +301,10 @@ pub fn verify_and_prepare_enrollment(st $&State, doc &json.Doc, root int, agent_
     if ctrl.controller_id.len > 0 {
         << enroll_fail(403, "ERR_NESTED_DELEGATION", "managed agents cannot issue enrollment credentials (1-hop hierarchy)")
     }
-    cpem := find_agent_pubkey_for_version(&ctrl, ckv)
-    if cpem.len == 0 {
-        << enroll_fail(401, "ERR_BAD_SIGNATURE", "controller_key_version not found")
+    if ckv != ctrl.key_version {
+        << enroll_fail(401, "ERR_BAD_SIGNATURE", "enrollment requires the current controller key")
     }
-    cpk := parse_spki_rsa_pem(&cpem) or (err) {
+    cpk := parse_spki_rsa_pem(&ctrl.pub_pem) or (err) {
         << enroll_fail(500, "ERR_INTERNAL", "stored controller public key invalid")
     }
     canon_enr := canonical_enrollment_payload(controller_id + "", ckv, cred_id + "", expires_at, issued_at, label + "", &sr.scopes)
@@ -480,7 +479,7 @@ pub fn handle_ctl_grant_credential(hub $&HubState, req &HttpReq, aid string, now
     if has_forbidden_ctrl(&lbl) || utf8_char_count(&lbl) > 64 {
         << err_resp(400, "ERR_BAD_REQUEST", "label must be <=64 chars", 0, 0, 0)
     }
-    if exp > 0 && now > exp {
+    if exp > 0 && now >= exp {
         << err_resp(400, "ERR_BAD_REQUEST", "credential already expired", 0, 0, 0)
     }
     if hub.st.used_creds.has(cred_id + "") {
@@ -492,9 +491,10 @@ pub fn handle_ctl_grant_credential(hub $&HubState, req &HttpReq, aid string, now
     sr := parse_scopes_from_json(&doc, doc.get(pl, "scopes"))
     if !sr.ok { << err_resp(400, "ERR_BAD_REQUEST", "invalid scopes", 0, 0, 0) }
 
-    cpem := find_agent_pubkey_for_version(&au.agent, pl_ckv)
-    if cpem.len == 0 { << err_resp(401, "ERR_BAD_SIGNATURE", "controller_key_version not found", 0, 0, 0) }
-    cpk := parse_spki_rsa_pem(&cpem) or (err) { << err_resp(500, "ERR_INTERNAL", "controller key invalid", 0, 0, 0) }
+    if pl_ckv != au.key_version {
+        << err_resp(401, "ERR_BAD_SIGNATURE", "grant requires the current controller key", 0, 0, 0)
+    }
+    cpk := parse_spki_rsa_pem(&au.agent.pub_pem) or (err) { << err_resp(500, "ERR_INTERNAL", "controller key invalid", 0, 0, 0) }
     canon_cert := canonical_agent_cert_payload(aid + "", pl_akv, expected_fp + "", au.agent_id + "", pl_ckv, cred_id + "", exp, iat, lbl + "", &sr.scopes)
     if !verify_pss_message(&cpk, &canon_cert, ctrl_sig + "") {
         << err_resp(401, "ERR_BAD_SIGNATURE", "agent_cert controller_sig verification failed", 0, 0, 0)
@@ -578,6 +578,7 @@ pub fn handle_ctl_grant_credential(hub $&HubState, req &HttpReq, aid string, now
         ag.status + "", "null", &ag.pub_pem, kh_json, &ag.name, &ag.bio, now, ext_json, ownership_json, managed_json, sig_json) or (err) {
         << err_resp(500, "ERR_INTERNAL", "failed updating agent credential", 0, 0, 0)
     }
+    hub_disconnect_agent(hub, aid + "")
     record_credential_used($&hub.st, cred_id + "", au.agent_id + "", aid + "", "agent_cert", now)
     sync_controller_agent_roster($&hub.st, au.agent_id + "", aid + "", cred_id + "", "agent_cert", lbl + "", &sr.scopes, next_ost + "", iat, exp) or (err) {
         << err_resp(500, "ERR_INTERNAL", "failed syncing controller agent roster", 0, 0, 0)

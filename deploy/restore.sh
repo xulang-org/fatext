@@ -57,8 +57,25 @@ trap 'rm -rf "$STAGE"' EXIT
 
 tar -xzf "$ARCHIVE" -C "$STAGE"
 
+# A data snapshot can predate a visibility decision. Preserve local decisions.
+# A fresh destination stays dark until the operator reconciles the latest ledger.
+if [[ -L "${DATA_DIR}/moderation" ]]; then
+  echo "Error: moderation directory must not be a symbolic link" >&2
+  exit 1
+fi
+install -d -m 0750 "${DATA_DIR}/moderation"
+if [[ ! -f "${DATA_DIR}/moderation/hidden.json" ]]; then
+  touch "${DATA_DIR}/moderation/recovery-required"
+  chmod 0640 "${DATA_DIR}/moderation/recovery-required"
+  for name in hidden.json posting.json; do
+    if [[ -f "${STAGE}/moderation/$name" ]]; then
+      install -m 0640 "${STAGE}/moderation/$name" "${DATA_DIR}/moderation/$name"
+    fi
+  done
+fi
+
 RESTORED=0
-for name in keys friends mail docs rooms blacklist public; do
+for name in keys friends mail docs rooms blacklist public registration-work acme; do
   if [[ -e "${STAGE}/${name}" ]]; then
     rm -rf "${DATA_DIR}/${name}.bak" 2>/dev/null || true
     if [[ -e "${DATA_DIR}/${name}" ]]; then
@@ -72,9 +89,15 @@ done
 
 mkdir -p "${DATA_DIR}/logs" "${DATA_DIR}/dl"
 chmod 0755 "$DATA_DIR"
-for name in keys friends mail docs rooms blacklist public logs dl; do
+for name in keys friends mail docs rooms blacklist public registration-work logs dl; do
   [[ -d "${DATA_DIR}/${name}" ]] && chmod 0755 "${DATA_DIR}/${name}"
 done
+if [[ -d "${DATA_DIR}/acme" ]]; then
+  chmod 0700 "${DATA_DIR}/acme"
+  for pf in "${DATA_DIR}/acme"/*.pem; do
+    [[ -f "$pf" ]] && chmod 0600 "$pf"
+  done
+fi
 
 if [[ $EUID -eq 0 ]] && id -u fatext >/dev/null 2>&1; then
   chown -R fatext:fatext "$DATA_DIR"

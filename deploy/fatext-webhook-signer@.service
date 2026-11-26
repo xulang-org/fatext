@@ -1,0 +1,16 @@
+[Unit]
+Description=Sign one fatext webhook
+
+[Service]
+DynamicUser=true
+LoadCredential=official.pem:/etc/fatext/official_private.pem
+ExecStart=/usr/bin/python3 -I /opt/fatext/deploy/webhook_signer.py
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+RuntimeMaxSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateDevices=true
+PrivateNetwork=true

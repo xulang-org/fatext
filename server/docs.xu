@@ -203,6 +203,29 @@ fn validate_doc_envelope(doc &json.Doc, env_node int, agent_id string, controlle
     << DocEnvCheck{ok: true, status: 200, code: "", message: "", env_json: env_json}
 }
 
+fn check_doc_write_rate_limit(st $&State, actor_id string, now int) HttpResp {
+    win := now / 60
+    if win != st.doc_min_window || st.doc_min_hits.len() > 8192 {
+        dmh := $&st.doc_min_hits
+        dmh.clear()
+        st.doc_min_window = win
+    }
+    cur_min := map_get_or(&st.doc_min_hits, actor_id + "", 0)
+    if cur_min >= 10 {
+        ra := 60 - (now % 60)
+        << err_resp(429, "ERR_RATE_LIMITED", "doc write rate limit exceeded (max 10/min)", ra, (win + 1) * 60, 0)
+    }
+    dkey := utc_date_from_unix(now) + ":" + actor_id
+    cur_day := map_get_or(&st.doc_day_count, dkey + "", 0)
+    if cur_day >= 50 {
+        rst := next_utc_midnight_unix(now)
+        << err_resp(429, "ERR_RATE_LIMITED", "daily doc write limit exceeded (max 50/day)", rst - now, rst, 0)
+    }
+    map_set($&st.doc_min_hits, actor_id + "", cur_min + 1)
+    map_set($&st.doc_day_count, dkey + "", cur_day + 1)
+    << HttpResp{status: 0, ctype: "", extra: "", body: ""}
+}
+
 fn store_agent_doc(
     hub $&HubState,
     aid string,
@@ -347,6 +370,10 @@ fn store_agent_doc(
     if !verify_pss_message(&spk, &canon, sig + "") {
         << err_resp(401, "ERR_BAD_SIGNATURE", "document RSA-PSS signature verification failed", 0, 0, 0)
     }
+    rl_err := check_doc_write_rate_limit($&hub.st, signer_id + "", now)
+    if rl_err.status != 0 {
+        << rl_err
+    }
 
     $locked_by := ""
     $lck_s := "false"
@@ -450,6 +477,10 @@ pub fn handle_agent_doc_delete(hub $&HubState, req &HttpReq, kind string, now in
     if cur.locked {
         << err_resp(403, "ERR_DOC_LOCKED", "document is locked by controller", 0, 0, 0)
     }
+    rl_err := check_doc_write_rate_limit($&hub.st, au.agent_id + "", now)
+    if rl_err.status != 0 {
+        << rl_err
+    }
     p := agent_doc_path(&hub.st, au.agent_id + "", kind + "")
     os.remove(p + "") or (err) {
         << err_resp(500, "ERR_INTERNAL", "failed removing document", 0, 0, 0)
@@ -518,6 +549,10 @@ pub fn handle_ctl_agent_doc_delete(hub $&HubState, req &HttpReq, aid string, kin
     _ := os.stat(p + "") or (err) {
         << err_resp(404, "ERR_NOT_FOUND", kind + " document not found", 0, 0, 0)
     }
+    rl_err := check_doc_write_rate_limit($&hub.st, au.agent_id + "", now)
+    if rl_err.status != 0 {
+        << rl_err
+    }
     os.remove(p + "") or (err) {
         << err_resp(500, "ERR_INTERNAL", "failed removing document", 0, 0, 0)
     }
@@ -527,6 +562,11 @@ pub fn handle_ctl_agent_doc_delete(hub $&HubState, req &HttpReq, aid string, kin
     del_ev := "{\"agent_id\":" + json.quote(&aid) + ",\"kind\":" + json.quote(&kind) + ",\"deleted\":true}"
     _ := hub_push_to_agent(hub, aid + "", "doc_update", &del_ev)
     << json_resp(200, "{\"ok\":true,\"agent_id\":" + json.quote(&aid) + ",\"kind\":" + json.quote(&kind) + ",\"deleted\":true}")
+}
+
+fn public_doc_meta(d &AgentDocSummary) string {
+    if d.found && d.visibility != "public" { << "{\"visibility\":\"private\"}" }
+    << doc_meta_json(d)
 }
 
 pub fn handle_public_docs_list(st &State, aid string) HttpResp {
@@ -539,7 +579,7 @@ pub fn handle_public_docs_list(st &State, aid string) HttpResp {
     }
     sd := read_agent_doc(st, aid + "", "soul")
     rd := read_agent_doc(st, aid + "", "rules")
-    << json_resp(200, "{\"agent_id\":" + json.quote(&aid) + ",\"soul\":" + doc_meta_json(&sd) + ",\"rules\":" + doc_meta_json(&rd) + "}")
+    << json_resp(200, "{\"agent_id\":" + json.quote(&aid) + ",\"soul\":" + public_doc_meta(&sd) + ",\"rules\":" + public_doc_meta(&rd) + "}")
 }
 
 pub fn handle_public_doc_get(st &State, aid string, kind string, raw_md bool) HttpResp {

@@ -19,6 +19,7 @@ import http.server
 import json
 import os
 import queue
+import shutil
 import signal
 import socket
 import stat
@@ -919,6 +920,9 @@ def main() -> int:
             for root_name in ("keys/", "friends/", "docs/", "rooms/", "public/"):
                 assert_true(root_name in dr_dry.stdout, f"restore dry-run missing {root_name}: {dr_dry.stdout}")
 
+            # Supply the latest moderation ledger independently of the data snapshot.
+            restored_data.mkdir()
+            shutil.copytree(data_dir / "moderation", restored_data / "moderation")
             subprocess.run(
                 ["bash", str(ROOT / "deploy" / "restore.sh"), str(archive), str(restored_data)],
                 stdout=subprocess.PIPE,

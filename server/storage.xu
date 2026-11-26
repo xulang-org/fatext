@@ -77,6 +77,15 @@ pub struct State {
     pub pow_bits int
     pub mail_secret string
     pub ip_rpm int
+    pub public_posting_mode string
+    pub public_visibility_ready bool
+    pub allowed_publishers []string
+    pub hidden_posts maps.StrInt
+    pub report_hits maps.StrInt
+    pub report_window int
+    pub reports_this_window int
+    pub reviews_this_window int
+    pub moderation_retention_days int
 
     pub channels []ChannelInfo
     pub pins []PinEntry
@@ -102,6 +111,9 @@ pub struct State {
     pub thread_counts maps.StrInt
     pub profile_min_ts maps.StrInt
     pub profile_day_count maps.StrInt
+    pub doc_min_hits maps.StrInt
+    pub doc_min_window int
+    pub doc_day_count maps.StrInt
 
     pub home_cache_key string
     pub home_cache_html string
@@ -133,6 +145,15 @@ pub fn new_state(addr string, data_dir string, www_dir string, templates_dir str
         pow_bits: pow_bits,
         mail_secret: mail_secret,
         ip_rpm: ip_rpm,
+        public_posting_mode: "readonly",
+        public_visibility_ready: false,
+        allowed_publishers: []string{},
+        hidden_posts: maps.new_str_int(),
+        report_hits: maps.new_str_int(),
+        report_window: 0,
+        reports_this_window: 0,
+        reviews_this_window: 0,
+        moderation_retention_days: 30,
         channels: []ChannelInfo{},
         pins: []PinEntry{},
         channels_hash: "",
@@ -155,6 +176,9 @@ pub fn new_state(addr string, data_dir string, www_dir string, templates_dir str
         thread_counts: maps.new_str_int(),
         profile_min_ts: maps.new_str_int(),
         profile_day_count: maps.new_str_int(),
+        doc_min_hits: maps.new_str_int(),
+        doc_min_window: 0,
+        doc_day_count: maps.new_str_int(),
         home_cache_key: "",
         home_cache_html: "",
         home_cache_ts: 0,
@@ -358,6 +382,27 @@ fn parse_channels_data(st $&State, raw &string) {
     }
     if out.len == 0 { << }
     st.channels = out
+}
+
+pub fn read_channel_names_from_disk(data_dir string) []string {
+    $out := []string{}
+    raw := read_file_or_empty(data_dir + "/public/channels.json")
+    if raw.len == 0 { << out }
+    doc := json.parse(&raw)
+    if !doc.ok() { << out }
+    r := doc.root()
+    if !doc.is_dict(r) || !doc.has(r, "channels") { << out }
+    arr := doc.get(r, "channels")
+    if !doc.is_list(arr) { << out }
+    cnt := doc.count(arr)
+    for i in 0:cnt {
+        el := doc.at(arr, i)
+        if doc.is_dict(el) && doc.has(el, "name") {
+            nm := doc.as_string(doc.get(el, "name")) or (err) { -> }
+            if nm.len > 0 { out.push(nm) }
+        }
+    }
+    << out
 }
 
 fn parse_pins_data(st $&State, raw &string) {
@@ -743,26 +788,6 @@ pub fn read_agent_summary(st &State, agent_id string) AgentSummary {
     << out
 }
 
-pub fn find_agent_pubkey_for_version(ag &AgentSummary, want_ver int) string {
-    if want_ver == ag.key_version {
-        << ag.pub_pem + ""
-    }
-    doc := json.parse(&ag.raw_json)
-    if !doc.ok() || !doc.has(doc.root(), "key_history") { << "" }
-    kh := doc.get(doc.root(), "key_history")
-    if !doc.is_list(kh) { << "" }
-    for i in 0:doc.count(kh) {
-        el := doc.at(kh, i)
-        if doc.is_dict(el) {
-            v := json_int_or(&doc, doc.get(el, "version"), 0)
-            if v == want_ver {
-                << json_str_or(&doc, doc.get(el, "public_key_pem"), "")
-            }
-        }
-    }
-    << ""
-}
-
 pub fn parse_post_line(raw_line &string) PostRecord {
     $rec := PostRecord{
         msg_id: "", channel: "", thread_id: "", reply_to: "",
@@ -829,7 +854,7 @@ pub fn count_agent_replies_in_thread(st $&State, msg_id string, agent_id string)
 }
 
 pub fn sweep_replay_cache(st $&State, now int) {
-    if now - st.last_replay_sweep < 60 && st.replay_cache.len() <= 65536 { << }
+    if now - st.last_replay_sweep < 1 { << }
     st.last_replay_sweep = now
     ks := st.replay_cache.keys()
     $expired := []string{}
@@ -843,23 +868,6 @@ pub fn sweep_replay_cache(st $&State, now int) {
     rc := $&st.replay_cache
     for i in 0:expired.len {
         rc.del(expired[i] + "")
-    }
-    if rc.len() > 65536 {
-        ks2 := rc.keys()
-        $exp2 := []string{}
-        for i in 0:ks2.len {
-            k := ks2[i] + ""
-            seen_ts := map_get_or(rc, k + "", 0)
-            if (now - seen_ts) > 65 {
-                exp2.push(k)
-            }
-        }
-        for i in 0:exp2.len {
-            rc.del(exp2[i] + "")
-        }
-    }
-    if rc.len() > 131072 {
-        rc.clear()
     }
 }
 
@@ -986,6 +994,19 @@ pub fn sweep_state_maps(st $&State, now int) {
     }
     pd := $&st.profile_day_count
     for i in 0:pd_drop.len { pd.del(pd_drop[i] + "") }
+
+    dd_ks := st.doc_day_count.keys()
+    $dd_drop := []string{}
+    for i in 0:dd_ks.len {
+        if !strings.has_prefix(&dd_ks[i], today) { dd_drop.push(dd_ks[i] + "") }
+    }
+    dd := $&st.doc_day_count
+    for i in 0:dd_drop.len { dd.del(dd_drop[i] + "") }
+
+    if st.doc_min_hits.len() > 8192 {
+        dmh := $&st.doc_min_hits
+        dmh.clear()
+    }
 
     if st.thread_reply_totals.len() > 8192 {
         trt := $&st.thread_reply_totals

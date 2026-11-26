@@ -1,0 +1,397 @@
+@main
+
+#crypto/sha256
+#encoding/json
+#maps
+#net/url
+#os
+#strconv
+#strings
+
+pub const PUBLIC_CONTENT_CACHE = "Cache-Control: no-store\r\n"
+
+pub fn contains_private_key_marker(text &string) bool {
+    << strings.contains(text, "-----BEGIN PRIVATE KEY-----") ||
+       strings.contains(text, "-----BEGIN RSA PRIVATE KEY-----") ||
+       strings.contains(text, "-----BEGIN OPENSSH PRIVATE KEY-----") ||
+       strings.contains(text, "-----BEGIN EC PRIVATE KEY-----") ||
+       strings.contains(text, "-----BEGIN ENCRYPTED PRIVATE KEY-----")
+}
+
+fn moderation_dir(st &State) string {
+    << st.data_dir + "/moderation"
+}
+
+fn is_posting_mode(mode &string) bool {
+    << *mode == "readonly" || *mode == "invite" || *mode == "open"
+}
+
+fn load_hidden_messages(path string) string {
+    raw := os.read(path + "") or (err) {
+        if !os.is_not_exist(err.msg()) { << "" }
+        write_atomic_mode(path + "", &"[]\n", 416) or (write_err) { << "" }
+        << "[]"
+    }
+    << raw
+}
+
+pub fn init_public_moderation(st $&State, default_mode string) {
+    dir := moderation_dir(st)
+    os.mkdir_all(dir + "") or (err) { << }
+    if file_exists(dir + "/recovery-required") { << }
+
+    raw := load_hidden_messages(dir + "/hidden.json")
+    doc := json.parse(&raw)
+    if !doc.ok() || !doc.is_list(doc.root()) { << }
+    for i in 0:doc.count(doc.root()) {
+        mid := json_str_or(&doc, doc.at(doc.root(), i), "")
+        if !is_valid_msg_id(mid + "") { << }
+        map_set($&st.hidden_posts, mid, 1)
+    }
+    st.public_visibility_ready = true
+
+    cfg := os.read(dir + "/posting.json") or (err) {
+        if os.is_not_exist(err.msg()) && is_posting_mode(&default_mode) {
+            st.public_posting_mode = default_mode
+        }
+        <<
+    }
+    policy := json.parse(&cfg)
+    if !policy.ok() || !policy.is_dict(policy.root()) { << }
+    mode := json_str_or(&policy, policy.get(policy.root(), "mode"), "")
+    ids := posting_allowlist(&policy, policy.get(policy.root(), "allowed_agent_ids"))
+    if !ids.ok || !is_posting_mode(&mode) { << }
+    st.public_posting_mode = mode
+    st.allowed_publishers = clone_str_slice(&ids.ids)
+}
+
+pub fn public_posting_allowed(st &State, aid string) bool {
+    if !st.public_visibility_ready { << false }
+    if st.public_posting_mode == "open" { << true }
+    << st.public_posting_mode == "invite" && str_list_contains(&st.allowed_publishers, aid + "")
+}
+
+pub fn public_message_visible(st &State, mid string) bool {
+    << st.public_visibility_ready && !st.hidden_posts.has(mid + "")
+}
+
+pub fn read_public_post_records(st &State, path string) []PostRecord {
+    $out := []PostRecord{}
+    if !st.public_visibility_ready { << out }
+    raw := read_file_or_empty(path)
+    lines := strings.split(&raw, "\n")
+    for i in 0:lines.len {
+        if lines[i].len == 0 { -> }
+        rec := parse_post_line(&lines[i])
+        if !is_valid_msg_id(rec.msg_id + "") || !public_message_visible(st, rec.msg_id + "") { -> }
+        out.push(rec)
+    }
+    << out
+}
+
+pub fn public_archive(st &State, raw &string) string {
+    if !st.public_visibility_ready { << "" }
+    if st.hidden_posts.len() == 0 { << *raw + "" }
+    lines := strings.split(raw, "\n")
+    $visible := []string{}
+    for i in 0:lines.len {
+        if lines[i].len == 0 { -> }
+        record := parse_post_line(&lines[i])
+        if is_valid_msg_id(record.msg_id + "") && public_message_visible(st, record.msg_id + "") {
+            visible.push(lines[i] + "")
+        }
+    }
+    if visible.len == 0 { << "" }
+    << strings.join(visible, "\n") + "\n"
+}
+
+struct PostingAllowlist {
+    ok bool
+    ids []string
+}
+
+fn posting_allowlist(doc &json.Doc, node int) PostingAllowlist {
+    $ids := []string{}
+    none := PostingAllowlist{ok: false, ids: []string{}}
+    if !doc.is_list(node) || doc.count(node) > 512 { << none }
+    for i in 0:doc.count(node) {
+        aid := json_str_or(doc, doc.at(node, i), "")
+        if !is_valid_agent_id(aid + "") { << none }
+        if !str_list_contains(&ids, aid + "") { ids.push(aid) }
+    }
+    << PostingAllowlist{ok: true, ids: ids}
+}
+
+fn encode_string_list(items &[]string) string {
+    $quoted := []string{}
+    for i in 0:items.len { quoted.push(json.quote(&items[i])) }
+    << "[" + strings.join(quoted, ",") + "]"
+}
+
+fn public_posting_json(st &State) string {
+    $ready := "false"
+    if st.public_visibility_ready { ready = "true" }
+    << "{\"mode\":" + json.quote(&st.public_posting_mode) +
+        ",\"visibility_ready\":" + ready +
+        ",\"allowed_agent_ids\":" + encode_string_list(&st.allowed_publishers) + "}"
+}
+
+pub fn handle_public_posting_admin(hub $&HubState, req &HttpReq, method string, now int) HttpResp {
+    if method == "GET" { << json_resp(200, public_posting_json(&hub.st)) }
+    if method != "PUT" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+    doc := json.parse(&req.req_body)
+    if !doc.ok() || !doc.is_dict(doc.root()) {
+        << err_resp(400, "ERR_BAD_REQUEST", "posting policy must be a JSON object", 0, 0, 0)
+    }
+    root := doc.root()
+    mode := json_str_or(&doc, doc.get(root, "mode"), "")
+    if !is_posting_mode(&mode) {
+        << err_resp(400, "ERR_BAD_REQUEST", "mode must be readonly, invite, or open", 0, 0, 0)
+    }
+    $ids := clone_str_slice(&hub.st.allowed_publishers)
+    if doc.has(root, "allowed_agent_ids") {
+        list := posting_allowlist(&doc, doc.get(root, "allowed_agent_ids"))
+        if !list.ok {
+            << err_resp(400, "ERR_BAD_REQUEST", "allowed_agent_ids must be an array of up to 512 agent IDs", 0, 0, 0)
+        }
+        ids = clone_str_slice(&list.ids)
+    }
+    body := "{\"mode\":" + json.quote(&mode) + ",\"allowed_agent_ids\":" + encode_string_list(&ids) + "}\n"
+    write_atomic_mode(moderation_dir(&hub.st) + "/posting.json", &body, 416) or (err) {
+        << err_resp(500, "ERR_INTERNAL", "could not save posting policy", 0, 0, 0)
+    }
+    hub.st.public_posting_mode = mode + ""
+    hub.st.allowed_publishers = ids
+    log_admin_action(hub, req, now, "public_posting", "public_feed", mode)
+    << json_resp(200, public_posting_json(&hub.st))
+}
+
+fn message_in_thread(st &State, thread string, message string) bool {
+    if !is_valid_msg_id(thread + "") || !is_valid_msg_id(message + "") { << false }
+    << message_author(st, thread, message).len > 0
+}
+
+fn message_author(st &State, thread string, message string) string {
+    if !is_valid_msg_id(thread + "") || !is_valid_msg_id(message + "") { << "" }
+    records := read_jsonl_records(thread_path(st, thread + ""))
+    if records.len == 0 || records[0].msg_id != thread { << "" }
+    for i in 0:records.len {
+        if records[i].msg_id == message { << records[i].sender_id + "" }
+    }
+    << ""
+}
+
+pub fn handle_message_visibility_admin(hub $&HubState, req &HttpReq, thread string, message string, now int) HttpResp {
+    if req.method() != "PUT" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+    if !hub.st.public_visibility_ready {
+        << err_resp(503, "ERR_MODERATION_UNAVAILABLE", "moderation state requires recovery", 0, 0, 0)
+    }
+    doc := json.parse(&req.req_body)
+    if !doc.ok() || !doc.is_dict(doc.root()) {
+        << err_resp(400, "ERR_BAD_REQUEST", "decision must be a JSON object", 0, 0, 0)
+    }
+    r := doc.root()
+    action := json_str_or(&doc, doc.get(r, "action"), "")
+    reason := json_str_or(&doc, doc.get(r, "reason"), "")
+    if (action != "hide" && action != "restore") || !is_valid_tag(&reason) {
+        << err_resp(400, "ERR_BAD_REQUEST", "action must be hide or restore and reason must be a short code", 0, 0, 0)
+    }
+    author := message_author(&hub.st, thread + "", message + "")
+    if author.len == 0 {
+        << err_resp(404, "ERR_NOT_FOUND", "message not found", 0, 0, 0)
+    }
+
+    $hidden := []string{}
+    ids := hub.st.hidden_posts.keys()
+    for i in 0:ids.len {
+        if ids[i] != message { hidden.push(ids[i] + "") }
+    }
+    if action == "hide" { hidden.push(message + "") }
+    body := encode_string_list(&hidden) + "\n"
+    write_atomic_mode(moderation_dir(&hub.st) + "/hidden.json", &body, 416) or (err) {
+        << err_resp(500, "ERR_INTERNAL", "could not save message visibility", 0, 0, 0)
+    }
+    $updated := maps.new_str_int()
+    for i in 0:hidden.len { updated.set(hidden[i] + "", 1) }
+    hub.st.hidden_posts = updated
+    hub.st.home_cache_ver += 1
+    notice := "{\"kind\":" + json.quote(&("message_" + action)) + ",\"thread_id\":" + json.quote(&thread) +
+        ",\"msg_id\":" + json.quote(&message) + ",\"reason\":" + json.quote(&reason) + ",\"at\":" + strconv.itoa(now) + "}"
+    sent := record_moderation_notice(hub, author, &notice, now, now)
+    log_admin_action(hub, req, now, "message_" + action, message + "", reason)
+    << json_resp(200, "{\"msg_id\":" + json.quote(&message) + ",\"action\":" + json.quote(&action) +
+        ",\"notice_recorded\":" + sent + "}")
+}
+
+fn report_rate_allowed(st $&State, ip string, now int, automatic bool) bool {
+    window := now / 600
+    if st.report_window != window {
+        st.report_window = window
+        st.reports_this_window = 0
+        st.reviews_this_window = 0
+        map_clear($&st.report_hits)
+    }
+    $key := ip + ""
+    if automatic { key = "ai:" + ip }
+    ip_count := map_get_or(&st.report_hits, key + "", 0)
+    if ip_count >= 5 { << false }
+    if automatic {
+        if st.reviews_this_window >= 40 { << false }
+        st.reviews_this_window += 1
+    } else {
+        if st.reports_this_window >= 60 { << false }
+        st.reports_this_window += 1
+    }
+    map_set($&st.report_hits, key, ip_count + 1)
+    << true
+}
+
+fn is_receipt_id(id &string) bool {
+    << id.len == 30 && strings.has_prefix(id, "rpt_") &&
+       is_valid_msg_id("msg_" + id[4:id.len])
+}
+
+fn report_path(st &State, date string, id string) string {
+    << moderation_dir(st) + "/reports/" + date + "/" + id + ".json"
+}
+
+fn save_report(st &State, date string, body &string) string {
+    ulid := new_ulid() or (err) { << "" }
+    id := "rpt_" + ulid
+    dir := moderation_dir(st) + "/reports/" + date
+    os.mkdir_all(dir) or (err) { << "" }
+    write_atomic_mode(report_path(st, date + "", id + ""), body, 384) or (err) { << "" }
+    << id
+}
+
+fn report_html(st &State, status int, detail string, thread string, message string, form bool) HttpResp {
+    $body := "<h1>Report public content</h1>"
+    if detail.len > 0 { body = body + "<p>" + esc(&detail) + "</p>" }
+    if form {
+        body = body + "<form method=\"post\" action=\"/report\">" +
+            "<p><label>Thread ID <input name=\"thread_id\" required maxlength=\"30\" value=\"" + esc(&thread) + "\"></label></p>" +
+            "<p><label>Message ID <input name=\"msg_id\" required maxlength=\"30\" value=\"" + esc(&message) + "\"></label></p>" +
+            "<p><label>Reason <select name=\"reason\"><option value=\"privacy\">Privacy</option>" +
+            "<option value=\"harassment\">Harassment or threats</option><option value=\"fraud\">Fraud or impersonation</option>" +
+            "<option value=\"copyright\">Copyright</option><option value=\"other\">Other</option></select></label></p>" +
+            "<p><label>Details <textarea name=\"details\" maxlength=\"2000\" rows=\"4\"></textarea></label></p>" +
+            "<p>Describe the issue without including passwords or unnecessary personal data.</p>" +
+            "<button type=\"submit\">Submit report</button></form>"
+    }
+    body = body + "<p><a href=\"/report/status\">Check an existing report</a></p>"
+    << report_page(st, status, "Report public content", "/report", body)
+}
+
+fn report_page(st &State, status int, title string, path string, body string) HttpResp {
+    rendered := render_base_html(st, title + " — fatext.com", title, "https://fatext.com" + path,
+        "", body, false, "", "", "")
+    headers := "Content-Security-Policy: default-src 'none'; style-src 'self'; img-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'\r\n" +
+        PUBLIC_CONTENT_CACHE + "X-Robots-Tag: noindex\r\n"
+    << http_resp(status, "text/html; charset=utf-8", headers, &rendered)
+}
+
+pub fn handle_public_report(st $&State, req &HttpReq, web bool, now int) HttpResp {
+    if web && req.method() == "GET" {
+        thread := query_param_str(req.path(), "thread", "")
+        msg := query_param_str(req.path(), "message", "")
+        << report_html(st, 200, "", thread, msg, true)
+    }
+    if req.method() != "POST" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+    if req.req_body.len > 8192 { << err_resp(413, "ERR_PAYLOAD_TOO_LARGE", "report body too large", 0, 0, 0) }
+    $thread := ""
+    $message := ""
+    $reason := ""
+    $details := ""
+    if web {
+        if req.header("Sec-Fetch-Site") == "cross-site" {
+            << report_html(st, 403, "Submit the report from this site.", "", "", true)
+        }
+        ctype := req.header("Content-Type")
+        if !strings.has_prefix(&ctype, "application/x-www-form-urlencoded") {
+            << report_html(st, 400, "Invalid report form.", "", "", true)
+        }
+        form := url.parse_query(req.body())
+        thread = form.get("thread_id")
+        message = form.get("msg_id")
+        reason = form.get("reason")
+        details = form.get("details")
+    } else {
+        doc := json.parse(&req.req_body)
+        if !doc.ok() || !doc.is_dict(doc.root()) {
+            << err_resp(400, "ERR_BAD_REQUEST", "report must be a JSON object", 0, 0, 0)
+        }
+        thread = json_str_or(&doc, doc.get(doc.root(), "thread_id"), "")
+        message = json_str_or(&doc, doc.get(doc.root(), "msg_id"), "")
+        reason = json_str_or(&doc, doc.get(doc.root(), "reason"), "")
+        details = json_str_or(&doc, doc.get(doc.root(), "details"), "")
+    }
+    $reporter := ""
+    if !web && (req.header("X-Agent-Id").len > 0 || req.header("X-Signature").len > 0) {
+        au := authenticate_scoped(st, req, now, "")
+        if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
+        reporter = au.agent_id + ""
+    }
+    if message.len == 0 { message = thread + "" }
+    if !is_valid_msg_id(thread + "") || !is_valid_msg_id(message + "") || !is_valid_tag(&reason) ||
+       details.len > 2000 || has_forbidden_ctrl(&details) {
+        if web { << report_html(st, 400, "Check the message IDs, reason, and details.", thread + "", message + "", true) }
+        << err_resp(400, "ERR_BAD_REQUEST", "invalid thread ID, message ID, reason, or details", 0, 0, 0)
+    }
+    if !report_rate_allowed(st, req.remote_ip + "", now, false) {
+        if web { << report_html(st, 429, "Too many reports. Try again in a few minutes.", thread + "", message + "", true) }
+        << err_resp(429, "ERR_RATE_LIMITED", "report rate limit reached", 600, 0, 0)
+    }
+    if !message_in_thread(st, thread + "", message + "") {
+        if web { << report_html(st, 404, "Message not found in the specified thread.", thread + "", message + "", true) }
+        << err_resp(404, "ERR_NOT_FOUND", "message not found", 0, 0, 0)
+    }
+    token := mint_report_token()
+    if token.len == 0 { << err_resp(503, "ERR_REPORT_UNAVAILABLE", "report storage unavailable", 0, 0, 0) }
+    token_hash := sha256.sum256(token + "")
+    body := "{\"source\":\"public\",\"status_token_hash\":" + json.quote(&token_hash) + ",\"thread_id\":" + json.quote(&thread) +
+        ",\"msg_id\":" + json.quote(&message) + ",\"reason\":" + json.quote(&reason) +
+        ",\"details\":" + json.quote(&details) + ",\"reporter_id\":" + json.quote(&reporter) +
+        ",\"created_at\":" + strconv.itoa(now) + "}\n"
+    date := utc_date_from_unix(now)
+    id := save_report(st, date + "", &body)
+    if id.len == 0 {
+        if web { << report_html(st, 503, "Report storage is unavailable. Try again later.", thread + "", message + "", true) }
+        << err_resp(503, "ERR_REPORT_UNAVAILABLE", "report storage unavailable", 0, 0, 0)
+    }
+    if web { << render_report_status(st, 201, "Report received.", date + "", id + "", token + "", true) }
+    out := "{\"receipt\":" + json.quote(&id) + ",\"date\":" + json.quote(&date) +
+        ",\"token\":" + json.quote(&token) + "}"
+    << http_resp(201, "application/json; charset=utf-8", PUBLIC_CONTENT_CACHE, &out)
+}
+
+pub fn handle_report_admin(st &State, req &HttpReq, now int) HttpResp {
+    if req.method() != "GET" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+    date := query_param_str(req.path(), "date", utc_date_from_unix(now))
+    id := query_param_str(req.path(), "receipt", "")
+    if !case_date_retained(st, &date, now) || (id.len > 0 && !is_receipt_id(&id)) {
+        << err_resp(400, "ERR_BAD_REQUEST", "invalid date or receipt", 0, 0, 0)
+    }
+    if id.len > 0 {
+        raw := os.read(report_path(st, date + "", id + "")) or (err) {
+            << err_resp(404, "ERR_NOT_FOUND", "report not found", 0, 0, 0)
+        }
+        report := json.parse(&raw)
+        if !report.ok() || !report.is_dict(report.root()) {
+            << err_resp(500, "ERR_INTERNAL", "report record is invalid", 0, 0, 0)
+        }
+        clean := strings.trim_space(&raw)
+        state := read_case_decision(st, date + "", id + "")
+        out := clean[0:(clean.len - 1)] + ",\"decision\":" + decision_json(&state) + "}"
+        << http_resp(200, "application/json; charset=utf-8", PUBLIC_CONTENT_CACHE, &out)
+    }
+    names := read_dir_or_empty(moderation_dir(st) + "/reports/" + date)
+    entries := strings.split(&names, "\n")
+    $receipts := []string{}
+    for i in 0:entries.len {
+        if entries[i].len != 35 || !strings.has_suffix(&entries[i], ".json") { -> }
+        rid := entries[i][0:30] + ""
+        if is_receipt_id(&rid) { receipts.push(rid) }
+    }
+    out := "{\"date\":" + json.quote(&date) + ",\"receipts\":" + encode_string_list(&receipts) + "}"
+    << http_resp(200, "application/json; charset=utf-8", PUBLIC_CONTENT_CACHE, &out)
+}

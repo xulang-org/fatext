@@ -6,7 +6,10 @@
 #time
 #crypto/rsa
 #encoding/json
-#net/http
+#net
+#net/url
+#crypto/tls
+#crypto/sha256
 
 const FRIEND_REQ_TTL_SEC = 864000
 const MAIL_TTL_SEC = 864000
@@ -543,25 +546,95 @@ pub fn handle_block_rm(st $&State, req &HttpReq, tgt string, now int) HttpResp {
 // Zero-Disk E2EE Relay (DM & Room) + Webhook fallback
 // =========================================================================
 
-fn deliver_webhook(url_s string, payload string) {
-    if !is_safe_webhook_url_resolved(&url_s) { << }
-    $cl := http.new_client()
-    cl.set_timeout(5000000000)
-    cl.max_redirects = -1
-    cl.max_response_bytes = 4096
-    extra := "Content-Type: application/json\r\n"
-    _ := cl.do_extra("POST", url_s, extra, &payload) or (err) { << }
+fn read_webhook_signature(conn &net.Conn, target &string, payload &string) string {
+    query := *target + "\n" + sha256.sum256(*payload + "") + "\n"
+    n := conn.write(&query) or (err) { << "" }
+    if n != query.len { << "" }
+    $line := ""
+    while line.len < 1024 && !strings.has_suffix(&line, "\n") {
+        part := conn.read(1024 - line.len) or (err) { << "" }
+        if part.len == 0 { << "" }
+        line = line + part
+    }
+    if !strings.has_suffix(&line, "\n") { << "" }
+    fields := strings.split(&line[0:(line.len - 1)], " ")
+    if fields.len != 2 || !is_uint64_decimal(&fields[0]) || signature_replay_key(&fields[1]).len == 0 { << "" }
+    << "X-Fatext-Timestamp: " + fields[0] + "\r\nX-Fatext-Signature: " + fields[1] + "\r\n"
 }
 
-pub fn webhook_worker_loop(ch chan string) {
+fn webhook_signature_headers(sock string, target &string, payload &string) string {
+    $conn := net.dial_timeout("unix", sock, 2000000000) or (err) { << "" }
+    conn.set_deadline(time.now() + 2000000000) or (err) {
+        _ := conn.close() or (close_err) { << "" }
+        << ""
+    }
+    headers := read_webhook_signature(&conn, target, payload)
+    _ := conn.close() or (err) { << "" }
+    << headers
+}
+
+fn deliver_webhook(sock string, url_s string, payload string) {
+    ip := resolve_public_webhook_ip(&url_s)
+    if ip.len == 0 { << }
+    u := url.parse(url_s + "") or (err) { << }
+    host := extract_https_host(&url_s)
+    $port := u.port()
+    if port.len == 0 { port = "443" }
+    target := u.request_uri()
+    headers := webhook_signature_headers(sock, &target, &payload)
+    if headers.len == 0 { << }
+    post_webhook(net.join_host_port(&ip, &port), host + "", u.host(), target + "", &headers, &payload)
+}
+
+fn post_webhook(addr string, host string, authority string, target string, headers &string, payload &string) {
+    deadline := time.now() + 5000000000
+    $nc := net.dial_timeout("tcp", addr, 5000000000) or (err) { << }
+    fd := nc.descriptor() or (err) {
+        _ := nc.close() or (close_err) { << }
+        <<
+    }
+    nc.set_deadline(deadline) or (err) {
+        close_raw_fd_quiet(fd)
+        <<
+    }
+    $cfg := tls.new_config(host)
+    cfg.set_next_protos(["http/1.1"])
+    $tc := tls.client(nc, &cfg) or (err) {
+        close_raw_fd_quiet(fd)
+        <<
+    }
+    request := "POST " + target + " HTTP/1.1\r\nHost: " + authority + "\r\n" +
+        *headers + "Content-Type: application/json\r\nConnection: close\r\nContent-Length: " +
+        strconv.itoa(payload.len) + "\r\n\r\n" + *payload
+    tc.write(&request) or (err) {
+        _ := tc.close() or (close_err) { << }
+        <<
+    }
+    _ := tc.read(4096) or (err) {
+        _ := tc.close() or (close_err) { << }
+        <<
+    }
+    _ := tc.close() or (err) { << }
+}
+
+pub fn webhook_worker_loop(ch chan string, signer_socket string) {
     while true {
         item := <-ch
         nl := strings.index_of(&item, "\n")
         if nl > 0 && nl + 1 < item.len {
-            u := item[0:nl] + ""
-            p := item[(nl + 1):item.len] + ""
-            deliver_webhook(u, p)
+            deliver_webhook(signer_socket + "", item[0:nl], item[(nl + 1):item.len])
         }
+    }
+}
+
+fn queue_webhook(hub &HubState, tag &AgentSummary, body string) bool {
+    if !hub.webhooks_enabled { << false }
+    wh := agent_ext_str(tag, "webhook_url", "")
+    if !is_safe_webhook_url_static(&wh) { << false }
+    item := wh + "\n" + body
+    select {
+        hub.webhook_ch <- item { << true }
+        else { << false }
     }
 }
 
@@ -625,20 +698,11 @@ pub fn deliver_dm_relay_raw(hub $&HubState, tag &AgentSummary, from_id string, t
     ev_json := "{\"from\":" + json.quote(&from_id) + ",\"frame\":" + frame_body + "}"
     delivered := hub_push_dm(hub, to_id + "", &ev_json)
     if delivered == 0 {
-        wh := agent_ext_str(tag, "webhook_url", "")
-        if is_safe_webhook_url_static(&wh) {
-            wh_body := "{\"event\":\"dm\",\"data\":" + ev_json + "}"
-            witem := wh + "\n" + wh_body
-            select {
-                hub.webhook_ch <- witem {
-                    hub.metrics.dm_webhook += 1
-                    << "webhook"
-                }
-                else {
-                    hub.metrics.dm_dropped += 1
-                    << "dropped_offline"
-                }
-            }
+        wh_body := "{\"event\":\"dm\",\"to\":" + json.quote(&to_id) +
+            ",\"data\":" + ev_json + "}"
+        if queue_webhook(hub, tag, wh_body) {
+            hub.metrics.dm_webhook += 1
+            << "webhook"
         }
         hub.metrics.dm_dropped += 1
         << "dropped_offline"
@@ -667,6 +731,9 @@ pub fn handle_dm_send(hub $&HubState, req &HttpReq, to_id string, now int) HttpR
 
     tag := read_agent_summary_cached($&hub.st, to_id + "")
     if !tag.found { << err_resp(404, "ERR_NOT_FOUND", "recipient not found", 0, 0, 0) }
+    if hub.st.banned.has(to_id + "") {
+        << err_resp(403, "ERR_AGENT_BANNED", "recipient is banned", 0, 0, 0)
+    }
     if tag.status == "revoked" { << err_resp(403, "ERR_REVOKED", "recipient revoked", 0, 0, 0) }
     if tag.controller_id.len > 0 && hub.st.revoked.has(tag.controller_id + "") {
         << err_resp(403, "ERR_CONTROLLER_REVOKED", "recipient controller revoked", 0, 0, 0)
@@ -727,7 +794,7 @@ pub fn handle_mail_ingest(hub $&HubState, req &HttpReq, now int) HttpResp {
     dkim := json_bool_or(&doc, doc.get(r, "dkim_pass"), false)
     dmarc := json_bool_or(&doc, doc.get(r, "dmarc_pass"), false)
     $rat := json_int_or(&doc, doc.get(r, "received_at"), now)
-    if rat <= 0 { rat = now }
+    if rat <= 0 || rat > now + 300 || rat < now - MAIL_TTL_SEC { rat = now }
 
     if mfrom.len > 512 || subj.len > 512 || snippet.len > 16384 {
         << err_resp(413, "ERR_PAYLOAD_TOO_LARGE", "mail field exceeds size limit", 0, 0, 0)
@@ -804,7 +871,12 @@ pub fn handle_mail_ingest(hub $&HubState, req &HttpReq, now int) HttpResp {
         << err_resp(500, "ERR_INTERNAL", "failed persisting encrypted mail", 0, 0, 0)
     }
     ev_data := "{\"mail_id\":" + json.quote(&mail_id) + ",\"received_at\":" + strconv.itoa(rat) + "}"
-    _ := hub_push_to_agent(hub, to_id + "", "mail", &ev_data)
+    if hub_push_to_agent(hub, to_id + "", "mail", &ev_data) == 0 {
+        wh_body := "{\"event\":\"mail\",\"to\":" + json.quote(&to_id) +
+            ",\"mail_id\":" + json.quote(&mail_id) + ",\"size\":" + strconv.itoa(stored_json.len) +
+            ",\"spf_pass\":" + spf_s + ",\"dkim_pass\":" + dkim_s + ",\"dmarc_pass\":" + dmarc_s + "}"
+        _ := queue_webhook(hub, &tag, wh_body)
+    }
     hub.metrics.mail_ingested += 1
     log_event_json(hub.log_ch, now, "mail_ingest",
         "\"to\":" + json.quote(&to_id) + ",\"mail_id\":" + json.quote(&mail_id) +

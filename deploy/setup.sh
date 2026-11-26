@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 022
 
 # Bootstrap fatext-server on Linux with built-in ACME Auto-TLS (no Caddy or certbot required).
 # Usage (as root):
@@ -20,9 +21,21 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
-id -u fatext >/dev/null 2>&1 || useradd --system --home /var/lib/fatext --shell /usr/sbin/nologin fatext
+id -u fatext >/dev/null 2>&1 || useradd --system --user-group --home /var/lib/fatext --shell /usr/sbin/nologin fatext
 
-install -d -m 0755 /opt/fatext /opt/fatext/deploy /opt/fatext/scripts /etc/fatext /var/lib/fatext /var/lib/fatext/dl /var/lib/fatext/public
+id -u fatext-backup >/dev/null 2>&1 || useradd --system --user-group --no-create-home --shell /usr/sbin/nologin fatext-backup
+install -d -m 0700 -o fatext-backup -g fatext-backup /var/backups/fatext
+
+# Legacy installations gave the daemon ownership of the entire code tree.
+# Install from the trusted checkout into a fresh directory and retain the old tree.
+if [[ -e /opt/fatext || -L /opt/fatext ]]; then
+  if [[ -L /opt/fatext || "$(stat -c %u /opt/fatext)" != 0 ]]; then
+    previous="$(mktemp -d /opt/.fatext-previous.XXXXXXXX)"
+    mv -T /opt/fatext "$previous/fatext"
+    echo "Preserved previous installation in $previous/fatext"
+  fi
+fi
+install -d -m 0755 -o root -g root /opt/fatext /opt/fatext/deploy /opt/fatext/scripts /etc/fatext /var/lib/fatext /var/lib/fatext/dl /var/lib/fatext/public
 install -d -m 0700 -o fatext -g fatext /var/lib/fatext/acme
 cp -r "$REPO_ROOT/www" /opt/fatext/
 cp -r "$REPO_ROOT/templates" /opt/fatext/
@@ -31,6 +44,7 @@ install -m 0755 "$REPO_ROOT/deploy/backup.sh" /opt/fatext/deploy/backup.sh
 install -m 0755 "$REPO_ROOT/deploy/restore.sh" /opt/fatext/deploy/restore.sh
 install -m 0755 "$REPO_ROOT/deploy/graceful_stop.sh" /opt/fatext/deploy/graceful_stop.sh
 install -m 0755 "$REPO_ROOT/deploy/sync_dl.sh" /opt/fatext/deploy/sync_dl.sh
+install -m 0644 "$REPO_ROOT/deploy/webhook_signer.py" /opt/fatext/deploy/webhook_signer.py
 install -m 0644 "$REPO_ROOT/scripts/analyze_logs.py" /opt/fatext/scripts/analyze_logs.py
 
 if [[ -x "$REPO_ROOT/build/fatext-server" ]]; then
@@ -61,6 +75,10 @@ FATEXT_DATA_DIR=/var/lib/fatext
 FATEXT_WWW_DIR=/opt/fatext/www
 FATEXT_TEMPLATES_DIR=/opt/fatext/templates
 FATEXT_DL_DIR=/var/lib/fatext/dl
+# Public-content AI moderation. Set the API key in this protected file.
+FATEXT_AI_MODERATION_MODEL=omni-moderation-latest
+# FATEXT_AI_MODERATION_API_KEY=
+# FATEXT_AI_MODERATION_URL=https://api.openai.com/v1/moderations
 FATEXT_POW_BITS=20
 FATEXT_IP_RPM=600
 FATEXT_MAX_CONNS=4096
@@ -88,17 +106,22 @@ EOF
   echo "Created /etc/fatext/fatext.env (generated mail, shutdown & admin secrets)."
 fi
 
-cp /opt/fatext/config/channels.json /var/lib/fatext/public/channels.json
-cp /opt/fatext/config/pins.json /var/lib/fatext/public/pins.json
-chown -R fatext:fatext /opt/fatext /var/lib/fatext
+for config in channels pins; do
+  dst="/var/lib/fatext/public/$config.json"
+  if [[ ! -e "$dst" && ! -L "$dst" ]]; then
+    install -o fatext -g fatext -m 0640 "/opt/fatext/config/$config.json" "$dst"
+  fi
+done
+chown -hR fatext:fatext /var/lib/fatext
 
 install -m 0644 "$REPO_ROOT/deploy/fatext.service" /etc/systemd/system/fatext.service
 install -m 0644 "$REPO_ROOT/deploy/fatext-backup.service" /etc/systemd/system/fatext-backup.service
 install -m 0644 "$REPO_ROOT/deploy/fatext-backup.timer" /etc/systemd/system/fatext-backup.timer
 install -m 0644 "$REPO_ROOT/deploy/fatext-log-report.service" /etc/systemd/system/fatext-log-report.service
 install -m 0644 "$REPO_ROOT/deploy/fatext-log-report.timer" /etc/systemd/system/fatext-log-report.timer
+install -m 0644 "$REPO_ROOT/deploy/fatext-webhook-signer.socket" "$REPO_ROOT/deploy/fatext-webhook-signer@.service" /etc/systemd/system/
 systemctl daemon-reload
-systemctl enable fatext.service fatext-backup.timer fatext-log-report.timer
+systemctl enable fatext.service fatext-backup.timer fatext-log-report.timer fatext-webhook-signer.socket
 
 chmod 0700 /var/lib/fatext/acme
 

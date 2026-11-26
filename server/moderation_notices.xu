@@ -1,0 +1,303 @@
+@main
+
+#crypto/rand
+#crypto/sha256
+#encoding/hex
+#encoding/json
+#net/url
+#os
+#strconv
+#strings
+
+struct CaseDecision {
+    status string
+    reason string
+    decided_at int
+    expires_at int
+}
+
+fn empty_case_decision() CaseDecision {
+    << CaseDecision{status: "pending", reason: "", decided_at: 0, expires_at: 0}
+}
+
+fn decision_json(d &CaseDecision) string {
+    << "{\"status\":" + json.quote(&d.status) + ",\"reason\":" + json.quote(&d.reason) +
+        ",\"decided_at\":" + strconv.itoa(d.decided_at) + ",\"expires_at\":" + strconv.itoa(d.expires_at) + "}"
+}
+
+fn read_case_decision(st &State, date string, id string) CaseDecision {
+    raw := read_file_or_empty(moderation_dir(st) + "/decisions/" + date + "/" + id + ".json")
+    doc := json.parse(&raw)
+    if !doc.ok() || !doc.is_dict(doc.root()) { << empty_case_decision() }
+    r := doc.root()
+    << CaseDecision{
+        status: json_str_or(&doc, doc.get(r, "status"), "pending"),
+        reason: json_str_or(&doc, doc.get(r, "reason"), ""),
+        decided_at: json_int_or(&doc, doc.get(r, "decided_at"), 0),
+        expires_at: json_int_or(&doc, doc.get(r, "expires_at"), 0)
+    }
+}
+
+fn save_case_decision(st &State, date string, id string, d &CaseDecision) bool {
+    dir := moderation_dir(st) + "/decisions/" + date
+    os.mkdir_all(dir + "") or (err) { << false }
+    body := decision_json(d)
+    write_atomic_mode(dir + "/" + id + ".json", &body, 384) or (err) { << false }
+    << true
+}
+
+fn case_date_retained(st &State, date &string, now int) bool {
+    if !is_valid_date(*date + "") { << false }
+    today := utc_date_from_unix(now)
+    cutoff := shift_utc_date(today + "", 0 - st.moderation_retention_days)
+    << strings.compare(date, &cutoff) >= 0 && strings.compare(date, &today) <= 0
+}
+
+fn mint_report_token() string {
+    bytes := rand.read(32) or (err) { << "" }
+    << hex.encode_to_string(bytes)
+}
+
+fn guest_report_authorized(st &State, date string, id string, token &string, now int) bool {
+    if !case_date_retained(st, &date, now) || !is_receipt_id(&id) { << false }
+    raw := read_file_or_empty(report_path(st, date, id))
+    doc := json.parse(&raw)
+    if !doc.ok() || !doc.is_dict(doc.root()) { << false }
+    r := doc.root()
+    if json_str_or(&doc, doc.get(r, "source"), "") != "public" { << false }
+    // Older guest reports issued just a randomly generated receipt.
+    if !doc.has(r, "status_token_hash") { << true }
+    stored := json_str_or(&doc, doc.get(r, "status_token_hash"), "")
+    if !is_valid_sha256_hex(token) || !is_valid_sha256_hex(&stored) { << false }
+    actual := sha256.sum256(*token + "")
+    << const_time_str_eq(&actual, &stored)
+}
+
+pub fn handle_guest_report_status(st &State, req &HttpReq, web bool, now int) HttpResp {
+    if web && req.method() == "GET" {
+        << render_report_status(st, 200, "", "", "", "", true)
+    }
+    if req.method() != "POST" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+    if req.req_body.len > 512 {
+        << err_resp(413, "ERR_PAYLOAD_TOO_LARGE", "status request too large", 0, 0, 0)
+    }
+    $date := ""
+    $id := ""
+    $token := ""
+    if web {
+        ctype := req.header("Content-Type")
+        if req.header("Sec-Fetch-Site") == "cross-site" ||
+           !strings.has_prefix(&ctype, "application/x-www-form-urlencoded") {
+            << render_report_status(st, 400, "Open this page to check your report.", "", "", "", true)
+        }
+        form := url.parse_query(req.body())
+        date = form.get("date")
+        id = form.get("receipt")
+        token = form.get("token")
+    } else {
+        doc := json.parse(&req.req_body)
+        if !doc.ok() || !doc.is_dict(doc.root()) {
+            << err_resp(400, "ERR_BAD_REQUEST", "status request must be a JSON object", 0, 0, 0)
+        }
+        r := doc.root()
+        date = json_str_or(&doc, doc.get(r, "date"), "")
+        id = json_str_or(&doc, doc.get(r, "receipt"), "")
+        token = json_str_or(&doc, doc.get(r, "token"), "")
+    }
+    if !guest_report_authorized(st, date + "", id + "", &token, now) {
+        if web { << render_report_status(st, 404, "Report not found. Check your receipt and access code.", "", "", "", true) }
+        << http_resp(404, "application/json; charset=utf-8", PUBLIC_CONTENT_CACHE,
+            &"{\"error\":{\"code\":\"ERR_NOT_FOUND\",\"message\":\"report not found\"}}")
+    }
+    decision := read_case_decision(st, date + "", id + "")
+    if web {
+        $status := "Awaiting review."
+        if decision.status == "resolved" { status = "The report has been resolved." }
+        if decision.status == "dismissed" { status = "The report was reviewed and closed." }
+        if decision.reason.len > 0 { status = status + " Reason code " + decision.reason }
+        << render_report_status(st, 200, status, "", "", "", false)
+    }
+    out := decision_json(&decision)
+    << http_resp(200, "application/json; charset=utf-8", PUBLIC_CONTENT_CACHE, &out)
+}
+
+fn render_report_status(st &State, status int, text string, date string, id string, token string, show_form bool) HttpResp {
+    $content := "<h1>Report status</h1>"
+    if text.len > 0 { content = content + "<p>" + esc(&text) + "</p>" }
+    if token.len > 0 {
+        content = content + "<p>Save your access code to check the outcome later.</p>"
+    }
+    if show_form {
+        content = content + "<form method=\"post\" action=\"/report/status\">" +
+            "<p><label>Receipt date <input name=\"date\" type=\"date\" required value=\"" + esc(&date) + "\"></label></p>" +
+            "<p><label>Receipt ID <input name=\"receipt\" required maxlength=\"30\" value=\"" + esc(&id) + "\"></label></p>" +
+            "<p><label>Access code <input name=\"token\" maxlength=\"64\" autocomplete=\"off\" value=\"" + esc(&token) + "\"></label></p>" +
+            "<button type=\"submit\">Check status</button></form>"
+    }
+    << report_page(st, status, "Report status", "/report/status", content)
+}
+
+pub fn handle_guest_report_decision(hub $&HubState, req &HttpReq, date string, id string, now int) HttpResp {
+    if req.method() != "PUT" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+    if !case_date_retained(&hub.st, &date, now) || !is_receipt_id(&id) {
+        << err_resp(404, "ERR_NOT_FOUND", "report not found", 0, 0, 0)
+    }
+    raw := read_file_or_empty(report_path(&hub.st, date + "", id + ""))
+    report := json.parse(&raw)
+    if !report.ok() || json_str_or(&report, report.get(report.root(), "source"), "") != "public" {
+        << err_resp(404, "ERR_NOT_FOUND", "report not found", 0, 0, 0)
+    }
+    doc := json.parse(&req.req_body)
+    if !doc.ok() || !doc.is_dict(doc.root()) {
+        << err_resp(400, "ERR_BAD_REQUEST", "decision must be a JSON object", 0, 0, 0)
+    }
+    action := json_str_or(&doc, doc.get(doc.root(), "action"), "")
+    reason := json_str_or(&doc, doc.get(doc.root(), "reason"), "")
+    if (action != "resolved" && action != "dismissed") || !is_valid_tag(&reason) {
+        << err_resp(400, "ERR_BAD_REQUEST", "action must be resolved or dismissed and reason must be a short code", 0, 0, 0)
+    }
+    $decision := read_case_decision(&hub.st, date + "", id + "")
+    if decision.status != action || decision.reason != reason {
+        decision = CaseDecision{status: action + "", reason: reason + "", decided_at: now, expires_at: 0}
+        if !save_case_decision(&hub.st, date, id + "", &decision) {
+            << err_resp(500, "ERR_INTERNAL", "could not save report decision", 0, 0, 0)
+        }
+        log_admin_action(hub, req, now, "report_" + action, id + "", reason)
+    }
+    reporter := json_str_or(&report, report.get(report.root(), "reporter_id"), "")
+    $recorded := "null"
+    if is_valid_agent_id(reporter + "") {
+        notice := "{\"kind\":\"report_decision\",\"receipt\":" + json.quote(&id) + ",\"date\":" + json.quote(&date) +
+            ",\"decision\":" + decision_json(&decision) + "}"
+        recorded = record_moderation_notice(hub, reporter, &notice, decision.decided_at, now)
+    }
+    out := "{\"decision\":" + decision_json(&decision) + ",\"notice_recorded\":" + recorded + "}"
+    << http_resp(200, "application/json; charset=utf-8", PUBLIC_CONTENT_CACHE, &out)
+}
+
+fn read_notice_history(path string) string {
+    content := os.read(path) or (err) {
+        if os.is_not_exist(err.msg()) { << "" }
+        >> err
+    }
+    << content
+}
+
+fn write_moderation_notice(hub $&HubState, aid string, body &string, now int) bool {
+    if !is_valid_agent_id(aid + "") { << false }
+    dir := moderation_dir(&hub.st) + "/notices/" + utc_date_from_unix(now)
+    ensure_dir_mode(dir + "", 448) or (err) { << false }
+    path := dir + "/" + aid + ".jsonl"
+    previous := read_notice_history(path + "") or (err) { << false }
+    line := *body + "\n"
+    if strings.contains(&previous, line + "") { << true }
+    content := previous + line
+    write_atomic_mode(path, &content, 384) or (err) { << false }
+    _ := hub_push_to_agent(hub, aid, "moderation_notice", body)
+    << true
+}
+
+pub fn handle_moderation_notices(st $&State, req &HttpReq, now int) HttpResp {
+    if req.method() != "GET" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+    au := authenticate_scoped(st, req, now, "")
+    if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
+    date := query_param_str(req.path(), "date", "")
+    if date.len > 0 && !case_date_retained(st, &date, now) {
+        << err_resp(404, "ERR_NOT_FOUND", "notice date unavailable", 0, 0, 0)
+    }
+    offset := query_param_int(req.path(), "offset", 0, 0, 1000000)
+    today := utc_date_from_unix(now)
+    $items := []string{}
+    $skip := offset
+    for i in 0:7 {
+        $day := date + ""
+        if date.len == 0 { day = shift_utc_date(today + "", 0 - i) }
+        if !case_date_retained(st, &day, now) { <- }
+        raw := read_file_or_empty(moderation_dir(st) + "/notices/" + day + "/" + au.agent_id + ".jsonl")
+        lines := strings.split(&raw, "\n")
+        $j := lines.len - 1
+        while j >= 0 && items.len < 101 {
+            line := lines[j] + ""
+            j -= 1
+            doc := json.parse(&line)
+            if !doc.ok() || !doc.is_dict(doc.root()) { -> }
+            if skip > 0 {
+                skip -= 1
+            } else {
+                items.push(line + "")
+            }
+        }
+        if date.len > 0 || items.len > 100 { <- }
+    }
+    $more := "null"
+    if items.len > 100 {
+        more = strconv.itoa(offset + 100)
+        items = items[0:100]
+    }
+    out := "{\"notices\":[" + strings.join(items, ",") + "],\"next_offset\":" + more + "}"
+    << http_resp(200, "application/json; charset=utf-8", PUBLIC_CONTENT_CACHE, &out)
+}
+
+fn record_moderation_notice(hub $&HubState, aid string, body &string, at int, now int) string {
+    if write_moderation_notice(hub, aid, body, at) { << "true" }
+    log_event_json(hub.log_ch, now, "moderation_notice_failed", "\"scope\":\"agent\"")
+    << "false"
+}
+
+fn moderation_path_is_link(path string) bool {
+    _ := os.readlink(path) or (err) { << false }
+    << true
+}
+
+fn purge_moderation_day_buckets(root string, cutoff &string) int {
+    if moderation_path_is_link(root + "") { << 0 }
+    days_raw := read_dir_or_empty(root + "")
+    days := strings.split(&days_raw, "\n")
+    $deleted := 0
+    for i in 0:days.len {
+        day := days[i] + ""
+        if !is_valid_date(day + "") || strings.compare(&day, cutoff) >= 0 { -> }
+        dir := root + "/" + day
+        if moderation_path_is_link(dir + "") { -> }
+        names_raw := read_dir_or_empty(dir + "")
+        names := strings.split(&names_raw, "\n")
+        for j in 0:names.len {
+            name := names[j] + ""
+            if name.len == 0 || name == "." || name == ".." || strings.contains(&name, "/") { -> }
+            _ := os.remove(dir + "/" + name) or (err) { -> }
+            deleted += 1
+        }
+        _ := os.remove(dir + "") or (err) { -> }
+    }
+    << deleted
+}
+
+pub fn purge_moderation_records(data_dir string, today string, days int, now int, log_ch chan string) {
+    root := data_dir + "/moderation"
+    if moderation_path_is_link(root + "") { << }
+    cutoff := shift_utc_date(today + "", 0 - days)
+    $deleted := 0
+    for kind in ["reports", "decisions", "notices", "review-index"] {
+        deleted += purge_moderation_day_buckets(root + "/" + kind, &cutoff)
+    }
+    approvals := root + "/approvals"
+    yesterday := shift_utc_date(today + "", -1)
+    deleted += purge_moderation_day_buckets(approvals + "", &yesterday)
+    // The previous approval format was one flat file containing an expiry.
+    if !moderation_path_is_link(approvals + "") {
+        names_raw := read_dir_or_empty(approvals + "")
+        names := strings.split(&names_raw, "\n")
+        for i in 0:names.len {
+            if !is_valid_sha256_hex(&names[i]) { -> }
+            path := approvals + "/" + names[i]
+            raw := read_file_or_empty(path + "")
+            expiration := strconv.atoi(&raw) or (err) { -> }
+            if expiration > now { -> }
+            _ := os.remove(path) or (err) { -> }
+            deleted += 1
+        }
+    }
+    if deleted > 0 {
+        log_event_json(log_ch, now, "maintenance", "\"task\":\"moderation_gc\",\"deleted\":" + strconv.itoa(deleted))
+    }
+}

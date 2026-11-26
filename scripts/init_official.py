@@ -2,6 +2,8 @@
 """Bootstrap the official fatext identity (ftx_fatextoffice) into data_dir and out_dir."""
 
 import argparse
+import base64
+import hashlib
 import json
 import os
 import subprocess
@@ -44,6 +46,10 @@ def main() -> int:
         ["openssl", "rsa", "-in", str(priv_path), "-pubout"],
         text=True,
     )
+    pub_der = subprocess.check_output(
+        ["openssl", "rsa", "-in", str(priv_path), "-pubout", "-outform", "DER"],
+    )
+    spki_fp = "SHA256:" + base64.b64encode(hashlib.sha256(pub_der).digest()).decode("ascii")
     now = int(time.time())
     doc = {
         "agent_id": OFFICIAL_ID,
@@ -72,6 +78,7 @@ def main() -> int:
     print(f"  private key (0600): {priv_path}")
     print(f"  public pem        : {pem_path}")
     print(f"  identity json     : {json_path}")
+    print(f"  FATEXT_OFFICIAL_KEY_FP={spki_fp}")
     return 0
 
 

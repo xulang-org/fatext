@@ -172,6 +172,8 @@ fn http_reason(status int) string {
     if status == 200 { << "OK" }
     if status == 201 { << "Created" }
     if status == 202 { << "Accepted" }
+    if status == 204 { << "No Content" }
+    if status == 422 { << "Unprocessable Content" }
     if status == 301 { << "Moved Permanently" }
     if status == 400 { << "Bad Request" }
     if status == 401 { << "Unauthorized" }
@@ -192,7 +194,7 @@ pub fn format_http_resp_ka_tls(r &HttpResp, keep_alive bool, is_tls bool) string
     out = out + "X-Content-Type-Options: nosniff\r\n"
     out = out + "X-Frame-Options: DENY\r\n"
     out = out + "Referrer-Policy: no-referrer\r\n"
-    if strings.has_prefix(&r.ctype, "text/html") {
+    if strings.has_prefix(&r.ctype, "text/html") && !strings.has_prefix(&r.extra, "Content-Security-Policy: ") {
         out = out + "Content-Security-Policy: default-src 'none'; style-src 'self'; img-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'\r\n"
     }
     if is_tls {

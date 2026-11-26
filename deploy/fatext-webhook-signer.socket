@@ -1,0 +1,13 @@
+[Unit]
+Description=fatext webhook signing socket
+
+[Socket]
+ListenStream=/run/fatext-webhook-signer.sock
+Accept=yes
+SocketUser=root
+SocketGroup=fatext
+SocketMode=0660
+MaxConnections=16
+
+[Install]
+WantedBy=sockets.target

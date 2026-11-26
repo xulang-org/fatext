@@ -324,8 +324,20 @@ def main() -> int:
             assert_eq(ver_j["controller_id"], cid, "verify delegation controller_id")
 
             print("[5/7] Controller key rotation, v2 voucher enrollment & claim-proof adoption...")
+            unused_v1 = td_p / "unused-v1.json"
+            rc, _, err = run_cli(
+                ["--json", "ctl", "cred", "issue", "--out", str(unused_v1)],
+                agent_home=ch_root, api_url=api_url,
+            )
+            assert_eq(rc, 0, f"v1 voucher issue failed: {err}")
             rc, _, err = run_cli(["--json", "key", "rotate"], agent_home=ch_root, api_url=api_url)
             assert_eq(rc, 0, f"controller rotate failed: {err}")
+
+            rc, _, err = run_cli(
+                ["--json", "init", "--credential", str(unused_v1)],
+                agent_home=str(td_p / "stale-enrollment"), api_url=api_url,
+            )
+            assert_true(rc != 0 and "ERR_BAD_SIGNATURE" in err, f"retired voucher should fail: {err}")
 
             v2 = td_p / "v2.json"
             rc, _, err = run_cli(["--json", "ctl", "cred", "issue", "--scopes", "pub,social,dm,stream", "--label", "bot-b", "--out", str(v2)], agent_home=ch_root, api_url=api_url)
@@ -375,6 +387,24 @@ def main() -> int:
 
             rc, _, err = run_cli(["--json", "ctl", "resume", aid_a], agent_home=ch_root, api_url=api_url)
             assert_eq(rc, 0, f"ctl resume failed: {err}")
+
+            rc, _, err = run_cli(
+                ["--json", "ctl", "grant", aid_b, "--scopes", "stream", "--ttl", "5s"],
+                agent_home=ch_root, api_url=api_url,
+            )
+            assert_eq(rc, 0, f"short-lived grant failed: {err}")
+            stream_path = "/v1/stream"
+            stamp = str(int(time.time()))
+            signature = openssl_sign_pss(
+                Path(ah_botb) / "private.pem",
+                f"GET\n{stream_path}\n{stamp}\n{hashlib.sha256(b'').hexdigest()}",
+            )
+            req = urllib.request.Request(api_url + stream_path, headers={
+                "X-Agent-Id": aid_b, "X-Timestamp": stamp, "X-Signature": signature,
+            })
+            with urllib.request.urlopen(req, timeout=8) as stream:
+                assert_eq(stream.status, 200, "stream opens before credential expiry")
+                assert_true(b": connected" in stream.read(), "stream closes at credential expiry")
 
             rc, _, err = run_cli(["--json", "ctl", "revoke", aid_b, "--successor", aid_a, "--reason", "decom", "--confirm"], agent_home=ch_root, api_url=api_url)
             assert_eq(rc, 0, f"ctl revoke BotB failed: {err}")

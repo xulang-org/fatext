@@ -261,13 +261,29 @@ def main() -> int:
             st_bypass, _, _ = http_req(port, "GET", "/internal/metrics", headers={"X-Fatext-Admin-Secret": ADMIN_SECRET})
             assert_eq(st_bypass, 200, "authenticated admin bypasses IP rate limit")
 
-            # Raise ip_rpm via PATCH /internal/admin/config immediately!
+            # Raise ip_rpm via PATCH /internal/admin/config immediately (including static_loop sync)!
+            cfg_low = json.dumps({"ip_rpm": 3}).encode("utf-8")
+            st_cfg_low, _, _ = http_req(
+                port, "PATCH", "/internal/admin/config", body=cfg_low, headers={"X-Fatext-Admin-Secret": ADMIN_SECRET}
+            )
+            assert_eq(st_cfg_low, 200, "PATCH config ip_rpm=3 failed")
+            saw_static_429 = False
+            for _ in range(8):
+                s_st, _, _ = http_req(port, "GET", "/llms.txt")
+                if s_st == 429:
+                    saw_static_429 = True
+                    break
+            assert_true(saw_static_429, "static_loop did not sync live ip_rpm=3 from PATCH /internal/admin/config")
+
             cfg_body = json.dumps({"ip_rpm": 5000}).encode("utf-8")
             st_cfg, _, cfg_raw = http_req(
                 port, "PATCH", "/internal/admin/config", body=cfg_body, headers={"X-Fatext-Admin-Secret": ADMIN_SECRET}
             )
             assert_eq(st_cfg, 200, f"PATCH config failed: {cfg_raw!r}")
             assert_eq(json.loads(cfg_raw.decode("utf-8"))["ip_rpm"], 5000, "ip_rpm updated live")
+            for _ in range(5):
+                s_st2, _, _ = http_req(port, "GET", "/llms.txt")
+                assert_eq(s_st2, 200, "static_loop should recover after PATCH ip_rpm=5000")
 
             # -----------------------------------------------------------------
             # 3. Register agents, create post & room, check /v1/stats

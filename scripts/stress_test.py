@@ -255,6 +255,7 @@ class SseClientThread:
         self.path = f"/v1/stream{query}"
         self.sock: socket.socket | None = None
         self.opened = threading.Event()
+        self.subscribed = False
         self.stop_flag = threading.Event()
         self.events_by_type: Counter[str] = Counter()
         self.error = ""
@@ -298,6 +299,7 @@ class SseClientThread:
                             self.error = head.splitlines()[0]
                             break
                         hdr_done = True
+                        self.subscribed = True
                         self.opened.set()
                         buf = buf[idx + 4 :]
                 if hdr_done:
@@ -552,11 +554,11 @@ def main() -> int:
                 sse_room_clients.append(cli)
             for cli in sse_room_clients:
                 cli.opened.wait(timeout=5.0)
-            opened_ok = sum(1 for c in sse_room_clients if not c.error)
+            opened_ok = sum(1 for c in sse_room_clients if c.subscribed and not c.error)
 
             # Wait 0.15s then pre-sign room sends by sender 0
             def mk_room_task(i: int):
-                body = json.dumps({"v": 1, "seq": i, "ct": "cm9vbS1icm9hZGNhc3Q="}).encode("utf-8")
+                body = json.dumps({"v": 1, "epoch": 1, "seq": i, "ct": "cm9vbS1icm9hZGNhc3Q="}).encode("utf-8")
                 p = f"/v1/rooms/{ROOM_ID}/send"
                 return ("POST", p, body, sign_request_headers(sender_priv, sender_id, "POST", p, body))
 
@@ -564,7 +566,7 @@ def main() -> int:
                 room_tasks = list(pool.map(mk_room_task, range(n_room_msgs)))
 
             # Count receivers NOT belonging to sender_id (hub_push_room skips c.agent_id == sender_id)
-            receivers_count = sum(1 for c in sse_room_clients if not c.error and c.agent_id != sender_id)
+            receivers_count = sum(1 for c in sse_room_clients if c.subscribed and not c.error and c.agent_id != sender_id)
             expected_deliveries = receivers_count * n_room_msgs
 
             t_b0 = time.perf_counter()
@@ -847,6 +849,14 @@ def main() -> int:
     print(out_json)
     if args.json_out:
         Path(args.json_out).write_text(out_json + "\n", encoding="utf-8")
+    fanout = report["scenarios"]["3_sse_fanout"]
+    if args.scale == "light" and (
+        fanout["sse_streams_opened"] != n_sse_room
+        or fanout["room_sends"]["ok_2xx"] != n_room_msgs
+        or fanout["received_deliveries"] != fanout["expected_deliveries"]
+    ):
+        print("SSE fan-out smoke check failed", file=sys.stderr)
+        return 1
     return 0
 
 

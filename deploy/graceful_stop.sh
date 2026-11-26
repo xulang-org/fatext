@@ -23,15 +23,35 @@ PORT="${ADDR##*:}"
 if [[ -z "$PORT" || ! "$PORT" =~ ^[0-9]+$ ]]; then
   PORT="8080"
 fi
-
-SCHEME="http"
-if [[ ( -n "${FATEXT_TLS_CERT:-}" && -n "${FATEXT_TLS_KEY:-}" ) || -n "${FATEXT_ACME_DOMAINS:-}" ]]; then
-  SCHEME="https"
+BIND_HOST="${ADDR%:*}"
+BIND_HOST="${BIND_HOST#[}"
+BIND_HOST="${BIND_HOST%]}"
+CONNECT_HOST="127.0.0.1"
+if [[ -n "$BIND_HOST" && "$BIND_HOST" != "0.0.0.0" && "$BIND_HOST" != "::" && "$BIND_HOST" != "$ADDR" ]]; then
+  CONNECT_HOST="$BIND_HOST"
+fi
+URL_HOST="$CONNECT_HOST"
+if [[ "$URL_HOST" == *:* ]]; then
+  URL_HOST="[${URL_HOST}]"
 fi
 
-curl -fsSk -X POST -K - \
+URL="http://${URL_HOST}:${PORT}/internal/shutdown"
+CURL_ARGS=(--noproxy '*')
+if [[ ( -n "${FATEXT_TLS_CERT:-}" && -n "${FATEXT_TLS_KEY:-}" ) || -n "${FATEXT_ACME_DOMAINS:-}" ]]; then
+  DOMAINS="${FATEXT_ACME_DOMAINS:-}"
+  TLS_HOST="${FATEXT_PUBLIC_HOST:-${DOMAINS%%,*}}"
+  TLS_HOST="${TLS_HOST:-fatext.com}"
+  TLS_HOST="${TLS_HOST//[[:space:]]/}"
+  URL="https://${TLS_HOST}:${PORT}/internal/shutdown"
+  CURL_ARGS+=(--resolve "${TLS_HOST}:${PORT}:${CONNECT_HOST}")
+  if [[ -n "${SSL_CERT_FILE:-}" ]]; then
+    CURL_ARGS+=(--cacert "$SSL_CERT_FILE")
+  fi
+fi
+
+curl -q -fsS "${CURL_ARGS[@]}" -X POST -K - \
   --max-time 5 \
-  "${SCHEME}://127.0.0.1:${PORT}/internal/shutdown" >/dev/null 2>&1 <<EOF || true
+  "$URL" >/dev/null 2>&1 <<EOF || exit 0
 header = "X-Fatext-Shutdown-Secret: ${SECRET}"
 EOF
 

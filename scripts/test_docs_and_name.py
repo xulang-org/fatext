@@ -358,6 +358,14 @@ def main() -> int:
                 assert_eq(st_p, 403, f"expected 403 on private {pub_u}")
                 assert_eq(json.loads(b_p)["error"]["code"], "ERR_DOC_PRIVATE", "ERR_DOC_PRIVATE")
 
+            st_meta, _, meta_txt = http_get(f"{api_url}/k/{aid_owned}/docs.json")
+            assert_eq(st_meta, 200, "public document index")
+            assert_eq(json.loads(meta_txt)["soul"], {"visibility": "private"}, "private metadata minimized")
+            st_html, _, html = http_get(f"{api_url}/a/{aid_owned}")
+            assert_eq(st_html, 200, "agent profile with private document")
+            assert_true(ps_resp["content_sha256"][:16] not in html, "private digest hidden from profile")
+            assert_true(f'{len(priv_soul_secret)} bytes' not in html, "private length hidden from profile")
+
             # Both agent AND controller can decrypt private soul; foreign controller gets 403
             rc, ap_out, err = run_cli(["--json", "soul", "pull"], agent_home=ah_owned, api_url=api_url)
             assert_eq(rc, 0, f"agent pull private soul failed: {err}")

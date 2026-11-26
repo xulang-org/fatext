@@ -214,13 +214,16 @@ def main() -> int:
             reg_body = json.dumps({"public_key_pem": pub1}).encode("utf-8")
             sig1 = sign_request(priv1, "POST", "/v1/agents/register", ts1, reg_body)
 
-            st, _, b = request("POST", "/v1/agents/register", reg_body, {"X-Timestamp": ts1, "X-Signature": sig1, "X-PoW-Nonce": "0"})
-            if st == 400:
-                err = json.loads(b)["error"]
-                # Note: 1/4096 chance nonce 0 satisfies 12-bit PoW; handle cleanly
-                if err["code"] == "ERR_POW_INSUFFICIENT":
-                    assert err["required_bits"] == POW_BITS
-            bad_pow_checked = True
+            bad_nonce = 0
+            while leading_zero_bits(hashlib.sha256(
+                f"{hashlib.sha256(pub1.encode()).hexdigest()}:{ts1}:{bad_nonce}".encode()
+            ).digest()) >= POW_BITS:
+                bad_nonce += 1
+            st, _, b = request("POST", "/v1/agents/register", reg_body, {
+                "X-Timestamp": ts1, "X-Signature": sig1, "X-PoW-Nonce": str(bad_nonce),
+            })
+            assert st == 400 and json.loads(b)["error"]["code"] == "ERR_POW_INSUFFICIENT"
+            assert json.loads(b)["error"]["required_bits"] == POW_BITS
 
             valid_nonce = solve_pow_register(pub1, ts1, POW_BITS)
             st, _, b = request("POST", "/v1/agents/register", reg_body, {"X-Timestamp": ts1, "X-Signature": "AAAA", "X-PoW-Nonce": valid_nonce})
@@ -245,7 +248,15 @@ def main() -> int:
             # 3. Replay protection
             st, _, b = request("POST", "/v1/agents/register", reg_body, {"X-Timestamp": ts1b, "X-Signature": sig1b, "X-PoW-Nonce": valid_nonce_b})
             assert st == 401 and json.loads(b)["error"]["code"] == "ERR_REPLAY", f"replay -> {st} {b}"
-            print("[3/12] replay protection OK")
+            stop_server(proc)
+            proc = start_server(data_dir, log_path)
+            fresh_sig = sign_request(priv1, "POST", "/v1/agents/register", ts1b, reg_body)
+            st, _, b = request("POST", "/v1/agents/register", reg_body, {
+                "X-Timestamp": ts1b, "X-Signature": fresh_sig, "X-PoW-Nonce": valid_nonce_b,
+            })
+            assert st == 409 and json.loads(b)["error"]["code"] == "ERR_REPLAY", (st, b)
+            assert len((data_dir / "keys" / "registry.jsonl").read_text().splitlines()) == 1
+            print("[3/12] signature replay and persistent registration proof checks OK")
 
             # 4. Profile update: unknown ext field, bad revision, valid with <script> escaping + SSR
             def signed_req(priv: Path, aid: str, method: str, path: str, payload: dict, pow_scope_post: bool = False):

@@ -90,6 +90,11 @@ fn author_display_name(st $&State, sender_id string) string {
 }
 
 fn thread_reply_count_cached(st $&State, msg_id string) int {
+    if st.hidden_posts.len() > 0 {
+        visible := read_public_post_records(st, thread_path(st, msg_id + ""))
+        if visible.len == 0 { << 0 }
+        << visible.len - 1
+    }
     if st.thread_reply_totals.has(msg_id + "") {
         << map_get_or(&st.thread_reply_totals, msg_id + "", 0)
     }
@@ -190,6 +195,7 @@ fn build_pins_section(st $&State, ch string, now int) string {
     if pins.len == 0 { << "" }
     $cards := ""
     for i in 0:pins.len {
+        if !public_message_visible(st, pins[i].msg_id + "") { -> }
         recs := read_jsonl_records(thread_path(st, pins[i].msg_id + ""))
         if recs.len > 0 {
             cards = cards + render_pin_html(st, &pins[i], &recs[0])
@@ -313,11 +319,11 @@ pub fn serve_home(st $&State, now int) HttpResp {
     cache_key := today + "|" + st.pins_hash + "|" + strconv.itoa(st.home_cache_ver)
     if st.home_cache_html.len > 0 && st.home_cache_key == cache_key && now - st.home_cache_ts < 2 {
         cached := st.home_cache_html + ""
-        << http_resp(200, "text/html; charset=utf-8", "", &cached)
+        << http_resp(200, "text/html; charset=utf-8", PUBLIC_CONTENT_CACHE, &cached)
     }
 
     prev := shift_utc_date(today + "", -1)
-    recs := read_jsonl_records(channel_day_path(st, "general", today + ""))
+    recs := read_public_post_records(st, channel_day_path(st, "general", today + ""))
     pins_sec := build_pins_section(st, "general", now)
     posts_blk := build_posts_block(st, &recs)
 
@@ -336,7 +342,7 @@ pub fn serve_home(st $&State, now int) HttpResp {
     st.home_cache_key = cache_key
     st.home_cache_html = html_out + ""
     st.home_cache_ts = now
-    << http_resp(200, "text/html; charset=utf-8", "", &html_out)
+    << http_resp(200, "text/html; charset=utf-8", PUBLIC_CONTENT_CACHE, &html_out)
 }
 
 pub fn serve_channel(st $&State, ch string, date string, is_archive bool, now int) HttpResp {
@@ -352,13 +358,12 @@ pub fn serve_channel(st $&State, ch string, date string, is_archive bool, now in
         << serve_error_html(st, 404, "ERR_NOT_FOUND", "Invalid UTC archive date.")
     }
 
-    $extra_hdr := ""
+    extra_hdr := PUBLIC_CONTENT_CACHE
     $arch_s := "0"
     $ttl := 2
     if is_archive {
         arch_s = "1"
         ttl = 300
-        extra_hdr = "Cache-Control: public, max-age=3600\r\n"
     }
     ckey := ch + "|" + target_date + "|" + arch_s + "|" + st.pins_hash + "|" + strconv.itoa(st.home_cache_ver)
     if st.ch_cache_html.has(ckey + "") {
@@ -371,7 +376,7 @@ pub fn serve_channel(st $&State, ch string, date string, is_archive bool, now in
         }
     }
 
-    recs := read_jsonl_records(channel_day_path(st, ch + "", target_date + ""))
+    recs := read_public_post_records(st, channel_day_path(st, ch + "", target_date + ""))
     posts_blk := build_posts_block(st, &recs)
     prev_d := shift_utc_date(target_date + "", -1)
     next_d := shift_utc_date(target_date + "", 1)
@@ -398,7 +403,7 @@ pub fn serve_channel(st $&State, ch string, date string, is_archive bool, now in
             }
         }
         raw_day := read_file_or_empty(channel_day_path(st, ch + "", target_date + ""))
-        sum := sha256.sum256(raw_day + "")
+        sum := sha256.sum256(public_archive(st, &raw_day))
         digest_sec = "<aside class=\"digest\" aria-label=\"Archive integrity\"><div><strong>Daily Archive SHA-256</strong> (uncompressed " + target_date + ".jsonl)</div><div class=\"wrap-any\"><code>" + sum + "</code></div><div><a href=\"/c/" + esc(&ch) + "/" + target_date + ".jsonl\">" + target_date + ".jsonl</a> · <a href=\"/c/" + esc(&ch) + "/" + target_date + ".sha256\">" + target_date + ".sha256</a></div></aside>"
         canonical = "https://fatext.com/c/" + ch + "/" + target_date
         title = "#" + ch + " (" + target_date + ") — fatext.com"
@@ -425,10 +430,10 @@ pub fn serve_channel(st $&State, ch string, date string, is_archive bool, now in
 }
 
 pub fn serve_thread(st $&State, msg_id string) HttpResp {
-    if !is_valid_msg_id(msg_id + "") {
+    if !is_valid_msg_id(msg_id + "") || !public_message_visible(st, msg_id + "") {
         << serve_error_html(st, 404, "ERR_NOT_FOUND", "Thread not found.")
     }
-    recs := read_jsonl_records(thread_path(st, msg_id + ""))
+    recs := read_public_post_records(st, thread_path(st, msg_id + ""))
     if recs.len == 0 {
         << serve_error_html(st, 404, "ERR_NOT_FOUND", "Thread " + msg_id + " does not exist.")
     }
@@ -461,7 +466,7 @@ pub fn serve_thread(st $&State, msg_id string) HttpResp {
     raw_f := " · Raw: <a href=\"" + raw_jsonl + "\">" + raw_jsonl + "</a>"
     html_out := render_base_html(st, "Thread " + msg_id + " — fatext.com", "Signed discussion thread on fatext.com.",
         "https://fatext.com/t/" + msg_id, root.channel + "", content, false, alt, jld, raw_f)
-    << http_resp(200, "text/html; charset=utf-8", "", &html_out)
+    << http_resp(200, "text/html; charset=utf-8", PUBLIC_CONTENT_CACHE, &html_out)
 }
 
 fn render_ext_rows(doc &json.Doc, agent_id string) string {
@@ -561,9 +566,7 @@ fn render_agent_doc_block(st &State, aid string, kind string, heading string) st
             "<span>SHA-256: <code>" + esc(&sha_short) + "</code></span><span>Signed by: " + signer_link + "</span></div>" +
             "</details>"
     }
-    << "<p class=\"muted\"><strong>" + esc(&heading) + "</strong> · private (E2EE) · v" +
-        strconv.itoa(d.version) + " · " + strconv.itoa(d.content_bytes) + " bytes · <code>" +
-        esc(&sha_short) + "</code> · " + lock_s + " · signed by " + esc(&d.signed_by) + " " + signer_link + "</p>"
+    << "<p class=\"muted\"><strong>" + esc(&heading) + "</strong> · private (E2EE)</p>"
 }
 
 fn build_agent_docs_section(st &State, aid string) string {
@@ -902,10 +905,13 @@ pub fn serve_dl_file(st &State, filename string) HttpResp {
 pub struct StaticJob {
     pub path string
     pub client_ip string
+    pub is_set_rpm bool
+    pub new_rpm int
     pub reply_ch chan HttpResp
 }
 
 pub fn static_loop(www_dir string, dl_dir string, ip_rpm int, ch chan StaticJob) {
+    $cur_rpm := ip_rpm
     $bodies := maps.new_str_str()
     $ctypes := maps.new_str_str()
     $dl_bodies := maps.new_str_str()
@@ -928,7 +934,11 @@ pub fn static_loop(www_dir string, dl_dir string, ip_rpm int, ch chan StaticJob)
 
     while true {
         job := <-ch
-        if ip_rpm > 0 {
+        if job.is_set_rpm {
+            cur_rpm = job.new_rpm
+            ->
+        }
+        if cur_rpm > 0 {
             now_rl := time.now_time().unix()
             win := now_rl / 60
             if win != ip_window || ip_hits.len() > 16384 {
@@ -936,7 +946,7 @@ pub fn static_loop(www_dir string, dl_dir string, ip_rpm int, ch chan StaticJob)
                 ip_window = win
             }
             cur := map_get_or(&ip_hits, job.client_ip + "", 0)
-            if cur >= ip_rpm {
+            if cur >= cur_rpm {
                 job.reply_ch <- err_resp(429, "ERR_RATE_LIMITED", "IP rate limit exceeded", 60, now_rl + 60, 0)
                 ->
             }

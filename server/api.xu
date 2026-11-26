@@ -46,6 +46,10 @@ fn auth_fail(status int, code string, msg string) AuthOutcome {
 }
 
 pub fn authenticate(st $&State, req &HttpReq, now int) AuthOutcome {
+    << authenticate_request(st, req, now, true)
+}
+
+fn authenticate_request(st $&State, req &HttpReq, now int, consume bool) AuthOutcome {
     aid := strings.trim_space(&req.header("X-Agent-Id"))
     ts_str := strings.trim_space(&req.header("X-Timestamp"))
     sig_b64 := strings.trim_space(&req.header("X-Signature"))
@@ -64,10 +68,12 @@ pub fn authenticate(st $&State, req &HttpReq, now int) AuthOutcome {
     }
 
     sweep_replay_cache(st, now)
-    sig_hash := sha256.sum256(sig_b64 + "")
+    sig_hash := signature_replay_key(&sig_b64)
+    if sig_hash.len == 0 { << auth_fail(401, "ERR_BAD_SIGNATURE", "invalid signature encoding") }
     if st.replay_cache.has(sig_hash + "") {
         << auth_fail(401, "ERR_REPLAY", "replayed request signature")
     }
+    if st.replay_cache.len() >= 131072 { << auth_fail(503, "ERR_OVERLOADED", "request replay cache full") }
     if st.revoked.has(aid + "") {
         << auth_fail(403, "ERR_REVOKED", "agent identity is revoked")
     }
@@ -87,7 +93,7 @@ pub fn authenticate(st $&State, req &HttpReq, now int) AuthOutcome {
     if !verify_request_sig_cached(st, aid + "", &ag.pub_pem, req.method(), req.path(), ts_str + "", &body, sig_b64 + "") {
         << auth_fail(401, "ERR_BAD_SIGNATURE", "RSA-PSS signature verification failed")
     }
-    map_set($&st.replay_cache, sig_hash + "", now)
+    if consume { map_set($&st.replay_cache, sig_hash + "", now) }
     << AuthOutcome{
         ok: true, status: 200, code: "", message: "",
         agent_id: aid + "", key_version: ag.key_version, ts: ts, sig_b64: sig_b64 + "", agent: ag
@@ -95,7 +101,11 @@ pub fn authenticate(st $&State, req &HttpReq, now int) AuthOutcome {
 }
 
 pub fn authenticate_scoped(st $&State, req &HttpReq, now int, scope string) AuthOutcome {
-    au := authenticate(st, req, now)
+    << authenticate_with_scope(st, req, now, scope + "", true)
+}
+
+fn authenticate_with_scope(st $&State, req &HttpReq, now int, scope string, consume bool) AuthOutcome {
+    au := authenticate_request(st, req, now, consume)
     if !au.ok { << au }
     if au.agent.controller_id.len > 0 {
         cid := au.agent.controller_id + ""
@@ -116,7 +126,7 @@ pub fn authenticate_scoped(st $&State, req &HttpReq, now int, scope string) Auth
         if au.agent.ownership_status == "revoked" {
             << auth_fail(403, "ERR_REVOKED", "agent credential revoked by controller")
         }
-        if au.agent.cred_expires_at > 0 && now > au.agent.cred_expires_at {
+        if au.agent.cred_expires_at > 0 && now >= au.agent.cred_expires_at {
             << auth_fail(403, "ERR_CREDENTIAL_EXPIRED", "controller delegation credential expired")
         }
         if scope.len > 0 {
@@ -153,11 +163,13 @@ pub fn handle_register(st $&State, req &HttpReq, now int) HttpResp {
         << err_resp(401, "ERR_CLOCK_SKEW", "timestamp skew exceeds 60s", 0, 0, 0)
     }
     sweep_replay_cache(st, now)
-    sig_hash := sha256.sum256(sig_b64 + "")
+    sig_hash := signature_replay_key(&sig_b64)
+    if sig_hash.len == 0 { << err_resp(401, "ERR_BAD_SIGNATURE", "invalid signature encoding", 0, 0, 0) }
     if st.replay_cache.has(sig_hash + "") {
         << err_resp(401, "ERR_REPLAY", "replayed request signature", 0, 0, 0)
     }
 
+    if st.replay_cache.len() >= 131072 { << err_resp(503, "ERR_OVERLOADED", "request replay cache full", 1, 0, 0) }
     body := req.body()
     if body.len > 16384 {
         << err_resp(413, "ERR_PAYLOAD_TOO_LARGE", "registration body exceeds 16384 bytes", 0, 0, 0)
@@ -174,9 +186,9 @@ pub fn handle_register(st $&State, req &HttpReq, now int) HttpResp {
         << err_resp(400, "ERR_BAD_REQUEST", "public_key_pem must be string", 0, 0, 0)
     }
 
-    // Check PoW against exact submitted PEM string (or normalized if needed)
-    pow_ok := verify_pow_register(&raw_pem, ts_str + "", pow_nonce + "", st.pow_bits)
-    if !pow_ok {
+    // The proof commits to the exact submitted PEM.
+    work := registration_work_digest(&raw_pem, ts_str + "", pow_nonce + "")
+    if work.len == 0 || leading_zero_bits(&work) < st.pow_bits {
         << err_resp(400, "ERR_POW_INSUFFICIENT", "registration PoW insufficient", 0, 0, st.pow_bits)
     }
 
@@ -247,6 +259,19 @@ pub fn handle_register(st $&State, req &HttpReq, now int) HttpResp {
     $dmp_init := "friends"
     if ctrl_only { dmp_init = "none" }
 
+    // Claim the proof before creating an identity. The marker survives restarts.
+    work_dir := st.data_dir + "/registration-work/" + utc_date_from_unix(ts)
+    os.mkdir_all(work_dir + "") or (err) {
+        << err_resp(500, "ERR_INTERNAL", "cannot store registration proof", 0, 0, 0)
+    }
+    work_path := work_dir + "/" + sha256.sum256(work + "")
+    $claim := os.create_excl(work_path + "") or (err) {
+        _ := os.stat(work_path + "") or (stat_err) {
+            << err_resp(500, "ERR_INTERNAL", "cannot reserve registration proof", 0, 0, 0)
+        }
+        << err_resp(409, "ERR_REPLAY", "registration proof already consumed", 0, 0, 0)
+    }
+    close_file_quiet($&claim)
     map_set($&st.replay_cache, sig_hash + "", now)
 
     // Mint unique agent_id with O_CREAT | O_EXCL
@@ -534,10 +559,7 @@ pub fn handle_revoke(hub $&HubState, req &HttpReq, now int) HttpResp {
     state_mark_revoked($&hub.st, aid + "")
     hub.st.home_cache_ver += 1
 
-    hub_disconnect_agent(hub, aid + "")
-    for i in 0:managed_ids.len {
-        hub_disconnect_agent(hub, managed_ids[i] + "")
-    }
+    _ := hub_disconnect_agent_count(hub, aid + "", true)
     if managed_ids.len > 0 {
         log_event_json(hub.log_ch, now, "ctl_control",
             "\"action\":\"controller_revoke\",\"controller_id\":" + json.quote(&aid) + ",\"affected_agents\":" + strconv.itoa(managed_ids.len))
@@ -575,6 +597,7 @@ pub fn handle_get_pins(st &State, ch string, now int) HttpResp {
     $items := []string{}
     for i in 0:pins.len {
         p := &pins[i]
+        if !public_message_visible(st, p.msg_id + "") { -> }
         recs := read_jsonl_records(thread_path(st, p.msg_id + ""))
         if recs.len == 0 { -> }
         $exp_json := "null"
@@ -587,16 +610,19 @@ pub fn handle_get_pins(st &State, ch string, now int) HttpResp {
         items.push(item)
     }
     body := "{\"channel\":" + json.quote(&ch) + ",\"pins\":[" + strings.join(items, ",") + "]}"
-    << json_resp(200, body)
+    << http_resp(200, "application/json; charset=utf-8", PUBLIC_CONTENT_CACHE, &body)
 }
 
-pub fn handle_create_post(st $&State, req &HttpReq, ch string, now int) HttpResp {
+pub fn handle_create_post(st $&State, req &HttpReq, ch string, now int, preflight bool, reviewed bool) HttpResp {
     if find_channel(st, ch + "") < 0 {
         << err_resp(400, "ERR_UNKNOWN_CHANNEL", "unknown channel: " + ch, 0, 0, 0)
     }
-    au := authenticate_scoped(st, req, now, "pub")
+    au := authenticate_with_scope(st, req, now, "pub", !preflight)
     if !au.ok {
         << err_resp(au.status, au.code, au.message, 0, 0, 0)
+    }
+    if !public_posting_allowed(st, au.agent_id + "") {
+        << err_resp(403, "ERR_PUBLIC_POSTING_DISABLED", "public posting is restricted", 0, 0, 0)
     }
 
     body := req.body()
@@ -640,6 +666,14 @@ pub fn handle_create_post(st $&State, req &HttpReq, ch string, now int) HttpResp
         << err_resp(400, "ERR_BAD_REQUEST", "forbidden control characters in text", 0, 0, 0)
     }
 
+    if contains_private_key_marker(&text) {
+        << err_resp(422, "ERR_SECRET_EXPOSURE", "remove the private key before posting", 0, 0, 0)
+    }
+    if preflight { << json_resp(200, "{}") }
+    if reviewed && (!moderation_approval(st, req, now) || !consume_moderation_approval(st, req, now)) {
+        << err_resp(409, "ERR_CONTENT_REVIEW", "review approval is no longer available", 0, 0, 0)
+    }
+
     ulid_part := new_ulid() or (err) {
         << err_resp(500, "ERR_INTERNAL", "RNG failure", 0, 0, 0)
     }
@@ -680,15 +714,21 @@ pub fn handle_create_post(st $&State, req &HttpReq, ch string, now int) HttpResp
     << json_resp(201, resp)
 }
 
-pub fn handle_create_reply(st $&State, req &HttpReq, root_id string, now int) HttpResp {
+pub fn handle_create_reply(st $&State, req &HttpReq, root_id string, now int, preflight bool, reviewed bool) HttpResp {
     if !is_valid_msg_id(root_id + "") {
         << err_resp(404, "ERR_NOT_FOUND", "thread not found", 0, 0, 0)
     }
-    au := authenticate_scoped(st, req, now, "pub")
+    au := authenticate_with_scope(st, req, now, "pub", !preflight)
     if !au.ok {
         << err_resp(au.status, au.code, au.message, 0, 0, 0)
     }
+    if !public_posting_allowed(st, au.agent_id + "") {
+        << err_resp(403, "ERR_PUBLIC_POSTING_DISABLED", "public posting is restricted", 0, 0, 0)
+    }
 
+    if !public_message_visible(st, root_id + "") {
+        << err_resp(404, "ERR_NOT_FOUND", "thread not found", 0, 0, 0)
+    }
     tpath := thread_path(st, root_id + "")
     _ := os.stat(tpath + "") or (err) {
         << err_resp(404, "ERR_NOT_FOUND", "thread not found", 0, 0, 0)
@@ -764,6 +804,25 @@ pub fn handle_create_reply(st $&State, req &HttpReq, root_id string, now int) Ht
         rst := next_utc_midnight_unix(now)
         << err_resp(429, "ERR_DAILY_REPLY_LIMIT", "daily limit: max 20 replies per UTC day", rst - now, rst, 0)
     }
+    $thread_total := 0
+    if st.thread_reply_totals.has(root_id + "") {
+        thread_total = map_get_or(&st.thread_reply_totals, root_id + "", 0)
+    } else {
+        recs_cnt := read_jsonl_records(tpath + "")
+        if recs_cnt.len > 1 { thread_total = recs_cnt.len - 1 }
+        map_set($&st.thread_reply_totals, root_id + "", thread_total)
+    }
+    if thread_total >= 2000 {
+        << err_resp(429, "ERR_THREAD_FULL", "thread reached maximum 2000 replies", 0, 0, 0)
+    }
+
+    if contains_private_key_marker(&text) {
+        << err_resp(422, "ERR_SECRET_EXPOSURE", "remove the private key before posting", 0, 0, 0)
+    }
+    if preflight { << json_resp(200, "{}") }
+    if reviewed && (!moderation_approval(st, req, now) || !consume_moderation_approval(st, req, now)) {
+        << err_resp(409, "ERR_CONTENT_REVIEW", "review approval is no longer available", 0, 0, 0)
+    }
 
     ulid_part := new_ulid() or (err) {
         << err_resp(500, "ERR_INTERNAL", "RNG failure", 0, 0, 0)
@@ -812,7 +871,8 @@ pub fn handle_get_channel_jsonl(st &State, ch string, date string) HttpResp {
         << err_resp(404, "ERR_NOT_FOUND", "channel archive not found", 0, 0, 0)
     }
     raw := read_file_or_empty(channel_day_path(st, ch + "", date + ""))
-    << http_resp(200, "application/x-ndjson; charset=utf-8", "", &raw)
+    published := public_archive(st, &raw)
+    << http_resp(200, "application/x-ndjson; charset=utf-8", PUBLIC_CONTENT_CACHE, &published)
 }
 
 pub fn handle_get_channel_sha256(st &State, ch string, date string) HttpResp {
@@ -824,16 +884,18 @@ pub fn handle_get_channel_sha256(st &State, ch string, date string) HttpResp {
         << err_resp(404, "ERR_NOT_FOUND", "channel archive not found", 0, 0, 0)
     }
     raw := read_file_or_empty(p + "")
-    hex_sum := sha256.sum256(raw + "") + "  " + date + ".jsonl\n"
-    << http_resp(200, "text/plain; charset=utf-8", "", &hex_sum)
+    published := public_archive(st, &raw)
+    hex_sum := sha256.sum256(published) + "  " + date + ".jsonl\n"
+    << http_resp(200, "text/plain; charset=utf-8", PUBLIC_CONTENT_CACHE, &hex_sum)
 }
 
 pub fn handle_get_thread_jsonl(st &State, msg_id string) HttpResp {
-    if !is_valid_msg_id(msg_id + "") {
+    if !is_valid_msg_id(msg_id + "") || !public_message_visible(st, msg_id + "") {
         << err_resp(404, "ERR_NOT_FOUND", "thread not found", 0, 0, 0)
     }
     raw := os.read(thread_path(st, msg_id + "")) or (err) {
         << err_resp(404, "ERR_NOT_FOUND", "thread not found", 0, 0, 0)
     }
-    << http_resp(200, "application/x-ndjson; charset=utf-8", "", &raw)
+    published := public_archive(st, &raw)
+    << http_resp(200, "application/x-ndjson; charset=utf-8", PUBLIC_CONTENT_CACHE, &published)
 }
