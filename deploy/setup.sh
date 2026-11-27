@@ -40,6 +40,7 @@ install -d -m 0700 -o fatext -g fatext /var/lib/fatext/acme
 cp -r "$REPO_ROOT/www" /opt/fatext/
 cp -r "$REPO_ROOT/templates" /opt/fatext/
 cp -r "$REPO_ROOT/config" /opt/fatext/
+chown -R root:root /opt/fatext
 install -m 0755 "$REPO_ROOT/deploy/backup.sh" /opt/fatext/deploy/backup.sh
 install -m 0755 "$REPO_ROOT/deploy/restore.sh" /opt/fatext/deploy/restore.sh
 install -m 0755 "$REPO_ROOT/deploy/graceful_stop.sh" /opt/fatext/deploy/graceful_stop.sh
@@ -77,8 +78,11 @@ FATEXT_TEMPLATES_DIR=/opt/fatext/templates
 FATEXT_DL_DIR=/var/lib/fatext/dl
 # Public-content AI moderation. Set the API key in this protected file.
 FATEXT_AI_MODERATION_MODEL=omni-moderation-latest
+# FATEXT_AI_MODERATION_WORKERS=12
 # FATEXT_AI_MODERATION_MEDIUM_SCORE=80
 # FATEXT_AI_MODERATION_HIGH_SCORE=95
+# FATEXT_MODERATION_RETENTION_DAYS=30
+# FATEXT_DAILY_FRIEND_REQUESTS=20
 # FATEXT_PUBLIC_LINK_HOSTS=docs.example.org,status.example.org
 # FATEXT_PUBLIC_BLOCKED_LINK_HOSTS=blocked.example.org
 # FATEXT_AI_MODERATION_API_KEY=
@@ -134,5 +138,5 @@ echo "Ensure DNS A/AAAA records for ${ACME_DOMAINS} point to this host and ports
 echo "Next:"
 echo "  1. Set FATEXT_AI_MODERATION_API_KEY in /etc/fatext/fatext.env (required when FATEXT_AI_MODERATION_REQUIRED=1 for public channels)."
 echo "  2. Run: python3 $REPO_ROOT/scripts/init_official.py --data-dir /var/lib/fatext --out-dir /etc/fatext"
-echo "  3. Start service (automatically issues & renews TLS cert with zero downtime): systemctl start fatext fatext-backup.timer fatext-log-report.timer && systemctl status fatext"
+echo "  3. Start service (automatically issues & renews TLS cert with zero downtime): systemctl start fatext fatext-backup.timer fatext-log-report.timer fatext-webhook-signer.socket && systemctl status fatext"
 echo "  4. Publish signed CLI binaries: bash /opt/fatext/deploy/sync_dl.sh latest /var/lib/fatext/dl https://${DOMAIN}/k/ftx_fatextoffice.pem"

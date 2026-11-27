@@ -28,7 +28,7 @@ import urllib.error
 import urllib.request
 
 ROOT = Path(__file__).resolve().parent.parent
-SERVER_BIN = ROOT / "build" / "fatext-server"
+SERVER_BIN = Path(os.environ.get("FATEXT_SERVER_BIN", str(ROOT / "build" / "fatext-server")))
 WWW_DIR = ROOT / "www"
 TPL_DIR = ROOT / "templates"
 ANALYZE_PY = ROOT / "scripts" / "analyze_logs.py"

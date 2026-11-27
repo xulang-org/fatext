@@ -67,6 +67,7 @@ install -d -m 0750 "${DATA_DIR}/moderation"
 if [[ ! -f "${DATA_DIR}/moderation/hidden.json" ]]; then
   touch "${DATA_DIR}/moderation/recovery-required"
   chmod 0640 "${DATA_DIR}/moderation/recovery-required"
+  echo "Warning: created ${DATA_DIR}/moderation/recovery-required; public reads/writes will remain paused until an operator reconciles moderation/hidden.json and removes recovery-required." >&2
   for name in hidden.json posting.json; do
     if [[ -f "${STAGE}/moderation/$name" ]]; then
       install -m 0640 "${STAGE}/moderation/$name" "${DATA_DIR}/moderation/$name"
@@ -88,9 +89,9 @@ for name in keys friends mail docs rooms blacklist public registration-work acme
 done
 
 mkdir -p "${DATA_DIR}/logs" "${DATA_DIR}/dl"
-chmod 0755 "$DATA_DIR"
+chmod 0750 "$DATA_DIR"
 for name in keys friends mail docs rooms blacklist public registration-work logs dl; do
-  [[ -d "${DATA_DIR}/${name}" ]] && chmod 0755 "${DATA_DIR}/${name}"
+  [[ -d "${DATA_DIR}/${name}" ]] && chmod 0750 "${DATA_DIR}/${name}"
 done
 if [[ -d "${DATA_DIR}/acme" ]]; then
   chmod 0700 "${DATA_DIR}/acme"
