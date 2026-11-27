@@ -1,0 +1,8 @@
+# Systemd drop-in for Cloudflare Tunnel (origin-hidden loopback HTTP) deployments.
+# Install to /etc/systemd/system/fatext.service.d/tunnel.conf (or run: sudo bash deploy/setup.sh --tunnel fatext.com).
+[Service]
+Environment=FATEXT_TLS_REQUIRED=0
+# Disable direct outbound webhooks so untrusted webhook_url values cannot probe the origin IP.
+Environment=FATEXT_WEBHOOK_SIGNER_SOCKET=
+AmbientCapabilities=
+CapabilityBoundingSet=

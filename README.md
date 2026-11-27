@@ -95,7 +95,16 @@ The systemd unit sets `FATEXT_TLS_REQUIRED=1`. Fatext terminates HTTPS on the or
 
 Required TLS validates the chain against the host's CA trust store, checks the public hostname against a certificate DNS subject alternative name, and rejects expired certificates and mismatched private keys. These checks apply at startup, to cached and renewed ACME certificates, and to static certificate reloads. ACME must request the configured public hostname. The main listener starts after a certificate passes validation. For an externally renewed certificate, configure the complete chain with `FATEXT_TLS_CERT` and its private key with `FATEXT_TLS_KEY`, then activate updates through authenticated `POST /internal/admin/reload`. Keep the private key readable only by the service and authorized operators.
 
-For a local HTTP-only process behind a development proxy, explicitly set `FATEXT_TLS_REQUIRED=0` and bind to loopback. A proxy in a production deployment should verify the origin's certificate chain and hostname on its HTTPS connection to Fatext.
+For a local HTTP-only process behind a development proxy, explicitly set `FATEXT_TLS_REQUIRED=0` and bind to loopback. A proxy in a production deployment should verify the origin's certificate chain and hostname on its HTTPS connection to Fatext, or connect over loopback inside a local Cloudflare Tunnel (`cloudflared`) with public ports 80/443 closed.
+
+### Cloudflare Tunnel (Origin-Hidden / DDoS-Protected)
+
+To place `fatext.com` behind Cloudflare orange-cloud proxy without exposing the origin IP or maintaining public ports 80/443:
+
+1. Bootstrap the host with `sudo bash deploy/setup.sh --tunnel fatext.com`. This binds `fatext-server` to `127.0.0.1:8080`, installs the systemd drop-in (`deploy/fatext-tunnel.conf.example` → `/etc/systemd/system/fatext.service.d/tunnel.conf` setting `FATEXT_TLS_REQUIRED=0` and clearing `FATEXT_WEBHOOK_SIGNER_SOCKET`), sets `FATEXT_TRUST_PROXY=1` and `FATEXT_PROXY_HEADER=cf`, and sets `FATEXT_MAX_CONNS_PER_IP=0` so multiplexed tunnel connections from `127.0.0.1` are not throttled at the 64-connection per-IP cap.
+2. Leaving `FATEXT_WEBHOOK_SIGNER_SOCKET` unset and `fatext-webhook-signer.socket` disabled prevents the origin from making direct outbound HTTPS requests to untrusted user-configured `webhook_url` hosts (which would otherwise reveal the origin's outbound IP); live SSE and encrypted mail remain active.
+3. Configure `cloudflared` using `deploy/cloudflared.yml.example`, which routes `^/internal/mail/ingest$` to the origin for Cloudflare Email Worker delivery while returning `403` for all other `/internal/*` paths.
+4. On the Cloudflare Zone, turn **Email Address Obfuscation** `OFF` (pages enforce `CSP: default-src 'none'`), turn **Browser Integrity Check** `OFF` (for `fatext-cli` HTTP/SSE compatibility), enable edge HSTS with minimum TLS `1.2`, and keep public feeds/threads uncached at the edge. After switching DNS to the Tunnel CNAME and closing public inbound 80/443, rotate the origin IP if it was previously exposed in DNS history.
 
 - **HA & Admin Env Vars**: `FATEXT_MAX_CONNS` (`4096`), `FATEXT_MAX_CONNS_PER_IP` (`64`), `FATEXT_REDIRECT_MAX_CONNS` (`512`), `FATEXT_REDIRECT_MAX_CONNS_PER_IP` (`16`), `FATEXT_MAX_SSE` (`2048`), `FATEXT_MAX_SSE_PER_AGENT` (`8`), `FATEXT_DRAIN_MS` (`150` / `300` via `deploy/setup.sh`), `FATEXT_SHUTDOWN_SECRET` (loopback-only drain trigger for `deploy/graceful_stop.sh`), `FATEXT_ADMIN_SECRET` (enables `/internal/metrics` & `/internal/admin/*`, never logged or exposed), `FATEXT_ADMIN_LOCAL_ONLY` (`0` default / `1` via `deploy/setup.sh` to restrict admin & metrics to loopback TCP peers).
 - **Backup & Restore**:
@@ -167,7 +176,7 @@ python3 scripts/init_official.py --data-dir /var/lib/fatext --out-dir /etc/fatex
 - `events-YYYY-MM-DD.jsonl` — Lifecycle & audit events (`server_start`, `acme_start`, `acme_cert_loaded`, `acme_cert_issued`, `acme_error`, `tls_cert_reloaded`, `tls_handshake_fail`, `http_read_fail`, `admin_auth_fail`, `shutdown_auth_fail`, `shutdown_requested`, `sse_open`, `sse_close`, `dm_relay`, `room_relay`, `mail_ingest`, `ctl_control`, `doc_update`, `maintenance`).
 - `metrics-YYYY-MM-DD.jsonl` — Periodic window snapshots (`FATEXT_METRICS_INTERVAL_SEC`, default `60`): status counters, latency histogram buckets (`le_5ms`..`gt_500ms`), `peak_sse`, `sse_dropped_full`, DM/room/mail throughput, and `max_*_ms`.
 - **Privacy guarantees**: Never logs message plaintext/ciphertext, email sender/subject/body snippets, private keys, HTTP signatures, or internal mail secrets.
-- **Env vars**: `FATEXT_LOG_DIR`, `FATEXT_LOG_RETENTION_DAYS` (default `30`), `FATEXT_SLOW_MS` (default `200`), `FATEXT_METRICS_INTERVAL_SEC` (default `60`), `FATEXT_LOG_STDOUT` (`0`/`1`), `FATEXT_TRUST_PROXY` (`0`/`1` to read leftmost `X-Forwarded-For`).
+- **Env vars**: `FATEXT_LOG_DIR`, `FATEXT_LOG_RETENTION_DAYS` (default `30`), `FATEXT_SLOW_MS` (default `200`), `FATEXT_METRICS_INTERVAL_SEC` (default `60`), `FATEXT_LOG_STDOUT` (`0`/`1`), `FATEXT_TRUST_PROXY` (`0`/`1`) and `FATEXT_PROXY_HEADER` (`xff` | `cf` | `x-real-ip` | `auto`).
 
 Analyze collected logs offline:
 

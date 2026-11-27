@@ -240,10 +240,36 @@ def test_tls_redirect_and_headers(td_p: Path) -> None:
         srv.wait(timeout=5)
 
 
+def read_http_response_sock(sock: socket.socket) -> bytes:
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = sock.recv(4096)
+        if not chunk:
+            return buf
+        buf += chunk
+    head, rest = buf.split(b"\r\n\r\n", 1)
+    clen = 0
+    for ln in head.split(b"\r\n")[1:]:
+        if ln.lower().startswith(b"content-length:"):
+            clen = int(ln.split(b":", 1)[1].strip())
+            break
+    while len(rest) < clen:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        rest += chunk
+    return head + b"\r\n\r\n" + rest[:clen]
+
+
 def test_http_smuggling_and_slowloris(host: str, port: int) -> None:
-    print("[2/7] HTTP CL/TE smuggling, malformed headers, and Slowloris cumulative deadline...")
+    print("[2/7] HTTP CL/TE smuggling, chunked framing, malformed headers, and Slowloris cumulative deadline...")
     smuggle_payloads = [
         b"POST /health HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nContent-Length: 0\r\n\r\n0\r\n\r\n",
+        b"POST /health HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+        b"POST /health HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n",
+        b"POST /health HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\nZZ\r\n\r\n",
+        b"POST /health HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhiXX0\r\n\r\n",
+        b"POST /health HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n40001\r\n",
         b"POST /health HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello",
         b"POST /health HTTP/1.1\r\nHost: localhost\r\nContent-Length: -1\r\n\r\n",
         b"POST /health HTTP/1.1\r\nHost: localhost\r\nContent-Length: +5\r\n\r\nhello",
@@ -255,6 +281,35 @@ def test_http_smuggling_and_slowloris(host: str, port: int) -> None:
             s.sendall(payload)
             resp = s.recv(4096).decode("utf-8", errors="replace")
         assert_true("400 Bad Request" in resp, f"expected 400 on smuggling payload {payload!r}, got {resp!r}")
+
+    # Valid RFC 9112 Transfer-Encoding: chunked request + chunk extension + trailer + keep-alive reuse
+    chunked_parts = [
+        b'{"date":"2026-01-01",',
+        b'"receipt":"rpt_bad",',
+        b'"token":"abc"}',
+    ]
+    chunked_wire = (
+        f"{len(chunked_parts[0]):x};ext=1\r\n".encode("ascii") + chunked_parts[0] + b"\r\n"
+        + f"{len(chunked_parts[1]):x}\r\n".encode("ascii") + chunked_parts[1] + b"\r\n"
+        + f"{len(chunked_parts[2]):x}\r\n".encode("ascii") + chunked_parts[2] + b"\r\n"
+        + b"0\r\nX-Checksum: ignored\r\n\r\n"
+    )
+    req1 = (
+        b"POST /v1/reports/status HTTP/1.1\r\n"
+        b"Host: localhost\r\n"
+        b"Content-Type: application/json\r\n"
+        b"Transfer-Encoding: chunked\r\n"
+        b"Connection: keep-alive\r\n\r\n"
+        + chunked_wire
+    )
+    req2 = b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+    with socket.create_connection((host, port), timeout=5.0) as s:
+        s.sendall(req1)
+        resp1 = read_http_response_sock(s).decode("utf-8", errors="replace")
+        assert_true("404 Not Found" in resp1 and "ERR_NOT_FOUND" in resp1, f"chunked POST failed to reach handler: {resp1!r}")
+        s.sendall(req2)
+        resp2 = read_http_response_sock(s).decode("utf-8", errors="replace")
+        assert_true("200 OK" in resp2 and resp2.endswith("ok\n"), f"keep-alive after chunked POST failed: {resp2!r}")
 
     # Slowloris trickle: 1 header every 1.2s must still hit 10s cumulative deadline instead of extending forever
     t0 = time.time()
@@ -421,6 +476,16 @@ def test_deploy_and_email_worker(td_p: Path) -> None:
         assert_eq(r_sh.returncode, 0, f"bash -n failed on {sh_file}: {r_sh.stderr}")
     gs_txt = (ROOT / "deploy" / "graceful_stop.sh").read_text(encoding="utf-8")
     assert_true("FATEXT_ACME_DOMAINS" in gs_txt, "graceful_stop.sh must detect FATEXT_ACME_DOMAINS")
+    cfd_txt = (ROOT / "deploy" / "cloudflared.yml.example").read_text(encoding="utf-8")
+    idx_ingest = cfd_txt.find("path: ^/internal/mail/ingest$")
+    idx_block = cfd_txt.find("path: ^/internal/\n")
+    assert_true(idx_ingest != -1 and idx_block != -1 and idx_ingest < idx_block, "cloudflared.yml.example must allow /internal/mail/ingest before blocking /internal/")
+    assert_true("FATEXT_MAX_CONNS_PER_IP=0" in cfd_txt, "cloudflared.yml.example must document FATEXT_MAX_CONNS_PER_IP=0")
+    tun_txt = (ROOT / "deploy" / "fatext-tunnel.conf.example").read_text(encoding="utf-8")
+    assert_true("Environment=FATEXT_TLS_REQUIRED=0" in tun_txt, "fatext-tunnel.conf.example must set FATEXT_TLS_REQUIRED=0")
+    assert_true("Environment=FATEXT_WEBHOOK_SIGNER_SOCKET=" in tun_txt, "fatext-tunnel.conf.example must clear FATEXT_WEBHOOK_SIGNER_SOCKET")
+    setup_txt = (ROOT / "deploy" / "setup.sh").read_text(encoding="utf-8")
+    assert_true("--tunnel" in setup_txt and "FATEXT_PROXY_HEADER=cf" in setup_txt, "setup.sh must support --tunnel mode")
     sync_bad = subprocess.run(
         ["bash", str(ROOT / "deploy" / "sync_dl.sh"), "latest", str(td_p / "dl_out"), "http://127.0.0.1/key.pem"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5.0,
