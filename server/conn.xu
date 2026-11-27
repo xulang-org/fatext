@@ -109,7 +109,7 @@ pub fn cc_write_timeout(cc $&ClientConn, data &string, dur_ns int) int {
     << rc
 }
 
-// SO_NOSIGPIPE (macOS SOL_SOCKET=65535, SO_NOSIGPIPE=4130); Linux relies on signal.ignore(SIGPIPE).
+// SO_NOSIGPIPE is a macOS socket option. The process also ignores SIGPIPE.
 pub fn cc_disable_sigpipe(fd int) {
     if fd < 0 { << }
     _ := os.setsockopt_int(fd, 65535, 4130, 1) or (err) { << }

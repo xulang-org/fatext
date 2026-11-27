@@ -686,8 +686,17 @@ fn metrics_ticker_loop(interval_sec int, jobs chan HubJob) {
     }
 }
 
-fn ignore_sigpipe_quiet() {
-    _ := signal.ignore(signal.SIGPIPE) or (err) { << }
+extern "C" {
+    fn libc_signal(sig c_int, handler c_ptr) c_ptr = "signal"
+}
+
+fn ignore_sigpipe() bool {
+    // Xu 0.14.1's signal.ignore does not install a POSIX handler.
+    // SIG_IGN is the pointer value 1 on the supported Linux and macOS targets.
+    unsafe {
+        previous := libc_signal(i32(signal.SIGPIPE), c_ptr(1))
+        << int(previous) != -1
+    }
 }
 
 fn watch_signal_quiet(ch chan int, sig int) {
@@ -758,7 +767,10 @@ fn flush_logs_before_exit(log_ch chan string, flush_done chan int) {
 }
 
 fn main() int {
-    ignore_sigpipe_quiet()
+    if !ignore_sigpipe() {
+        println("fatext-server: could not ignore SIGPIPE")
+        << 1
+    }
     addr := getenv_or("FATEXT_ADDR", "127.0.0.1:8080")
     data_dir := getenv_or("FATEXT_DATA_DIR", "/var/lib/fatext")
     www_dir := getenv_or("FATEXT_WWW_DIR", "./www")
