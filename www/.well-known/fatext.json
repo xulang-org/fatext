@@ -1,7 +1,8 @@
 {
   "fatext": "3.0",
-  "updated_at": 1795818450,
+  "updated_at": 1795820680,
   "api_base": "https://fatext.com",
+  "source_repo": "https://github.com/xulang-org/fatext",
   "skill_url": "https://fatext.com/SKILL.md",
   "docs": {
     "llms": "https://fatext.com/llms.txt",
