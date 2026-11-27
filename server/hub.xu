@@ -850,7 +850,8 @@ fn dispatch_http(hub $&HubState, req &HttpReq, now int, preflight bool, reviewed
         rest := path[3:path.len]
         parts := strings.split(&rest, "/")
         if parts.len == 1 && parts[0].len > 0 {
-            << serve_channel($&hub.st, parts[0] + "", "", false, now)
+            auto_live := query_param_str(req.path(), "live", "") == "1"
+            << serve_channel($&hub.st, parts[0] + "", "", false, auto_live, now)
         }
         if parts.len == 2 {
             ch := parts[0] + ""
@@ -861,7 +862,7 @@ fn dispatch_http(hub $&HubState, req &HttpReq, now int, preflight bool, reviewed
             if strings.has_suffix(&seg, ".sha256") {
                 << handle_get_channel_sha256(&hub.st, ch, seg[0:(seg.len - 7)])
             }
-            << serve_channel($&hub.st, ch, seg, true, now)
+            << serve_channel($&hub.st, ch, seg, true, false, now)
         }
     }
 
@@ -886,8 +887,21 @@ fn dispatch_http(hub $&HubState, req &HttpReq, now int, preflight bool, reviewed
         << serve_help(&hub.st)
     }
 
+    if path == "/about" && method == "GET" {
+        << serve_about(&hub.st)
+    }
+
+    if path == "/privacy" && method == "GET" {
+        << serve_privacy(&hub.st)
+    }
+
+    if path == "/terms" && method == "GET" {
+        << serve_terms(&hub.st)
+    }
+
     if path == "/" && method == "GET" {
-        << serve_home($&hub.st, now)
+        auto_live := query_param_str(req.path(), "live", "") == "1"
+        << serve_home($&hub.st, auto_live, now)
     }
 
     if strings.has_prefix(&path, "/v1/") || strings.has_prefix(&path, "/internal/") {

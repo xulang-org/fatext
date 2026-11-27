@@ -404,11 +404,26 @@ def main() -> int:
             st, _, home_html = request("GET", "/")
             assert st == 200
             hh = home_html.decode("utf-8")
-            assert_zero_js(hh, expect_refresh=True, label="home SSR")
+            assert_zero_js(hh, expect_refresh=False, label="home SSR default")
+            assert "/?live=1" in hh
             assert "[PIN · SPONSORED]" in hh
             assert "SEND THIS TO YOUR AI AGENT" in hh and "Read https://fatext.com/SKILL.md" in hh
             assert 'href="/dl/"' in hh and 'href="/help#architecture"' in hh
-            assert 'href="/help"' in hh
+            assert 'href="/help"' in hh and 'href="/about"' in hh and 'href="/privacy"' in hh and 'href="/terms"' in hh
+
+            st_hl, _, home_live = request("GET", "/?live=1")
+            assert st_hl == 200
+            assert_zero_js(home_live.decode("utf-8"), expect_refresh=True, label="home SSR ?live=1")
+
+            st_ch, _, ch_html = request("GET", "/c/general")
+            assert st_ch == 200
+            ch_s = ch_html.decode("utf-8")
+            assert_zero_js(ch_s, expect_refresh=False, label="channel general SSR default")
+            assert "/c/general?live=1" in ch_s
+
+            st_chl, _, ch_live = request("GET", "/c/general?live=1")
+            assert st_chl == 200
+            assert_zero_js(ch_live.decode("utf-8"), expect_refresh=True, label="channel general SSR ?live=1")
 
             st_dl, _, dl_html = request("GET", "/dl/")
             assert st_dl == 200, f"GET /dl/ -> {st_dl}"
@@ -416,12 +431,13 @@ def main() -> int:
             assert_zero_js(dl_s, expect_refresh=False, label="download SSR")
             assert "Download fatext CLI" in dl_s and "SHA256SUMS.sig" in dl_s
 
-            st_hp, _, hp_html = request("GET", "/help")
-            assert st_hp == 200, f"GET /help -> {st_hp}"
-            hp_s = hp_html.decode("utf-8")
-            assert_zero_js(hp_s, expect_refresh=False, label="help SSR")
-            assert "Usage Help" in hp_s and "SINGLE AGENT PROMPT" in hp_s
-            print("[10/12] hot-reload pins.json + home SSR OK")
+            for p_path, p_marker in [("/help", "Usage Help"), ("/about", "About fatext"), ("/privacy", "Privacy &amp; Security Policy"), ("/terms", "Terms of Use")]:
+                st_p, _, p_html = request("GET", p_path)
+                assert st_p == 200, f"GET {p_path} -> {st_p}"
+                p_s = p_html.decode("utf-8")
+                assert_zero_js(p_s, expect_refresh=False, label=f"{p_path} SSR")
+                assert p_marker in p_s, f"GET {p_path} missing {p_marker}"
+            print("[10/12] hot-reload pins.json + home/channel/policy SSR OK")
 
             # 11. Zero-DB restart recovery of daily post limit
             stop_server(proc)

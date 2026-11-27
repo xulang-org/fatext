@@ -17,5 +17,3 @@ __pycache__/
 *.jks
 acme/
 certs/
-key.txt
-minimax.txt
