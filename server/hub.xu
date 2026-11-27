@@ -539,7 +539,10 @@ pub fn entity_stats_loop(data_dir string, jobs chan HubJob) {
 }
 
 fn dispatch_http(hub $&HubState, req &HttpReq, now int, preflight bool, reviewed bool) HttpResp {
-    method := req.method()
+    $method := req.method()
+    if method == "HEAD" {
+        method = "GET"
+    }
     path := path_only(req.path())
 
     if path == "/report/status" || path == "/v1/reports/status" {

@@ -404,9 +404,9 @@ All signaling travels in encrypted DMs (§10), so fatext.com never sees candidat
     "x25519_pub":"base64","mode":"stdio"|"forward"|"bus","remote_port":5432,"relay":false,"expires_at":1764081060}}
    ```
 2. **Answer.** B runs `p2p listen` and checks four things: A is a friend (default policy), `|now - ts| ≤ 60` and nonce is unseen (24h cache), `remote_port` is in `--expose` (for forward mode), and the session slot is available. It then replies with `p2p_answer` `{session, accept, candidates, x25519_pub, reason?}`.
-3. **Punch & Data.** Both peers exchange UDP hole-punch packets across candidates every 50 ms for up to 10 s, derive an AES-256-GCM session key (`SHA256("fatext-p2p-v1\n" + session + "\n" + ecdh_shared)`), chunk payloads to `≤ 1150` bytes with `ACK(seq)` retransmission (60 ms interval, up to 8 retries), and maintain NAT bindings with 15 s idle `PING`/`PONG` keepalives. Supports `stdio`, `--expose`/`--forward` TCP bridging, and `--star [--bus]` multi-spoke topologies.
-5. **Fallback.** With `--relay turn:…`, relay candidates are added (`"relay":true`). fatext.com never relays data. If both sides sit behind symmetric NAT and no relay is configured, the session fails and the CLI exits with code 9.
-6. **Close.** Send `p2p_close` `{session}` (optional), then close QUIC.
+3. **Punch & Data.** Both peers exchange UDP hole-punch packets across candidates every 50 ms for up to 10 s, derive separate directional AES-256-GCM keys (`i2r` and `r2i`) bound to the full session transcript (`SHA256("fatext-p2p-v2\n" + dir + "\n" + session + "\n" + init_id + "\n" + resp_id + "\n" + init_xpub + "\n" + resp_xpub + "\n" + ecdh_shared)`) with random 96-bit IVs and AAD `header(ptype || seq) || session`, chunk payloads to `≤ 1150` bytes with adaptive SRTT/RTO `ACK(seq)` retransmission (`100`–`2000` ms, up to 12 exponential retries) and strict in-order delivery, and maintain NAT bindings with bidirectional `PING`/`PONG` keepalives and dead-peer reaping. Supports `stdio`, `--expose`/`--forward` TCP bridging, and `--star [--bus]` multi-spoke topologies.
+4. **Fallback.** With `--relay turn:…`, relay candidates are added (`"relay":true`). fatext.com never relays data. If both sides sit behind symmetric NAT and no relay is configured, the session fails and the CLI exits with code 9.
+5. **Close.** Send `p2p_close` `{session}` (optional) and UDP `FIN` packets, then close the UDP socket.
 
 ---
 

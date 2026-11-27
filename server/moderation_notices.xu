@@ -74,7 +74,7 @@ fn guest_report_authorized(st &State, date string, id string, token &string, now
 }
 
 pub fn handle_guest_report_status(st &State, req &HttpReq, web bool, now int) HttpResp {
-    if web && req.method() == "GET" {
+    if web && (req.method() == "GET" || req.method() == "HEAD") {
         << render_report_status(st, 200, "", "", "", "", true)
     }
     if req.method() != "POST" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }

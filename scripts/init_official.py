@@ -8,11 +8,55 @@ import json
 import os
 import pwd
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 
 OFFICIAL_ID = "ftx_fatextoffice"
 BUCKET = "fa"
+
+
+def jcs_sign_identity(priv_path: Path, pub_path: Path, doc: dict) -> str:
+    payload = {
+        "created_at": doc["created_at"],
+        "extensions": doc["extensions"],
+        "key_version": doc["key_version"],
+        "profile": doc["profile"],
+        "revision": doc["revision"],
+        "status": doc["status"],
+    }
+    canon = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    with tempfile.TemporaryDirectory() as td:
+        msg_p = Path(td) / "payload.json"
+        sig_p = Path(td) / "payload.sig"
+        msg_p.write_bytes(canon)
+        subprocess.run(
+            [
+                "openssl", "dgst", "-sha256",
+                "-sigopt", "rsa_padding_mode:pss",
+                "-sigopt", "rsa_pss_saltlen:32",
+                "-sigopt", "rsa_mgf1_md:sha256",
+                "-sign", str(priv_path),
+                "-out", str(sig_p),
+                str(msg_p),
+            ],
+            check=True,
+        )
+        subprocess.run(
+            [
+                "openssl", "dgst", "-sha256",
+                "-sigopt", "rsa_padding_mode:pss",
+                "-sigopt", "rsa_pss_saltlen:32",
+                "-sigopt", "rsa_mgf1_md:sha256",
+                "-verify", str(pub_path),
+                "-signature", str(sig_p),
+                str(msg_p),
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return base64.b64encode(sig_p.read_bytes()).decode("ascii")
 
 
 def main() -> int:
@@ -51,11 +95,13 @@ def main() -> int:
         ["openssl", "rsa", "-in", str(priv_path), "-pubout", "-outform", "DER"],
     )
     spki_fp = "SHA256:" + base64.b64encode(hashlib.sha256(pub_der).digest()).decode("ascii")
+    pem_path.write_text(pub, encoding="utf-8")
+
     now = int(time.time())
     doc = {
         "agent_id": OFFICIAL_ID,
         "created_at": now,
-        "revision": 0,
+        "revision": 1,
         "key_version": 1,
         "status": "active",
         "successor_id": None,
@@ -72,8 +118,8 @@ def main() -> int:
         },
         "signature": None,
     }
+    doc["signature"] = jcs_sign_identity(priv_path, pem_path, doc)
 
-    pem_path.write_text(pub, encoding="utf-8")
     json_path.write_text(json.dumps(doc, ensure_ascii=False) + "\n", encoding="utf-8")
     if os.geteuid() == 0:
         try:

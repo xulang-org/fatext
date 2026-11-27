@@ -86,6 +86,7 @@ fn is_static_or_dl_path(p &string) bool {
         *p == "/protocol.md" || *p == "/.well-known/fatext.json" ||
         *p == "/static/fatext.css" || *p == "/static/favicon.svg" ||
         *p == "/favicon.ico" || *p == "/static/logo.svg" ||
+        *p == "/robots.txt" || *p == "/sitemap.xml" ||
         (strings.has_prefix(p, "/dl/") && p.len > 4)
 }
 
@@ -286,7 +287,7 @@ fn handle_connection(fd int, req_seq int, peer_ip string, rcfg ConnRuntimeCfg, s
         req_bytes := req.req_body.len
 
         reply_ch := chan HubReply{cap: 1}
-        if path_only(raw_p + "") == "/v1/stream" {
+        if path_only(raw_p + "") == "/v1/stream" && meth == "GET" {
             if !acquire_job_token(rcfg.job_tokens, rcfg.queue_timeout_ms) {
                 r503 := err_resp(503, "ERR_OVERLOADED", "server request queue full", 2, 0, 0)
                 t_w0 := time.now()
@@ -469,7 +470,8 @@ fn handle_connection(fd int, req_seq int, peer_ip string, rcfg ConnRuntimeCfg, s
             }
             <-
         }
-        if meth == "GET" && is_static_or_dl_path(&req_p_only) {
+        is_head := meth == "HEAD"
+        if (meth == "GET" || is_head) && is_static_or_dl_path(&req_p_only) {
             t_st0 := time.now()
             st_rch := chan HttpResp{cap: 1}
             static_ch <- StaticJob{path: req_p_only, client_ip: client_ip + "", is_set_rpm: false, new_rpm: 0, reply_ch: st_rch}
@@ -478,7 +480,7 @@ fn handle_connection(fd int, req_seq int, peer_ip string, rcfg ConnRuntimeCfg, s
                 $sh_ms := (time.now() - t_st0) / 1000000
                 if sh_ms < 0 { sh_ms = 0 }
                 t_w0 := time.now()
-                w_rc := write_http_resp_ka($&cc, &sresp, ka)
+                w_rc := write_http_resp_ka_head($&cc, &sresp, ka, is_head)
                 $w_ms := (time.now() - t_w0) / 1000000
                 if w_ms < 0 { w_ms = 0 }
                 $tot_us := (time.now() - req_t0) / 1000
@@ -487,9 +489,11 @@ fn handle_connection(fd int, req_seq int, peer_ip string, rcfg ConnRuntimeCfg, s
                 $secode := ""
                 if sresp.status == 429 { secode = "ERR_RATE_LIMITED" }
                 else if sresp.status >= 400 { secode = "ERR_NOT_FOUND" }
+                $s_bytes := sresp.body.len
+                if is_head { s_bytes = 0 }
                 log_access_json(rcfg.access_ch, rcfg.slow_ms, time.now_time().unix(), req_id + "", meth + "", route + "",
                     sresp.status, secode, rcfg.tls_on, client_ip + "", "anon", "",
-                    req_bytes, sresp.body.len, req_tls_ms, read_ms, 0, sh_ms, w_ms, tot_us / 1000, tot_us)
+                    req_bytes, s_bytes, req_tls_ms, read_ms, 0, sh_ms, w_ms, tot_us / 1000, tot_us)
                 req_n += 1
                 if !ka || w_rc < 0 {
                     <-
@@ -500,15 +504,17 @@ fn handle_connection(fd int, req_seq int, peer_ip string, rcfg ConnRuntimeCfg, s
         rep := submit_http_request(req, jobs, rcfg.job_tokens, rcfg.queue_timeout_ms, reply_ch, rcfg.ai_moderation, rcfg.moderation_pool)
         req_n += 1
         t_w0 := time.now()
-        w_rc := write_http_resp_ka($&cc, &rep.resp, ka)
+        w_rc := write_http_resp_ka_head($&cc, &rep.resp, ka, is_head)
         $w_ms := (time.now() - t_w0) / 1000000
         if w_ms < 0 { w_ms = 0 }
         $tot_us := (time.now() - req_t0) / 1000
         if tot_us < 0 { tot_us = 0 }
         inflight_add(rcfg.inflight_ch, -1)
+        $r_bytes := rep.resp.body.len
+        if is_head { r_bytes = 0 }
         log_access_json(rcfg.access_ch, rcfg.slow_ms, time.now_time().unix(), req_id + "", meth + "", route + "",
             rep.resp.status, rep.err_code + "", rcfg.tls_on, client_ip + "", rep.actor_type + "", rep.actor_id + "",
-            req_bytes, rep.resp.body.len, req_tls_ms, read_ms, rep.queue_ms, rep.handle_ms, w_ms, tot_us / 1000, tot_us)
+            req_bytes, r_bytes, req_tls_ms, read_ms, rep.queue_ms, rep.handle_ms, w_ms, tot_us / 1000, tot_us)
         if !ka || w_rc < 0 {
             <-
         }
