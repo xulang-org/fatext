@@ -2,12 +2,16 @@ XU ?= xu
 XU_STDLIB_ROOT ?= $(if $(wildcard ../xu/src/runtime/core),../xu/src,$(HOME)/.xu/src)
 OUT ?= build/fatext-server
 
-.PHONY: build preview test test-all clean
+.PHONY: build build-linux-x64 preview test test-all clean
 
 build:
 	@mkdir -p build
 	XU_STDLIB_ROOT=$(XU_STDLIB_ROOT) $(XU) build server -o $(OUT)
 	@if [ "$$(uname -s)" = "Darwin" ]; then codesign -fs - $(OUT); fi
+
+build-linux-x64:
+	@mkdir -p build
+	XU_STDLIB_ROOT=$(XU_STDLIB_ROOT) $(XU) build server --target linux-x64 -o build/fatext-server-linux-x64
 
 preview:
 	python3 scripts/build_preview.py
