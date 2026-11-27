@@ -58,9 +58,13 @@ pub fn valid_moderation_endpoint(endpoint &string) bool {
 }
 
 pub fn moderation_worker(ch chan ModerationJob, endpoint string, secret string, model string, levels ModerationLevels) {
+    $client := http.new_client()
+    client.set_timeout(6000000000)
+    client.max_redirects = -1
+    client.max_response_bytes = 32768
     while true {
         job := <-ch
-        job.result <- classify_public_text(endpoint + "", secret + "", &model, &job.text, &levels)
+        job.result <- classify_public_text($&client, endpoint + "", secret + "", &model, &job.text, &levels)
     }
 }
 
@@ -77,18 +81,17 @@ fn flagged_moderation_level(doc &json.Doc, node int, levels &ModerationLevels) i
     << MODERATION_FLAG_LOW
 }
 
-fn classify_public_text(endpoint string, secret string, model &string, input &string, levels &ModerationLevels) int {
+fn classify_public_text(client $&http.Client, endpoint string, secret string, model &string, input &string, levels &ModerationLevels) int {
     if endpoint.len == 0 { << MODERATION_UNAVAILABLE }
-    $client := http.new_client()
-    client.set_timeout(6000000000)
-    client.max_redirects = -1
-    client.max_response_bytes = 32768
-    $headers := "Content-Type: application/json\r\n"
+    $headers := "Connection: close\r\nContent-Type: application/json\r\n"
     if secret.len > 0 {
         headers = headers + "Authorization: Bearer " + secret + "\r\n"
     }
     body := "{\"model\":" + json.quote(model) + ",\"input\":" + json.quote(input) + "}"
-    resp := client.do_extra("POST", endpoint, headers, &body) or (err) { << MODERATION_UNAVAILABLE }
+    resp := client.do_extra("POST", endpoint, headers, &body) or (err) {
+        client.close_idle_connections()
+        << MODERATION_UNAVAILABLE
+    }
     client.close_idle_connections()
     if resp.status_code != 200 { << MODERATION_UNAVAILABLE }
     raw := resp.body()
@@ -130,10 +133,21 @@ pub fn is_public_write(req &HttpReq) bool {
     << (parts[2] == "channels" && parts[4] == "posts") || (parts[2] == "threads" && parts[4] == "replies")
 }
 
+fn canonical_review_body(raw_body &string) string {
+    doc := json.parse(raw_body)
+    if !doc.ok() || !doc.is_dict(doc.root()) { << *raw_body + "" }
+    r := doc.root()
+    text := json_str_or(&doc, doc.get(r, "text"), "")
+    reply_to := json_str_or(&doc, doc.get(r, "reply_to"), "")
+    cstate := json_str_or(&doc, doc.get(r, "conversation_state"), "")
+    << "{\"text\":" + json.quote(&text) + ",\"reply_to\":" + json.quote(&reply_to) + ",\"conversation_state\":" + json.quote(&cstate) + "}"
+}
+
 fn review_key(req &HttpReq) string {
     actor := strings.trim_space(&req.header("X-Agent-Id"))
     path := path_only(req.path())
-    digest := sha256.sum256(req.body())
+    canon := canonical_review_body(&req.req_body)
+    digest := sha256.sum256(canon + "")
     << sha256.sum256(actor + "\n" + req.method() + "\n" + path + "\n" + digest)
 }
 

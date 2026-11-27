@@ -51,6 +51,27 @@ fn load_hidden_messages(path string, fresh bool) string {
 pub fn init_public_moderation(st $&State, default_mode string, fresh bool) {
     dir := moderation_dir(st)
     os.mkdir_all(dir + "") or (err) { << }
+    troot := st.data_dir + "/public/threads"
+    bdirs := read_dir_or_empty(troot + "")
+    if bdirs.len > 0 {
+        buckets := strings.split(&bdirs, "\n")
+        for bi in 0:buckets.len {
+            b := strings.trim_space(&buckets[bi])
+            if b.len == 0 || strings.contains(&b, "/") || b == "." || b == ".." { -> }
+            tlist := read_dir_or_empty(troot + "/" + b)
+            if tlist.len == 0 { -> }
+            tfiles := strings.split(&tlist, "\n")
+            for ti in 0:tfiles.len {
+                fn_s := strings.trim_space(&tfiles[ti])
+                if strings.has_suffix(&fn_s, ".jsonl.publishing") && fn_s.len > 17 {
+                    mid := fn_s[0:(fn_s.len - 17)] + ""
+                    if is_valid_msg_id(mid + "") {
+                        map_set($&st.publishing_posts, mid + "", 1)
+                    }
+                }
+            }
+        }
+    }
     if file_exists(dir + "/recovery-required") { << }
 
     raw := load_hidden_messages(dir + "/hidden.json", fresh)
@@ -86,8 +107,7 @@ pub fn public_posting_allowed(st &State, aid string) bool {
 
 pub fn public_message_visible(st &State, mid string) bool {
     if !st.public_visibility_ready || !is_valid_msg_id(mid + "") || st.hidden_posts.has(mid + "") { << false }
-    _ := os.stat(thread_path(st, mid + "") + ".publishing") or (err) { << os.is_not_exist(err.msg()) }
-    << false
+    << !st.publishing_posts.has(mid + "")
 }
 
 pub fn read_public_post_records(st &State, path string) []PostRecord {
@@ -259,6 +279,22 @@ fn report_rate_allowed(st $&State, ip string, now int, automatic bool) bool {
     << true
 }
 
+fn report_probe_allowed(st $&State, ip string, now int) bool {
+    window := now / 600
+    if st.report_window != window {
+        st.report_window = window
+        st.reports_this_window = 0
+        st.reviews_this_window = 0
+        map_clear($&st.report_hits)
+    }
+    key := "probe:" + ip
+    if !st.report_hits.has(key + "") && st.report_hits.len() >= 8192 { << false }
+    cnt := map_get_or(&st.report_hits, key + "", 0)
+    if cnt >= 20 { << false }
+    map_set($&st.report_hits, key, cnt + 1)
+    << true
+}
+
 fn is_receipt_id(id &string) bool {
     << id.len == 30 && strings.has_prefix(id, "rpt_") &&
        is_valid_msg_id("msg_" + id[4:id.len])
@@ -350,6 +386,10 @@ pub fn handle_public_report(st $&State, req &HttpReq, web bool, now int) HttpRes
        details.len > 2000 || has_forbidden_ctrl(&details) {
         if web { << report_html(st, 400, "Check the message IDs, reason, and details.", thread + "", message + "", true) }
         << err_resp(400, "ERR_BAD_REQUEST", "invalid thread ID, message ID, reason, or details", 0, 0, 0)
+    }
+    if !report_probe_allowed(st, req.remote_ip + "", now) {
+        if web { << report_html(st, 429, "Too many reports. Try again in a few minutes.", thread + "", message + "", true) }
+        << err_resp(429, "ERR_RATE_LIMITED", "report rate limit reached", 600, 0, 0)
     }
     if !message_in_thread(st, thread + "", message + "") {
         if web { << report_html(st, 404, "Message not found in the specified thread.", thread + "", message + "", true) }

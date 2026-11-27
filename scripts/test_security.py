@@ -982,6 +982,62 @@ def main() -> int:
                 srv6b.terminate()
                 srv6b.wait(timeout=5)
 
+        print("[6b2/7] Testing default FATEXT_PROXY_HEADER=xff ignores CF header and merges duplicate XFF headers...")
+        import socket as pysocket
+        p6x_port = free_tcp_port()
+        p6x_url = f"http://{HOST}:{p6x_port}"
+        p6x_data = td_p / "p6x_data"
+        p6x_logs = td_p / "p6x_logs"
+        p6x_data.mkdir(parents=True, exist_ok=True)
+        p6x_logs.mkdir(parents=True, exist_ok=True)
+        sd_sec_x = "sd-sec-r3-5522"
+        p6x_env = os.environ.copy()
+        p6x_env.pop("FATEXT_PROXY_HEADER", None)
+        p6x_env.update({
+            "FATEXT_ADDR": f"{HOST}:{p6x_port}",
+            "FATEXT_DATA_DIR": str(p6x_data),
+            "FATEXT_LOG_DIR": str(p6x_logs),
+            "FATEXT_WWW_DIR": str(WWW_DIR),
+            "FATEXT_TEMPLATES_DIR": str(TPL_DIR),
+            "FATEXT_POW_BITS": "8",
+            "FATEXT_TRUST_PROXY": "1",
+            "FATEXT_SHUTDOWN_SECRET": sd_sec_x,
+        })
+        srv6x = subprocess.Popen([str(SERVER_BIN)], env=p6x_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            wait_http_ok(f"{p6x_url}/health")
+            with pysocket.create_connection((HOST, p6x_port), timeout=5.0) as sock:
+                raw_req = (
+                    f"GET /health HTTP/1.1\r\n"
+                    f"Host: {HOST}:{p6x_port}\r\n"
+                    f"CF-Connecting-IP: 198.51.100.1\r\n"
+                    f"X-Forwarded-For: 198.51.100.10\r\n"
+                    f"X-Forwarded-For: 203.0.113.88\r\n"
+                    f"Connection: close\r\n\r\n"
+                ).encode("ascii")
+                sock.sendall(raw_req)
+                raw_resp = b""
+                while True:
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        break
+                    raw_resp += chunk
+            assert_true(b"200 OK" in raw_resp, f"default xff raw health failed: {raw_resp[:120]!r}")
+            with urllib.request.urlopen(
+                urllib.request.Request(f"{p6x_url}/internal/shutdown", data=b"", method="POST", headers={"X-Fatext-Shutdown-Secret": sd_sec_x}),
+                timeout=5.0,
+            ) as sdr_x:
+                assert_eq(sdr_x.status, 200, "6x shutdown 200")
+            assert_eq(srv6x.wait(timeout=8.0), 0, "6x shutdown clean exit")
+            acc6x = [json.loads(ln) for p in p6x_logs.glob("access-*.jsonl") for ln in p.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            ips6x = {e.get("ip") for e in acc6x if e.get("route") == "/health"}
+            assert_true("203.0.113.88" in ips6x, f"default xff expected merged rightmost XFF 203.0.113.88 in {ips6x}")
+            assert_true("198.51.100.1" not in ips6x, f"default xff leaked spoofed CF-Connecting-IP: {ips6x}")
+        finally:
+            if srv6x.poll() is None:
+                srv6x.terminate()
+                srv6x.wait(timeout=5)
+
         print("[6c/7] Testing persistent daily friend request limit & UTF-8 note hardening...")
         bad_fr_env = os.environ.copy()
         bad_fr_env.update({
