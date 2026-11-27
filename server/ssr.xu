@@ -804,7 +804,7 @@ fn extract_ver_from_dl_filename(name &string) string {
 
 pub fn resolve_dl_latest_version(dl_dir &string) string {
     if dl_dir.len == 0 { << "" }
-    lraw := os.read(dl_dir + "/latest.json") or (err) { << "" }
+    lraw := read_file_or_empty(dl_dir + "/latest.json")
     if lraw.len > 0 {
         ldoc := json.parse(&lraw)
         if ldoc.ok() && ldoc.is_dict(ldoc.root()) && ldoc.has(ldoc.root(), "latest_version") {
@@ -956,9 +956,13 @@ pub fn static_loop(www_dir string, dl_dir string, ip_rpm int, ch chan StaticJob)
         if cur_rpm > 0 {
             now_rl := time.now_time().unix()
             win := now_rl / 60
-            if win != ip_window || ip_hits.len() > 16384 {
+            if win != ip_window {
                 ip_hits.clear()
                 ip_window = win
+            }
+            if !ip_hits.has(job.client_ip + "") && ip_hits.len() >= 16384 {
+                job.reply_ch <- err_resp(429, "ERR_RATE_LIMITED", "IP rate limit exceeded", 60, now_rl + 60, 0)
+                ->
             }
             cur := map_get_or(&ip_hits, job.client_ip + "", 0)
             if cur >= cur_rpm {

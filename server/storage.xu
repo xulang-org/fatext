@@ -67,6 +67,7 @@ pub struct AgentSummary {
     pub ownership_raw string
     pub managed_count int
     pub managed_agents_raw string
+    pub controller_only bool
     pub raw_json string
 }
 
@@ -86,6 +87,9 @@ pub struct State {
     pub public_blocked_link_hosts maps.StrInt
     pub allowed_publishers []string
     pub hidden_posts maps.StrInt
+    pub publishing_posts maps.StrInt
+    pub moderation_inflight maps.StrInt
+    pub official_pin_verified maps.StrInt
     pub report_hits maps.StrInt
     pub report_window int
     pub reports_this_window int
@@ -158,6 +162,9 @@ pub fn new_state(addr string, data_dir string, www_dir string, templates_dir str
         public_blocked_link_hosts: maps.new_str_int(),
         allowed_publishers: []string{},
         hidden_posts: maps.new_str_int(),
+        publishing_posts: maps.new_str_int(),
+        moderation_inflight: maps.new_str_int(),
+        official_pin_verified: maps.new_str_int(),
         report_hits: maps.new_str_int(),
         report_window: 0,
         reports_this_window: 0,
@@ -286,8 +293,14 @@ pub fn agent_doc_path(st &State, agent_id string, kind string) string {
 
 pub fn write_atomic(path string, data &string) int {
     tmp := path + ".tmp." + strconv.itoa(os.getpid()) + "." + strconv.itoa(time.now())
-    os.write(tmp + "", data + "") or >>
-    os.rename(tmp + "", path) or >>
+    os.write(tmp + "", data + "") or (err) {
+        _ := os.remove(tmp + "") or (e2) { << 0 }
+        >> err
+    }
+    os.rename(tmp + "", path) or (err) {
+        _ := os.remove(tmp + "") or (e2) { << 0 }
+        >> err
+    }
     << 0
 }
 
@@ -577,6 +590,7 @@ pub fn reload_configs(st $&State, now int) {
             parse_pins_data(st, &pin_raw)
             st.pins_hash = h
             st.home_cache_ver += 1
+            map_clear($&st.official_pin_verified)
         }
     }
 
@@ -739,7 +753,7 @@ pub fn read_agent_summary(st &State, agent_id string) AgentSummary {
         ownership_label: "", ownership_suspend_reason: "", ownership_revoked_by: "",
         ownership_sig: "", cred_id: "", cred_issued_at: 0, cred_expires_at: 0,
         cred_scopes: []string{}, ownership_raw: "null",
-        managed_count: 0, managed_agents_raw: "[]", raw_json: ""
+        managed_count: 0, managed_agents_raw: "[]", controller_only: false, raw_json: ""
     }
     if !is_valid_agent_id(agent_id + "") { << out }
     $raw := ""
@@ -803,6 +817,9 @@ pub fn read_agent_summary(st &State, agent_id string) AgentSummary {
             out.managed_count = doc.count(ma)
             out.managed_agents_raw = json_encode_or(&doc, ma, "[]")
         }
+    }
+    if doc.has(r, "controller_only") && doc.is_bool(doc.get(r, "controller_only")) {
+        out.controller_only = json_bool_or(&doc, doc.get(r, "controller_only"), false)
     }
     << out
 }
@@ -902,26 +919,50 @@ fn clone_str_slice(xs &[]string) []string {
     << out
 }
 
-fn read_thread_root(st &State, mid string) PostRecord {
-    $file := os.open(thread_path(st, mid)) or (err) { << parse_post_line(&"") }
+fn read_thread_root_line(st &State, mid string) string {
+    $file := os.open(thread_path(st, mid)) or (err) { << "" }
     // The signed request is capped at 8 KiB, even before decoding its text.
     raw := file.read(65536) or (err) {
         close_file_quiet($&file)
-        << parse_post_line(&"")
+        << ""
     }
     close_file_quiet($&file)
     end := strings.index_of(&raw, "\n")
-    if end < 0 { << parse_post_line(&raw) }
-    << parse_post_line(&raw[0:end])
+    if end < 0 { << raw }
+    << raw[0:end] + ""
 }
 
-fn official_pin_author_verified(st &State, mid string) bool {
+fn read_thread_root(st &State, mid string) PostRecord {
+    line := read_thread_root_line(st, mid + "")
+    << parse_post_line(&line)
+}
+
+fn store_pin_verify_cache(st $&State, ckey string, ok bool) {
+    if st.official_pin_verified.len() >= 256 {
+        map_clear($&st.official_pin_verified)
+    }
+    if ok {
+        map_set($&st.official_pin_verified, ckey + "", 1)
+    } else {
+        map_set($&st.official_pin_verified, ckey + "", -1)
+    }
+}
+
+fn official_pin_author_verified(st $&State, mid string) bool {
     if !is_valid_msg_id(mid + "") { << false }
-    post := read_thread_root(st, mid + "")
-    if !post.public_body_ok || post.msg_id != mid || post.sender_id != "ftx_fatextoffice" ||
-       post.thread_id.len > 0 || !is_valid_channel_name(post.channel + "") { << false }
+    first_line := read_thread_root_line(st, mid + "")
+    if first_line.len == 0 { << false }
     agent := read_agent_summary(st, "ftx_fatextoffice")
     if !agent.found { << false }
+    ckey := sha256.sum256(mid + "\n" + first_line + "\n" + strconv.itoa(agent.key_version) + "\n" + agent.pub_pem)
+    cached := map_get_or(&st.official_pin_verified, ckey + "", 0)
+    if cached != 0 { << cached > 0 }
+    post := parse_post_line(&first_line)
+    if !post.public_body_ok || post.msg_id != mid || post.sender_id != "ftx_fatextoffice" ||
+       post.thread_id.len > 0 || !is_valid_channel_name(post.channel + "") {
+        store_pin_verify_cache(st, ckey + "", false)
+        << false
+    }
     $pem := ""
     if post.key_version == agent.key_version {
         pem = agent.pub_pem + ""
@@ -936,42 +977,54 @@ fn official_pin_author_verified(st &State, mid string) bool {
             }
         }
     }
-    pk := parse_spki_rsa_pem(&pem) or (err) { << false }
-    << verify_request_sig(&pk, "POST", "/v1/channels/" + post.channel + "/posts", strconv.itoa(post.ts), &post.signed_body, post.sig + "")
+    pk := parse_spki_rsa_pem(&pem) or (err) {
+        store_pin_verify_cache(st, ckey + "", false)
+        << false
+    }
+    ok := verify_request_sig(&pk, "POST", "/v1/channels/" + post.channel + "/posts", strconv.itoa(post.ts), &post.signed_body, post.sig + "")
+    store_pin_verify_cache(st, ckey + "", ok)
+    << ok
 }
 
-pub fn active_pins_for_channel(st &State, ch string, now int) []PinEntry {
+pub fn active_pins_for_channel(st $&State, ch string, now int) []PinEntry {
     $out := []PinEntry{}
     $off_cnt := 0
     $spon_cnt := 0
-    for i in 0:st.pins.len {
-        p := &st.pins[i]
-        if p.expires_at > 0 && now > p.expires_at { -> }
+    n_pins := st.pins.len
+    for i in 0:n_pins {
+        exp := st.pins[i].expires_at
+        if exp > 0 && now > exp { -> }
         $matches := false
-        for j in 0:p.channels.len {
-            if p.channels[j] == "*" || p.channels[j] == ch {
+        for j in 0:st.pins[i].channels.len {
+            if st.pins[i].channels[j] == "*" || st.pins[i].channels[j] == ch {
                 matches = true
                 <-
             }
         }
         if !matches { -> }
+        mid := st.pins[i].msg_id + ""
+        ptype := st.pins[i].pin_type + ""
+        lbl := st.pins[i].label + ""
+        prio := st.pins[i].priority
+        cat := st.pins[i].created_at
+        chs := clone_str_slice(&st.pins[i].channels)
         $keep := false
-        if p.pin_type == "official" && off_cnt < 1 && official_pin_author_verified(st, p.msg_id + "") {
+        if ptype == "official" && off_cnt < 1 && official_pin_author_verified(st, mid + "") {
             off_cnt += 1
             keep = true
-        } else if p.pin_type == "sponsored" && spon_cnt < 2 {
+        } else if ptype == "sponsored" && spon_cnt < 2 {
             spon_cnt += 1
             keep = true
         }
         if !keep { -> }
         out.push(PinEntry{
-            msg_id: p.msg_id + "",
-            channels: clone_str_slice(&p.channels),
-            pin_type: p.pin_type + "",
-            label: p.label + "",
-            priority: p.priority,
-            created_at: p.created_at,
-            expires_at: p.expires_at
+            msg_id: mid,
+            channels: chs,
+            pin_type: ptype,
+            label: lbl,
+            priority: prio,
+            created_at: cat,
+            expires_at: exp
         })
     }
     << out

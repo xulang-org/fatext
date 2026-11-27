@@ -530,7 +530,7 @@ pub fn effective_client_ip(peer_ip string, req &HttpReq, trust_proxy bool, proxy
         xri := strings.trim_space(&req.header("X-Real-IP"))
         if is_valid_ip_literal(&xri) { << xri }
     }
-    xff := strings.trim_space(&req.header("X-Forwarded-For"))
+    xff := strings.trim_space(&req.header_all("X-Forwarded-For"))
     if xff.len == 0 { << peer_ip + "" }
     parts := strings.split(&xff, ",")
     $last_valid := ""

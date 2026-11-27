@@ -72,14 +72,17 @@ fn link_punctuation(r int) bool {
     << strings.contains_rune(&"[]{}<>\"`，；：（）《》「」、！？", r)
 }
 
+fn unescape_or_raw(s &string) string {
+    << url.path_unescape(s) or (err) { << *s + "" }
+}
+
 // Examine the authority only. A blocked name in an ordinary URL path or
 // query is not its destination. Use the last @ to skip optional user info.
 fn public_link_host(piece &string) string {
-    candidate := strings.trim_left(piece, "('!,;")
+    candidate := strings.trim_left(piece, "('!,;`*_~\"<>[{")
     $start := 0
     scheme := strings.index_of(&candidate, "://")
-    first_sep := strings.index_any(&candidate, "/?#\\")
-    if scheme >= 0 && first_sep == scheme + 1 {
+    if scheme >= 0 {
         start = scheme + 3
     } else if strings.has_prefix(&candidate, "//") {
         start = 2
@@ -93,8 +96,11 @@ fn public_link_host(piece &string) string {
     $port := strings.index_of(&host_port, ":")
     if port < 0 { port = host_port.len }
     host_text := host_port[0:port]
-    decoded := url.path_unescape(&host_text) or (err) { << "" }
-    << strings.trim_right(&normalize_domain_dots(&strings.to_lower(&decoded)), ".)',;!")
+    decoded := unescape_or_raw(&host_text)
+    $hend := strings.index_any(&decoded, "/?#\\")
+    if hend < 0 { hend = decoded.len }
+    host_clean := decoded[0:hend]
+    << strings.trim_right(&normalize_domain_dots(&strings.to_lower(&host_clean)), ".)',;`!*_~\"<>]}")
 }
 
 fn blocked_link_host(host &string, blocked &maps.StrInt) bool {
@@ -121,8 +127,16 @@ pub fn public_link_policy(text &string, trusted &maps.StrInt, blocked &maps.StrI
         if has_stop || (blocked.len() > 0 && strings.contains_any(&token, ".%．")) {
             pieces := strings.fields_func(&token, link_punctuation)
             for j in 0:pieces.len {
-                host := public_link_host(&pieces[j])
+                p := pieces[j] + ""
+                host := public_link_host(&p)
                 if blocked.len() > 0 && blocked_link_host(&host, blocked) { << PUBLIC_LINK_BLOCK }
+                col := strings.index_of(&p, ":")
+                if col > 0 && col + 1 < p.len && !strings.has_prefix(&p, "http://") && !strings.has_prefix(&p, "https://") {
+                    after_col := p[(col + 1):p.len]
+                    h2 := public_link_host(&after_col)
+                    if blocked.len() > 0 && blocked_link_host(&h2, blocked) { << PUBLIC_LINK_BLOCK }
+                    if has_stop && is_valid_acme_domain(&h2) { decision = PUBLIC_LINK_REVIEW }
+                }
                 if has_stop && is_valid_acme_domain(&host) { decision = PUBLIC_LINK_REVIEW }
             }
         }

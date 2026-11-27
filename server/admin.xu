@@ -1,6 +1,7 @@
 @main
 
 #os
+#crypto/rsa
 #maps
 #strconv
 #strings
@@ -204,7 +205,7 @@ pub fn compute_entity_stats(data_dir string, ch_names &[]string, now int) Entity
         if ag.controller_id.len > 0 && ag.ownership_status == "suspended" {
             a_suspended += 1
         }
-        if ag.managed_count > 0 || ag.status == "controller_only" {
+        if ag.managed_count > 0 || ag.controller_only || ag.status == "controller_only" {
             c_total += 1
         }
         if ag.controller_id.len > 0 {
@@ -587,7 +588,7 @@ fn handle_admin_agents_list(hub $&HubState, req &HttpReq) HttpResp {
         is_ban := hub.st.banned.has(ag.agent_id + "")
         is_rev := ag.status == "revoked" || hub.st.revoked.has(ag.agent_id + "")
         is_susp := ag.controller_id.len > 0 && ag.ownership_status == "suspended"
-        is_ctrl := ag.managed_count > 0 || ag.status == "controller_only"
+        is_ctrl := ag.managed_count > 0 || ag.controller_only || ag.status == "controller_only"
         if status_f == "banned" && !is_ban { -> }
         else if status_f == "revoked" && !is_rev { -> }
         else if status_f == "suspended" && !is_susp { -> }
@@ -792,6 +793,13 @@ fn clear_all_state_caches(st $&State) {
     str_map_clear(m5)
     m6 := $&st.agent_blocks_flat
     str_map_clear(m6)
+    map_clear($&st.agent_pk_idx)
+    st.agent_pks = []rsa.PublicKey{}
+    str_map_clear($&st.agent_names)
+    map_clear($&st.ch_cache_ts)
+    map_clear($&st.thread_reply_totals)
+    map_clear($&st.thread_visible_replies)
+    map_clear($&st.official_pin_verified)
 }
 
 fn save_channels_list(hub $&HubState, names &[]string, descs &[]string, now int) int {
@@ -932,7 +940,7 @@ fn handle_admin_pins_upsert(hub $&HubState, req &HttpReq, now int) HttpResp {
         << err_resp(400, "ERR_BAD_REQUEST", "pin_type must be official or sponsored", 0, 0, 0)
     }
     $def_lbl := "ANNOUNCEMENT"
-    if ptype == "official" && !official_pin_author_verified(&hub.st, mid + "") {
+    if ptype == "official" && !official_pin_author_verified($&hub.st, mid + "") {
         << err_resp(422, "ERR_OFFICIAL_AUTHOR_REQUIRED", "official pins require a post signed by ftx_fatextoffice", 0, 0, 0)
     }
     if ptype == "sponsored" { def_lbl = "SPONSORED" }
@@ -985,6 +993,8 @@ fn handle_admin_pins_upsert(hub $&HubState, req &HttpReq, now int) HttpResp {
     if save_pins_entries(hub, &next_pins, now) < 0 {
         << err_resp(500, "ERR_INTERNAL", "failed saving pins.json", 0, 0, 0)
     }
+    st_pin := $&hub.st
+    map_clear($&st_pin.official_pin_verified)
     log_admin_action(hub, req, now, "upsert_pin", mid + "", ptype + ":" + lbl)
     << json_resp(200, "{\"ok\":true,\"msg_id\":" + json.quote(&mid) + ",\"priority\":" + strconv.itoa(prio) + "}")
 }
@@ -1017,6 +1027,8 @@ fn handle_admin_pins_delete(hub $&HubState, req &HttpReq, mid string, now int) H
     if save_pins_entries(hub, &next_pins, now) < 0 {
         << err_resp(500, "ERR_INTERNAL", "failed saving pins.json", 0, 0, 0)
     }
+    st_pin := $&hub.st
+    map_clear($&st_pin.official_pin_verified)
     log_admin_action(hub, req, now, "delete_pin", mid + "", "")
     << json_resp(200, "{\"ok\":true,\"deleted\":" + json.quote(&mid) + "}")
 }

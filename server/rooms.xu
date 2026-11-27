@@ -653,6 +653,10 @@ fn handle_room_add_member(hub $&HubState, req &HttpReq, rid string, now int) Htt
     if rd.members.len >= rd.max_members {
         << err_resp(409, "ERR_ROOM_FULL", "room member limit reached", 0, 0, 0)
     }
+    tgt_rooms := load_agent_room_ids(&hub.st, tgt + "")
+    if tgt_rooms.len >= 100 {
+        << err_resp(429, "ERR_RATE_LIMITED", "target agent has reached max 100 rooms", 0, 0, 0)
+    }
 
     if agent_blocks_sender(&hub.st, tgt + "", au.agent_id + "", now) || agent_blocks_sender(&hub.st, tgt + "", rd.owner_id + "", now) {
         << err_resp(403, "ERR_BLOCKED", "target agent has blocked inviter or room owner", 0, 0, 0)
@@ -693,7 +697,11 @@ fn handle_room_add_member(hub $&HubState, req &HttpReq, rid string, now int) Htt
     $del_state := "none"
     if inv_frame.len > 0 {
         upsert_room_keybox_entry(&hub.st, rid + "", tgt + "", au.agent_id + "", rd.epoch, now, &inv_frame)
-        del_state = deliver_dm_relay_raw(hub, &tag, au.agent_id + "", tgt + "", &inv_frame, now)
+        if agent_ext_str(&tag, "dm_policy", "friends") == "none" {
+            del_state = "suppressed"
+        } else {
+            del_state = deliver_dm_relay_raw(hub, &tag, au.agent_id + "", tgt + "", &inv_frame, now)
+        }
     }
     log_event_json(hub.log_ch, now, "room_invite",
         "\"room_id\":" + json.quote(&rid) + ",\"from\":" + json.quote(&au.agent_id) +
@@ -917,8 +925,10 @@ fn handle_room_rekey(hub $&HubState, req &HttpReq, rid string, now int) HttpResp
             if agent_blocks_sender(&hub.st, to_id + "", au.agent_id + "", now) { -> }
             tot_cnt += 1
             kb_updates.push(RoomKeyBoxEntry{agent_id: to_id + "", from_id: au.agent_id + "", epoch: rd.epoch, updated_at: now, frame_json: frame_s + ""})
-            res := deliver_dm_relay_raw(hub, &tag, au.agent_id + "", to_id + "", &frame_s, now)
-            if res != "dropped_offline" { del_cnt += 1 }
+            if agent_ext_str(&tag, "dm_policy", "friends") != "none" {
+                res := deliver_dm_relay_raw(hub, &tag, au.agent_id + "", to_id + "", &frame_s, now)
+                if res != "dropped_offline" { del_cnt += 1 }
+            }
         }
     }
     if kb_updates.len > 0 {

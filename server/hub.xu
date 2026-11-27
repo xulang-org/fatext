@@ -330,12 +330,15 @@ fn clear_map(m $&maps.StrInt) {
 fn check_ip_rate_limit(hub $&HubState, remote_ip string, now int) bool {
     if hub.st.ip_rpm <= 0 { << true }
     win := now / 60
-    if win != hub.ip_window || hub.ip_hits.len() > 16384 {
+    if win != hub.ip_window {
         hub.ip_window = win
         clear_map($&hub.ip_hits)
     }
     $k := remote_ip + ""
     if k.len == 0 { k = "unknown" }
+    if !hub.ip_hits.has(k + "") && hub.ip_hits.len() >= 16384 {
+        << false
+    }
     cur := map_get_or(&hub.ip_hits, k + "", 0)
     if cur >= hub.st.ip_rpm { << false }
     map_set($&hub.ip_hits, k + "", cur + 1)
@@ -773,7 +776,7 @@ fn dispatch_http(hub $&HubState, req &HttpReq, now int, preflight bool, reviewed
         parts := strings.split(&rest, "/")
         if parts.len == 2 && parts[1] == "pins" {
             if method != "GET" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
-            << handle_get_pins(&hub.st, parts[0] + "", now)
+            << handle_get_pins($&hub.st, parts[0] + "", now)
         }
         if parts.len == 2 && parts[1] == "posts" {
             if method != "POST" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
@@ -1022,7 +1025,7 @@ pub fn hub_loop(hub_init HubState, jobs chan HubJob) {
         }
 
         admin_req := is_valid_admin_request(&hub, &job.req)
-        if job.flag == 0 && !admin_req && !check_ip_rate_limit($&hub, job.req.remote_ip + "", now) {
+        if !(job.kind == HUB_HTTP && is_public_write(&job.req)) && !admin_req && !check_ip_rate_limit($&hub, job.req.remote_ip + "", now) {
             r429 := err_resp(429, "ERR_RATE_LIMITED", "IP rate limit exceeded", 60, now + 60, 0)
             slow := hub.slow_ms
             metrics_record_http($&hub.metrics, 429, job.req.req_body.len, r429.body.len, q_ms, 0, q_ms, slow)
@@ -1127,18 +1130,27 @@ pub fn hub_loop(hub_init HubState, jobs chan HubJob) {
         if job.kind == HUB_MODERATION_PREFLIGHT {
             $resp := dispatch_http($&hub, &job.req, now, true, false)
             if resp.status == 200 {
-                resp = preflight_public_review($&hub.st, &job.req, now)
-                if resp.status >= 400 {
-                    consume_request_replay($&hub.st, &job.req, now)
+                aid_pf := strings.trim_space(&job.req.header("X-Agent-Id"))
+                st_pf := $&hub.st
+                if job.flag == 1 && aid_pf.len > 0 && map_get_or(&st_pf.moderation_inflight, aid_pf + "", 0) > now {
+                    resp = err_resp(429, "ERR_RATE_LIMITED", "moderation already in flight for agent", 2, now + 2, 0)
+                } else {
+                    resp = preflight_public_review(st_pf, &job.req, now)
+                    if resp.status >= 400 {
+                        consume_request_replay(st_pf, &job.req, now)
+                    } else if resp.status == 200 && job.flag == 1 && aid_pf.len > 0 {
+                        map_set($&st_pf.moderation_inflight, aid_pf + "", now + 10)
+                    }
                 }
             }
             h_ms := (time.now() - t_start) / 1000000
             ec := extract_err_code(resp.status, &resp.body)
+            actor_pair := resolve_actor_type_id(&job.req, &resp)
             if resp.status >= 400 {
                 slow := hub.slow_ms
                 metrics_record_http($&hub.metrics, resp.status, job.req.req_body.len, resp.body.len, q_ms, h_ms, q_ms + h_ms, slow)
             }
-            job.reply_ch <- reply_http(resp, q_ms, h_ms, ec, "agent", job.req.header("X-Agent-Id"))
+            job.reply_ch <- reply_http(resp, q_ms, h_ms, ec, actor_pair.actor_type + "", actor_pair.actor_id + "")
             ->
         }
 
@@ -1154,6 +1166,13 @@ pub fn hub_loop(hub_init HubState, jobs chan HubJob) {
             resp = err_resp(503, "ERR_MODERATION_UNAVAILABLE", "public content moderation unavailable", 5, 0, 0)
         } else {
             resp = dispatch_http($&hub, &job.req, now, false, job.flag == MODERATION_REVIEWED)
+        }
+        if is_public_write(&job.req) {
+            aid_rel := strings.trim_space(&job.req.header("X-Agent-Id"))
+            if aid_rel.len > 0 {
+                st_rel := $&hub.st
+                map_del($&st_rel.moderation_inflight, aid_rel + "")
+            }
         }
         $h_ms := (time.now() - t_start) / 1000000
         if h_ms < 0 { h_ms = 0 }

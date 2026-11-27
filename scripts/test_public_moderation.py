@@ -545,6 +545,27 @@ def main():
             admin("PUT", POLICY, {"mode": "open"})
             calls = len(Classifier.seen)
             assert_link_blocked(guest, POSTS, "https://external.example.test/latest")
+            for bypass in (
+                "`https://external.example.test/x`",
+                "**https://external.example.test/x**",
+                "a/https://external.example.test/x",
+                "https://external.example.test%2f",
+                "url:external.example.test",
+            ):
+                assert_link_blocked(guest, POSTS, bypass)
+            hit_429 = False
+            for _ in range(21):
+                fake_st, fake_body = submit("POST", "/v1/reports", json.dumps({
+                    "thread_id": root,
+                    "msg_id": "msg_01M00000000000000000000000",
+                    "reason": "spam",
+                }).encode(), {"X-Forwarded-For": "198.51.100.88"})
+                if fake_st == 429:
+                    assert fake_body["error"]["code"] == "ERR_RATE_LIMITED", (fake_st, fake_body)
+                    hit_429 = True
+                    break
+                assert fake_st == 404, (fake_st, fake_body)
+            assert hit_429, "expected report probe rate limit 429 on fake msg_id flood"
             link_st, default_case = publish(guest, POSTS, "https://docs.example.test/guide")
             assert link_st == 422 and default_case["error"]["code"] == "ERR_CONTENT_REVIEW"
             assert len(Classifier.seen) == calls

@@ -518,7 +518,9 @@ fn submit_http_request(req HttpReq, jobs chan HubJob, job_tokens chan string, qu
             r503 := err_resp(503, "ERR_OVERLOADED", "server request queue full", 2, 0, 0)
             << reply_http(r503, queue_timeout_ms, 0, "ERR_OVERLOADED", "anon", "")
         }
-        jobs <- make_hub_job(HUB_MODERATION_PREFLIGHT, probe, 0, time.now(), 0, reply_ch)
+        $pf_flag := 0
+        if ai_moderation { pf_flag = 1 }
+        jobs <- make_hub_job(HUB_MODERATION_PREFLIGHT, probe, 0, time.now(), pf_flag, reply_ch)
         checked := <-reply_ch
         release_job_token(job_tokens)
         if checked.resp.status == 204 {
@@ -806,7 +808,7 @@ fn main() int {
     metrics_interval_sec := getenv_int_or("FATEXT_METRICS_INTERVAL_SEC", 60)
     stdout_mirror := getenv_int_or("FATEXT_LOG_STDOUT", 0) != 0
     trust_proxy := getenv_int_or("FATEXT_TRUST_PROXY", 0) != 0
-    proxy_header := strings.to_lower(&strings.trim_space(&getenv_or("FATEXT_PROXY_HEADER", "auto")))
+    proxy_header := strings.to_lower(&strings.trim_space(&getenv_or("FATEXT_PROXY_HEADER", "xff")))
     if proxy_header != "auto" && proxy_header != "xff" && proxy_header != "x-real-ip" && proxy_header != "cf" {
         println("fatext-server: invalid FATEXT_PROXY_HEADER (expected auto|xff|x-real-ip|cf)")
         << 1
