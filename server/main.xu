@@ -230,27 +230,35 @@ fn handle_connection(fd int, req_seq int, peer_ip string, rcfg ConnRuntimeCfg, s
     while req_n < 200 {
         $req_t0 := t0_ns
         $req_tls_ms := tls_ms
+        $idle_to_ns := 10000000000
         $read_to_ns := 10000000000
         $req_id := req_prefix + ""
         if req_n > 0 {
             req_t0 = time.now()
             req_tls_ms = 0
-            read_to_ns = 5000000000
+            idle_to_ns = 20000000000
+            read_to_ns = 10000000000
             req_id = req_prefix + "_" + strconv.itoa(req_n)
         }
 
         t_read0 := time.now()
-        $read_errs := []string{}
-        $req := read_req_into($&cc, read_to_ns, $&read_errs)
-        if read_errs.len > 0 {
-            read_err := read_errs[0] + ""
-            if req_n > 0 && cc.buf.len == 0 {
-                // Clean Keep-Alive idle close or timeout between requests
+        $req := empty_req()
+        rr := read_http_request_split($&cc, idle_to_ns, read_to_ns, $&req)
+        if !rr.ok {
+            if rr.idle_closed {
+                // Clean Keep-Alive or unused-connection idle close/timeout
                 <-
             }
+            read_err := rr.err_msg + ""
             $rm := (time.now() - t_read0) / 1000000
             if rm < 0 { rm = 0 }
-            r := err_resp(400, "ERR_BAD_REQUEST", read_err + "", 0, 0, 0)
+            $err_status := 400
+            $err_code := "ERR_BAD_REQUEST"
+            if rr.is_timeout {
+                err_status = 408
+                err_code = "ERR_REQUEST_TIMEOUT"
+            }
+            r := err_resp(err_status, err_code + "", read_err + "", 0, 0, 0)
             t_w0 := time.now()
             _ := write_http_resp_ka($&cc, &r, false)
             $w_ms := (time.now() - t_w0) / 1000000
@@ -263,7 +271,7 @@ fn handle_connection(fd int, req_seq int, peer_ip string, rcfg ConnRuntimeCfg, s
                 "\"req_id\":" + json.quote(&req_id) + ",\"ip\":" + json.quote(&peer_ip) +
                 ",\"tls_ms\":" + strconv.itoa(req_tls_ms) + ",\"read_ms\":" + strconv.itoa(rm) +
                 ",\"error\":" + json.quote(&read_err))
-            log_access_json(rcfg.access_ch, rcfg.slow_ms, now_r, req_id + "", "?", "/invalid", 400, "ERR_BAD_REQUEST",
+            log_access_json(rcfg.access_ch, rcfg.slow_ms, now_r, req_id + "", "?", "/invalid", err_status, err_code + "",
                 rcfg.tls_on, peer_ip + "", "anon", "", 0, r.body.len, req_tls_ms, rm, 0, 0, w_ms, tot_ms, tot_us)
             <-
         }
@@ -570,9 +578,19 @@ fn resolve_allowed_redirect_host(raw_host &string, https_host string, allowed_ho
 fn handle_redirect_conn(fd int, peer_ip string, https_host string, allowed_hosts &[]string, chal_ch chan AcmeChalMsg) {
     cc_disable_sigpipe(fd)
     $cc := cc_from_tcp(fd, peer_ip + "")
-    req := read_http_request_timeout($&cc, 2000000000) or (err) {
-        r400 := err_resp(400, "ERR_BAD_REQUEST", err.msg(), 0, 0, 0)
-        _ := write_http_resp($&cc, &r400)
+    $req := empty_req()
+    rr := read_http_request_split($&cc, 3000000000, 5000000000, $&req)
+    if !rr.ok {
+        if !rr.idle_closed {
+            $err_status := 400
+            $err_code := "ERR_BAD_REQUEST"
+            if rr.is_timeout {
+                err_status = 408
+                err_code = "ERR_REQUEST_TIMEOUT"
+            }
+            rerr := err_resp(err_status, err_code + "", rr.err_msg + "", 0, 0, 0)
+            _ := write_http_resp($&cc, &rerr)
+        }
         cc_close($&cc)
         <<
     }
