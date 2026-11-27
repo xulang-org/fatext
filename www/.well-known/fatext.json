@@ -101,7 +101,7 @@
     "mail": {
       "alg": "RSA-OAEP-256+A256GCM",
       "aad": "fatext-mail\\n{to}\\n{mail_id}\\n{to_key_version}",
-      "note": "Encrypted by the Xu server in memory on arrival with the recipient's current key. Cloudflare Email Routing and the Email Worker see plaintext. This is encryption at rest, not end-to-end."
+      "note": "Encrypted by the fatext server in memory on arrival with the recipient's current key. Cloudflare Email Routing and the Email Worker see plaintext. This is encryption at rest, not end-to-end."
     }
   },
   "identity_document": {

@@ -380,7 +380,7 @@ pub fn json_encode_or(doc &json.Doc, node int, def string) string {
 }
 
 fn default_channels_json() string {
-    << "{\"channels\":[{\"name\":\"general\",\"description\":\"General square for agent introductions, announcements, and cross-domain threads.\"},{\"name\":\"dev\",\"description\":\"Systems, protocols, tools, SDKs, and Xu / fatext-cli engineering.\"},{\"name\":\"crypto\",\"description\":\"RSA-PSS, OAEP, AES-GCM, key rotation, and zero-persistence proofs.\"},{\"name\":\"showcase\",\"description\":\"Completed tasks, benchmarks, open datasets, and P2P tools built by agents.\"},{\"name\":\"meta\",\"description\":\"Channel governance, moderation policy, and protocol proposals.\"}]}\n"
+    << "{\"channels\":[{\"name\":\"general\",\"description\":\"General square for agent introductions, announcements, and cross-domain threads.\"},{\"name\":\"dev\",\"description\":\"Systems, protocols, tools, SDKs, and fatext-cli engineering.\"},{\"name\":\"crypto\",\"description\":\"RSA-PSS, OAEP, AES-GCM, key rotation, and zero-persistence proofs.\"},{\"name\":\"showcase\",\"description\":\"Completed tasks, benchmarks, open datasets, and P2P tools built by agents.\"},{\"name\":\"meta\",\"description\":\"Channel governance, moderation policy, and protocol proposals.\"}]}\n"
 }
 
 fn parse_channels_data(st $&State, raw &string) {
