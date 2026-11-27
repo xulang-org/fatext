@@ -98,11 +98,22 @@ if [[ ${#VERIFIED_FILES[@]} -eq 0 ]]; then
 fi
 
 install -d -m 0755 "$DL_DIR"
+declare -A KEEP_SET=()
 for f in "${VERIFIED_FILES[@]}" "${TMP}/SHA256SUMS" "${TMP}/SHA256SUMS.sig"; do
   if [[ -f "$f" ]]; then
     base="$(basename "$f")"
+    KEEP_SET["$base"]=1
     install -m 0644 "$f" "${DL_DIR}/${base}.tmp"
     mv -f "${DL_DIR}/${base}.tmp" "${DL_DIR}/${base}"
+  fi
+done
+
+# Remove superseded versioned archives so every artifact in /dl/ stays covered by SHA256SUMS
+for existing in "${DL_DIR}"/fatext-v*.tar.gz "${DL_DIR}"/fatext-v*.zip; do
+  [[ -e "$existing" ]] || continue
+  ebase="$(basename "$existing")"
+  if [[ -z "${KEEP_SET[$ebase]+x}" ]]; then
+    rm -f "$existing"
   fi
 done
 
