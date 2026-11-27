@@ -19,7 +19,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-BIN = ROOT / "build" / "fatext-server"
+BIN = Path(os.environ.get("FATEXT_SERVER_BIN", str(ROOT / "build" / "fatext-server")))
 WWW_DIR = ROOT / "www"
 TPL_DIR = ROOT / "templates"
 HOST = "127.0.0.1"

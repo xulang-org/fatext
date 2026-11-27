@@ -6,6 +6,7 @@ import base64
 import hashlib
 import json
 import os
+import pwd
 import subprocess
 import time
 from pathlib import Path
@@ -74,6 +75,17 @@ def main() -> int:
 
     pem_path.write_text(pub, encoding="utf-8")
     json_path.write_text(json.dumps(doc, ensure_ascii=False) + "\n", encoding="utf-8")
+    if os.geteuid() == 0:
+        try:
+            pw = pwd.getpwnam("fatext")
+            for d in (data_dir / "keys", keys_dir):
+                os.chown(d, pw.pw_uid, pw.pw_gid)
+                os.chmod(d, 0o750)
+            for f in (pem_path, json_path):
+                os.chown(f, pw.pw_uid, pw.pw_gid)
+                os.chmod(f, 0o640)
+        except KeyError:
+            pass
     print(f"Bootstrapped {OFFICIAL_ID}:")
     print(f"  private key (0600): {priv_path}")
     print(f"  public pem        : {pem_path}")

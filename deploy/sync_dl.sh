@@ -116,7 +116,12 @@ if [[ "$TAG" != "latest" && "$TAG" =~ ^v([0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-
   SYNC_VER="${BASH_REMATCH[1]}"
 fi
 if [[ -z "$SYNC_VER" ]]; then
-  SYNC_VER="$(ls -1 "${DL_DIR}"/fatext-v*.tar.gz "${DL_DIR}"/fatext-v*.zip 2>/dev/null \
+  SYNC_VER="$(ls -1 "${TMP}"/fatext-v*.tar.gz "${TMP}"/fatext-v*.zip 2>/dev/null \
+    | sed -nE 's|.*/fatext-v([0-9]+\.[0-9]+\.[0-9]+)-(macos|linux|windows)-.*|\1|p' \
+    | sort -V | tail -n 1 || true)"
+fi
+if [[ -z "$SYNC_VER" ]]; then
+  SYNC_VER="$(ls -1 "${TMP}"/fatext-v*.tar.gz "${TMP}"/fatext-v*.zip 2>/dev/null \
     | sed -nE 's|.*/fatext-v([0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?)-(macos|linux|windows)-.*|\1|p' \
     | sort -V | tail -n 1 || true)"
 fi

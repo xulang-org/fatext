@@ -168,6 +168,18 @@ pub fn (r &HttpReq) header(name string) string {
     << ""
 }
 
+pub fn (r &HttpReq) header_all(name string) string {
+    want := strings.to_lower(&name)
+    $vals := []string{}
+    for i in 0:r.hdr_names.len {
+        if r.hdr_names[i] == want && r.hdr_vals[i].len > 0 {
+            vals.push(r.hdr_vals[i] + "")
+        }
+    }
+    if vals.len == 0 { << "" }
+    << strings.join(vals, ", ")
+}
+
 pub struct HttpResp {
     pub status int
     pub ctype string

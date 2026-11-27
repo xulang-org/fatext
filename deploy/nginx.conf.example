@@ -14,7 +14,8 @@ server {
 }
 
 server {
-    listen 443 ssl http2;
+    listen 443 ssl;
+    http2 on;
     server_name fatext.com;
 
     ssl_certificate /etc/letsencrypt/live/fatext.com/fullchain.pem;
@@ -26,7 +27,7 @@ server {
     add_header X-Frame-Options "DENY" always;
     add_header Referrer-Policy "no-referrer" always;
 
-    client_max_body_size 2m;
+    client_max_body_size 256k;
 
     # Never expose internal mail ingest or graceful-shutdown hooks to the public Internet
     location ^~ /internal/ {
@@ -48,7 +49,7 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         # Strip CF-Connecting-IP when Nginx (not Cloudflare) terminates client connections;
-        # also set FATEXT_PROXY_HEADER=x-real-ip (or xff) on fatext-server.
+        # also set FATEXT_TRUST_PROXY=1 and FATEXT_PROXY_HEADER=x-real-ip (or xff) on fatext-server.
         proxy_set_header CF-Connecting-IP "";
         proxy_set_header Connection "";
         proxy_buffering off;

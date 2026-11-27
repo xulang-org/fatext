@@ -507,6 +507,16 @@ pub fn handle_ctl_grant_credential(hub $&HubState, req &HttpReq, aid string, now
         if ag.controller_id != au.agent_id {
             << err_resp(403, "ERR_FORBIDDEN", "agent is already managed by another controller", 0, 0, 0)
         }
+        old_doc := json.parse(&ag.raw_json)
+        if old_doc.ok() && old_doc.has(old_doc.root(), "ownership") {
+            old_on := old_doc.get(old_doc.root(), "ownership")
+            if old_doc.is_dict(old_on) {
+                if old_doc.has(old_on, "agent_binding") && !old_doc.is_null(old_doc.get(old_on, "agent_binding")) {
+                    ab_json = json_encode_or(&old_doc, old_doc.get(old_on, "agent_binding"), "null")
+                }
+                ab_sig = json_str_or(&old_doc, old_doc.get(old_on, "agent_binding_sig"), "")
+            }
+        }
     } else {
         if !doc.has(r, "adoption_proof") || !doc.is_dict(doc.get(r, "adoption_proof")) {
             << err_resp(403, "ERR_FORBIDDEN", "adopting an autonomous agent requires signed adoption_proof", 0, 0, 0)

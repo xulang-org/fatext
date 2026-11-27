@@ -367,6 +367,69 @@ def test_webhook_signature(td_p: Path) -> None:
     print("Webhook signing checks passed.")
 
 
+def test_deploy_and_email_worker(td_p: Path) -> None:
+    print("[7/7] Testing Cloudflare Email Worker spoofing resistance & deploy script hardening...")
+    for sh_file in sorted((ROOT / "deploy").glob("*.sh")):
+        r_sh = subprocess.run(["bash", "-n", str(sh_file)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        assert_eq(r_sh.returncode, 0, f"bash -n failed on {sh_file}: {r_sh.stderr}")
+    gs_txt = (ROOT / "deploy" / "graceful_stop.sh").read_text(encoding="utf-8")
+    assert_true("FATEXT_ACME_DOMAINS" in gs_txt, "graceful_stop.sh must detect FATEXT_ACME_DOMAINS")
+    sync_bad = subprocess.run(
+        ["bash", str(ROOT / "deploy" / "sync_dl.sh"), "latest", str(td_p / "dl_out"), "http://127.0.0.1/key.pem"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5.0,
+    )
+    assert_true(sync_bad.returncode != 0 and "http://" in sync_bad.stderr, f"sync_dl.sh must reject http:// OFFICIAL_PEM: {sync_bad.stderr}")
+
+    worker_rel = "deploy/email-worker/worker.js"
+    js_txt = (ROOT / worker_rel).read_text(encoding="utf-8")
+    assert_true('const first = parts[0] || "";' in js_txt, f"{worker_rel} must inspect only topmost auth-results header")
+    assert_true("for (const part of parts)" not in js_txt, f"{worker_rel} still scans all comma-separated auth-results parts")
+    assert_true(r"/^(?:[a-z0-9-]+\.)*cloudflare\.(?:net|com)$/" in js_txt, f"{worker_rel} missing strict CLOUDFLARE_AUTHSERV_RE")
+    assert_true("resp.status === 413" in js_txt and "message.setReject" in js_txt, f"{worker_rel} must reject HTTP 413 cleanly")
+
+    node_bin = shutil.which("node") or next(
+        (p for p in ("/opt/homebrew/bin/node", "/usr/local/bin/node") if Path(p).is_file()),
+        None,
+    )
+    if node_bin is not None:
+        r_chk = subprocess.run([node_bin, "--check", str(ROOT / worker_rel)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        assert_eq(r_chk.returncode, 0, f"node --check failed on {worker_rel}: {r_chk.stderr}")
+        js_test = r'''
+import * as w1 from "./deploy/email-worker/worker.js";
+function assert(cond, msg) { if (!cond) throw new Error(msg); }
+const okHdr = "mx.cloudflare.net; spf=pass smtp.mailfrom=a@b.com; dkim=pass; dmarc=pass";
+assert(w1.parseAuthResults(okHdr).spf_pass === true, "w1 legit spf");
+assert(w1.parseAuthResults(okHdr).dkim_pass === true, "w1 legit dkim");
+assert(w1.parseAuthResults(okHdr).dmarc_pass === true, "w1 legit dmarc");
+for (const spoof of [
+  "evil-cloudflare.com; spf=pass; dkim=pass; dmarc=pass",
+  "notcloudflare.net; spf=pass; dkim=pass",
+  "mx.cloudflare.org; spf=pass",
+  "mx.attacker.example; spf=fail, mx.cloudflare.net; spf=pass; dkim=pass"
+]) {
+  const r1 = w1.parseAuthResults(spoof);
+  assert(!r1.spf_pass && !r1.dkim_pass && !r1.dmarc_pass, "w1 accepted spoof: " + spoof);
+}
+assert(w1.extractRecipientAgentId("Alice <ftx_abc123def456+tag@fatext.com>") === "ftx_abc123def456", "recipient display name + tag");
+const cjkSnippet = w1.extractBodySnippet("\r\n\r\n" + "中".repeat(5000));
+assert(Buffer.byteLength(cjkSnippet, "utf8") <= 8192, "snippet UTF-8 bytes bounded <= 8192");
+'''
+        r_js = subprocess.run([node_bin, "--input-type=module", "-e", js_test], cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        assert_eq(r_js.returncode, 0, f"email worker security check failed: {r_js.stderr}")
+    elif sys.platform == "darwin" and shutil.which("osascript"):
+        src_raw = (ROOT / worker_rel).read_text(encoding="utf-8")
+        src_stripped = src_raw.split("export {")[0]
+        jxa = (
+            src_stripped
+            + "\nconst okHdr = 'mx.cloudflare.net; spf=pass; dkim=pass; dmarc=pass';"
+            + "\nconst spoofs = ['evil-cloudflare.com; spf=pass', 'notcloudflare.net; spf=pass', 'mx.cloudflare.org; spf=pass', 'mx.attacker.example; spf=fail, mx.cloudflare.net; spf=pass'];"
+            + "\nfor (var i = 0; i < spoofs.length; i++) { var spoof = spoofs[i]; if (!(parseAuthResults(okHdr).spf_pass === true && !parseAuthResults(spoof).spf_pass)) throw new Error('failed ' + spoof); }"
+            + "\n'ok';"
+        )
+        r_jxa = subprocess.run(["osascript", "-l", "JavaScript", "-e", jxa], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        assert_eq(r_jxa.returncode, 0, f"JXA worker check failed for {worker_rel}: {r_jxa.stderr}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--without-cli", action="store_true", help="run checks that do not require the CLI")
@@ -382,6 +445,28 @@ def main() -> int:
         test_backup_restore_acme_and_tmp(td_p)
         test_webhook_signature(td_p)
         if args.without_cli:
+            sm_port = free_tcp_port()
+            sm_data = td_p / "smuggle_data"
+            sm_logs = td_p / "smuggle_logs"
+            sm_data.mkdir(parents=True, exist_ok=True)
+            sm_logs.mkdir(parents=True, exist_ok=True)
+            sm_env = os.environ.copy()
+            sm_env["FATEXT_ADDR"] = f"{HOST}:{sm_port}"
+            sm_env["FATEXT_DATA_DIR"] = str(sm_data)
+            sm_env["FATEXT_WWW_DIR"] = str(WWW_DIR)
+            sm_env["FATEXT_TEMPLATES_DIR"] = str(TPL_DIR)
+            sm_env["FATEXT_TLS_REQUIRED"] = "0"
+            sm_env["FATEXT_LOG_DIR"] = str(sm_logs)
+            sm_srv = subprocess.Popen([str(SERVER_BIN)], env=sm_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                wait_http_ok(f"http://{HOST}:{sm_port}/health")
+                test_http_smuggling_and_slowloris(HOST, sm_port)
+            finally:
+                if sm_srv.poll() is None:
+                    sm_srv.terminate()
+                    sm_srv.wait(timeout=5)
+            test_deploy_and_email_worker(td_p)
+            print("ALL SERVER-ONLY SECURITY REGRESSION TESTS PASSED.")
             return 0
 
         print("[4/7] Testing SSRF, SSR single-pass, XFF right-to-left, SSE compaction, room/post/mail bounds...")
@@ -897,6 +982,62 @@ def main() -> int:
                 srv6b.terminate()
                 srv6b.wait(timeout=5)
 
+        print("[6b2/7] Testing default FATEXT_PROXY_HEADER=xff ignores CF header and merges duplicate XFF headers...")
+        import socket as pysocket
+        p6x_port = free_tcp_port()
+        p6x_url = f"http://{HOST}:{p6x_port}"
+        p6x_data = td_p / "p6x_data"
+        p6x_logs = td_p / "p6x_logs"
+        p6x_data.mkdir(parents=True, exist_ok=True)
+        p6x_logs.mkdir(parents=True, exist_ok=True)
+        sd_sec_x = "sd-sec-r3-5522"
+        p6x_env = os.environ.copy()
+        p6x_env.pop("FATEXT_PROXY_HEADER", None)
+        p6x_env.update({
+            "FATEXT_ADDR": f"{HOST}:{p6x_port}",
+            "FATEXT_DATA_DIR": str(p6x_data),
+            "FATEXT_LOG_DIR": str(p6x_logs),
+            "FATEXT_WWW_DIR": str(WWW_DIR),
+            "FATEXT_TEMPLATES_DIR": str(TPL_DIR),
+            "FATEXT_POW_BITS": "8",
+            "FATEXT_TRUST_PROXY": "1",
+            "FATEXT_SHUTDOWN_SECRET": sd_sec_x,
+        })
+        srv6x = subprocess.Popen([str(SERVER_BIN)], env=p6x_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            wait_http_ok(f"{p6x_url}/health")
+            with pysocket.create_connection((HOST, p6x_port), timeout=5.0) as sock:
+                raw_req = (
+                    f"GET /health HTTP/1.1\r\n"
+                    f"Host: {HOST}:{p6x_port}\r\n"
+                    f"CF-Connecting-IP: 198.51.100.1\r\n"
+                    f"X-Forwarded-For: 198.51.100.10\r\n"
+                    f"X-Forwarded-For: 203.0.113.88\r\n"
+                    f"Connection: close\r\n\r\n"
+                ).encode("ascii")
+                sock.sendall(raw_req)
+                raw_resp = b""
+                while True:
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        break
+                    raw_resp += chunk
+            assert_true(b"200 OK" in raw_resp, f"default xff raw health failed: {raw_resp[:120]!r}")
+            with urllib.request.urlopen(
+                urllib.request.Request(f"{p6x_url}/internal/shutdown", data=b"", method="POST", headers={"X-Fatext-Shutdown-Secret": sd_sec_x}),
+                timeout=5.0,
+            ) as sdr_x:
+                assert_eq(sdr_x.status, 200, "6x shutdown 200")
+            assert_eq(srv6x.wait(timeout=8.0), 0, "6x shutdown clean exit")
+            acc6x = [json.loads(ln) for p in p6x_logs.glob("access-*.jsonl") for ln in p.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            ips6x = {e.get("ip") for e in acc6x if e.get("route") == "/health"}
+            assert_true("203.0.113.88" in ips6x, f"default xff expected merged rightmost XFF 203.0.113.88 in {ips6x}")
+            assert_true("198.51.100.1" not in ips6x, f"default xff leaked spoofed CF-Connecting-IP: {ips6x}")
+        finally:
+            if srv6x.poll() is None:
+                srv6x.terminate()
+                srv6x.wait(timeout=5)
+
         print("[6c/7] Testing persistent daily friend request limit & UTF-8 note hardening...")
         bad_fr_env = os.environ.copy()
         bad_fr_env.update({
@@ -997,70 +1138,7 @@ def main() -> int:
                 srv6c.terminate()
                 srv6c.wait(timeout=5)
 
-        print("[7/7] Testing Cloudflare Email Worker spoofing resistance & deploy script hardening...")
-        for sh_file in sorted((ROOT / "deploy").glob("*.sh")):
-            r_sh = subprocess.run(["bash", "-n", str(sh_file)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            assert_eq(r_sh.returncode, 0, f"bash -n failed on {sh_file}: {r_sh.stderr}")
-        gs_txt = (ROOT / "deploy" / "graceful_stop.sh").read_text(encoding="utf-8")
-        assert_true("FATEXT_ACME_DOMAINS" in gs_txt, "graceful_stop.sh must detect FATEXT_ACME_DOMAINS")
-        sync_bad = subprocess.run(
-            ["bash", str(ROOT / "deploy" / "sync_dl.sh"), "latest", str(td_p / "dl_out"), "http://127.0.0.1/key.pem"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5.0,
-        )
-        assert_true(sync_bad.returncode != 0 and "http://" in sync_bad.stderr, f"sync_dl.sh must reject http:// OFFICIAL_PEM: {sync_bad.stderr}")
-
-        node_bin = shutil.which("node") or next(
-            (p for p in ("/opt/homebrew/bin/node", "/usr/local/bin/node") if Path(p).is_file()),
-            None,
-        )
-        for js_rel in ("deploy/email-worker/worker.js", "workers/email-worker/src/index.js"):
-            js_txt = (ROOT / js_rel).read_text(encoding="utf-8")
-            assert_true("const first = parts[0] || \"\";" in js_txt, f"{js_rel} must inspect only topmost auth-results header")
-            assert_true("for (const part of parts)" not in js_txt, f"{js_rel} still scans all comma-separated auth-results parts")
-            assert_true(r"/^(?:[a-z0-9-]+\.)*cloudflare\.(?:net|com)$/" in js_txt, f"{js_rel} missing strict CLOUDFLARE_AUTHSERV_RE")
-        if node_bin is not None:
-            for js_rel in ("deploy/email-worker/worker.js", "workers/email-worker/src/index.js"):
-                js_path = ROOT / js_rel
-                r_chk = subprocess.run([node_bin, "--check", str(js_path)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-                assert_eq(r_chk.returncode, 0, f"node --check failed on {js_rel}: {r_chk.stderr}")
-            js_test = r'''
-import * as w1 from "./deploy/email-worker/worker.js";
-import * as w2 from "./workers/email-worker/src/index.js";
-function assert(cond, msg) { if (!cond) throw new Error(msg); }
-const okHdr = "mx.cloudflare.net; spf=pass smtp.mailfrom=a@b.com; dkim=pass; dmarc=pass";
-assert(w1.parseAuthResults(okHdr).spf_pass === true, "w1 legit spf");
-assert(w1.parseAuthResults(okHdr).dkim_pass === true, "w1 legit dkim");
-assert(w2.parseAuthResult(okHdr, "spf") === true, "w2 legit spf");
-assert(w2.parseAuthResult(okHdr, "dmarc") === true, "w2 legit dmarc");
-for (const spoof of [
-  "evil-cloudflare.com; spf=pass; dkim=pass; dmarc=pass",
-  "notcloudflare.net; spf=pass; dkim=pass",
-  "mx.cloudflare.org; spf=pass",
-  "mx.attacker.example; spf=fail, mx.cloudflare.net; spf=pass; dkim=pass"
-]) {
-  const r1 = w1.parseAuthResults(spoof);
-  assert(!r1.spf_pass && !r1.dkim_pass && !r1.dmarc_pass, "w1 accepted spoof: " + spoof);
-  assert(!w2.parseAuthResult(spoof, "spf") && !w2.parseAuthResult(spoof, "dkim"), "w2 accepted spoof: " + spoof);
-}
-'''
-            r_js = subprocess.run([node_bin, "--input-type=module", "-e", js_test], cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            assert_eq(r_js.returncode, 0, f"email worker security check failed: {r_js.stderr}")
-        elif sys.platform == "darwin" and shutil.which("osascript"):
-            for js_rel, fn_check in [
-                ("deploy/email-worker/worker.js", "parseAuthResults(okHdr).spf_pass === true && !parseAuthResults(spoof).spf_pass"),
-                ("workers/email-worker/src/index.js", "parseAuthResult(okHdr, 'spf') === true && !parseAuthResult(spoof, 'spf')"),
-            ]:
-                src_raw = (ROOT / js_rel).read_text(encoding="utf-8")
-                src_stripped = src_raw.split("export {")[0]
-                jxa = (
-                    src_stripped
-                    + "\nconst okHdr = 'mx.cloudflare.net; spf=pass; dkim=pass; dmarc=pass';"
-                    + "\nconst spoofs = ['evil-cloudflare.com; spf=pass', 'notcloudflare.net; spf=pass', 'mx.cloudflare.org; spf=pass', 'mx.attacker.example; spf=fail, mx.cloudflare.net; spf=pass'];"
-                    + f"\nfor (var i = 0; i < spoofs.length; i++) {{ var spoof = spoofs[i]; if (!({fn_check})) throw new Error('failed ' + spoof); }}"
-                    + "\n'ok';"
-                )
-                r_jxa = subprocess.run(["osascript", "-l", "JavaScript", "-e", jxa], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-                assert_eq(r_jxa.returncode, 0, f"JXA worker check failed for {js_rel}: {r_jxa.stderr}")
+        test_deploy_and_email_worker(td_p)
 
     print("ALL 7 SERVER SECURITY REGRESSION TESTS PASSED.")
     return 0

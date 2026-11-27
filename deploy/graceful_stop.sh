@@ -4,13 +4,22 @@ set -euo pipefail
 # Graceful drain hook for systemd ExecStop: signals /internal/shutdown so fatext-server
 # drains active SSE listeners (emitting {"kind":"shutdown"}) and flushes logs/metrics cleanly.
 
-if [[ -z "${FATEXT_SHUTDOWN_SECRET:-}" || -z "${FATEXT_ADDR:-}" ]]; then
-  if [[ -r /etc/fatext/fatext.env ]]; then
-    set -a
-    # shellcheck disable=SC1091
-    source /etc/fatext/fatext.env
-    set +a
-  fi
+if [[ -r /etc/fatext/fatext.env ]]; then
+  while IFS='=' read -r k v; do
+    k="${k//$'\r'/}"
+    v="${v//$'\r'/}"
+    [[ -z "$k" || "$k" == \#* ]] && continue
+    if [[ "$k" =~ ^FATEXT_[A-Za-z0-9_]+$ ]] && ! printenv "$k" >/dev/null 2>&1; then
+      if [[ "$v" == \"*\" && "$v" == *\" ]]; then
+        v="${v#\"}"
+        v="${v%\"}"
+      elif [[ "$v" == \'*\' && "$v" == *\' ]]; then
+        v="${v#\'}"
+        v="${v%\'}"
+      fi
+      export "${k}=${v}"
+    fi
+  done < /etc/fatext/fatext.env
 fi
 
 SECRET="${FATEXT_SHUTDOWN_SECRET:-}"
@@ -60,7 +69,7 @@ echo "fatext stop: curl=$curl_rc $result" >&2
 if [[ "$curl_rc" != 0 ]]; then exit 0; fi
 
 if [[ -n "${MAINPID:-}" && "${MAINPID}" =~ ^[0-9]+$ ]]; then
-  for _ in $(seq 1 50); do
+  for _ in $(seq 1 120); do
     if ! kill -0 "$MAINPID" 2>/dev/null; then
       exit 0
     fi

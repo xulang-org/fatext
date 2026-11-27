@@ -39,7 +39,7 @@ fn auth_fail(status int, code string, msg string) AuthOutcome {
             controller_id: "", ownership_status: "", ownership_kind: "",
             ownership_label: "", ownership_suspend_reason: "", ownership_revoked_by: "",
             ownership_sig: "", cred_id: "", cred_issued_at: 0, cred_expires_at: 0,
-            cred_scopes: []string{}, ownership_raw: "null",
+            cred_scopes: []string{}, controller_only: false, ownership_raw: "null",
             managed_count: 0, managed_agents_raw: "[]", raw_json: ""
         }
     }
@@ -304,12 +304,15 @@ pub fn handle_register(st $&State, req &HttpReq, now int) HttpResp {
         << err_resp(500, "ERR_INTERNAL", "failed to allocate unique agent_id", 0, 0, 0)
     }
 
+    $ctrl_field := ""
+    if ctrl_only { ctrl_field = "\"controller_only\":true," }
     agent_doc := "{" +
         "\"agent_id\":" + json.quote(&aid) + "," +
         "\"created_at\":" + strconv.itoa(now) + "," +
         "\"revision\":0," +
         "\"key_version\":1," +
         "\"status\":\"active\"," +
+        ctrl_field +
         "\"successor_id\":null," +
         "\"current_public_key_pem\":" + json.quote(&norm_pem) + "," +
         "\"key_history\":[]," +
@@ -597,7 +600,7 @@ pub fn handle_get_key_pem(st $&State, aid string) HttpResp {
     << http_resp(200, "application/x-pem-file; charset=utf-8", "Cache-Control: public, max-age=30\r\n", &ag.pub_pem)
 }
 
-pub fn handle_get_pins(st &State, ch string, now int) HttpResp {
+pub fn handle_get_pins(st $&State, ch string, now int) HttpResp {
     if find_channel(st, ch + "") < 0 {
         << err_resp(400, "ERR_UNKNOWN_CHANNEL", "unknown channel: " + ch, 0, 0, 0)
     }
@@ -740,6 +743,7 @@ pub fn handle_create_post(st $&State, req &HttpReq, ch string, now int, prefligh
     if reviewed {
         root_path := thread_path(st, msg_id + "")
         pending_path := root_path + ".publishing"
+        map_set($&st.publishing_posts, msg_id + "", 1)
         saved := read_or_create_review_root(pending_path + "", &line) or (err) {
             << err_resp(500, "ERR_INTERNAL", "failed preparing reviewed thread root", 0, 0, 0)
         }
@@ -757,6 +761,7 @@ pub fn handle_create_post(st $&State, req &HttpReq, ch string, now int, prefligh
         os.rename(pending_path, root_path) or (err) {
             << err_resp(500, "ERR_INTERNAL", "failed committing reviewed thread root", 0, 0, 0)
         }
+        map_del($&st.publishing_posts, msg_id + "")
     } else {
         append_jsonl(channel_day_path(st, ch + "", today + ""), line + "") or (err) {
             << err_resp(500, "ERR_INTERNAL", "failed appending channel post", 0, 0, 0)
@@ -768,6 +773,9 @@ pub fn handle_create_post(st $&State, req &HttpReq, ch string, now int, prefligh
     map_set($&st.daily_posts, utc_date_from_unix(published_at) + ":" + au.agent_id, 1)
     map_set($&st.thread_reply_totals, msg_id + "", 0)
     map_set($&st.thread_visible_replies, msg_id + "", 0)
+    if au.agent_id == "ftx_fatextoffice" {
+        map_clear($&st.official_pin_verified)
+    }
     st.home_cache_ver += 1
 
     if reviewed && !consume_moderation_approval(st, req, now) {

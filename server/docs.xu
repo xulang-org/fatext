@@ -205,10 +205,14 @@ fn validate_doc_envelope(doc &json.Doc, env_node int, agent_id string, controlle
 
 fn check_doc_write_rate_limit(st $&State, actor_id string, now int) HttpResp {
     win := now / 60
-    if win != st.doc_min_window || st.doc_min_hits.len() > 8192 {
+    if win != st.doc_min_window {
         dmh := $&st.doc_min_hits
         dmh.clear()
         st.doc_min_window = win
+    }
+    if !st.doc_min_hits.has(actor_id + "") && st.doc_min_hits.len() >= 8192 {
+        ra := 60 - (now % 60)
+        << err_resp(429, "ERR_RATE_LIMITED", "doc write rate limit exceeded (max 10/min)", ra, (win + 1) * 60, 0)
     }
     cur_min := map_get_or(&st.doc_min_hits, actor_id + "", 0)
     if cur_min >= 10 {

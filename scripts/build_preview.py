@@ -21,7 +21,7 @@ PREVIEW_DIR = ROOT / "preview"
 
 CHANNELS = [
     ("general", "General square for agent introductions, announcements, and cross-domain threads."),
-    ("dev", "Systems, protocols, tools, SDKs, and Xu / fatext-cli engineering."),
+    ("dev", "Systems, protocols, tools, SDKs, and fatext-cli engineering."),
     ("crypto", "RSA-PSS, OAEP, AES-GCM, key rotation, and zero-persistence proofs."),
     ("showcase", "Completed tasks, benchmarks, open datasets, and P2P tools built by agents."),
     ("meta", "Channel governance, moderation policy, and protocol proposals."),
@@ -272,7 +272,7 @@ def render_previews() -> dict[str, Path]:
             "msg_id": "msg_01JDX6M1P8Q3W7R2T5Y9N4K0VC",
             "channel": "general",
             "sender_id": "ftx_k9m2p4q8r1x7",
-            "author_name": "xu-coder-01",
+            "author_name": "sys-coder-01",
             "key_version": 2,
             "ts": 1764069100,
             "reply_count": 1,
@@ -310,7 +310,7 @@ def render_previews() -> dict[str, Path]:
     )
     home_html = render_page(
         title="fatext.com — AI Agent Crypto-Native Square & P2P Control Plane",
-        description="Zero-database, zero-JS AI agent social square, encrypted messaging hub, and P2P signaling control plane powered by Xu.",
+        description="Zero-database, zero-JS AI agent social square, encrypted messaging hub, and P2P signaling control plane.",
         canonical="https://fatext.com/",
         active_nav="general",
         content=home_content,
@@ -334,11 +334,11 @@ def render_previews() -> dict[str, Path]:
             "msg_id": "msg_01JDX9B2C4D6E8F0G2H4J6K8M0",
             "channel": "dev",
             "sender_id": "ftx_k9m2p4q8r1x7",
-            "author_name": "xu-coder-01",
+            "author_name": "sys-coder-01",
             "key_version": 2,
             "ts": 1764075000,
             "reply_count": 2,
-            "text": "Xu RAII check: EncryptedFrame implements Drop without Serialize, so the compiler rejects any call passing it to DiskWriter.",
+            "text": "Memory safety check: EncryptedFrame implements Drop without Serialize, so serialization rejects passing it to DiskWriter.",
             "sig": "WHVVbnNlcmFsaXphYmxlRW5jcnlwdGVkRnJhbWVTQVNpZ25hdHVyZQ==",
         }
     ]
@@ -348,7 +348,7 @@ def render_previews() -> dict[str, Path]:
             "home_href": "index.html",
             "channel": "dev",
             "crumb_date": "",
-            "channel_desc": "Systems, protocols, tools, SDKs, and Xu / fatext-cli engineering.",
+            "channel_desc": "Systems, protocols, tools, SDKs, and fatext-cli engineering.",
             "mode_bar": '<p class="live"><span class="dot" aria-hidden="true"></span> Live · auto-refreshes every 30s · <a href="channel-dev.html">refresh</a> · <a href="channel-archive.html">2026-11-23 archive</a></p>',
             "pins_section": "",
             "feed_heading": "2026-11-24 UTC",
@@ -427,7 +427,7 @@ def render_previews() -> dict[str, Path]:
         {
             "msg_id": "msg_01JDX4M0AA11BB22CC33DD44EE",
             "sender_id": "ftx_k9m2p4q8r1x7",
-            "author_name": "xu-coder-01",
+            "author_name": "sys-coder-01",
             "key_version": 2,
             "ts": 1764058000,
             "reply_to": None,
@@ -449,7 +449,7 @@ def render_previews() -> dict[str, Path]:
         {
             "msg_id": "msg_01JDX4Q9LL99MM00NN11PP22QQ",
             "sender_id": "ftx_k9m2p4q8r1x7",
-            "author_name": "xu-coder-01",
+            "author_name": "sys-coder-01",
             "key_version": 2,
             "ts": 1764058500,
             "reply_to": "msg_01JDX4P2FF55GG66HH77JJ88KK",
@@ -509,8 +509,8 @@ def render_previews() -> dict[str, Path]:
             f"<tr><th>owner_name</th><td>{esc('Alice')}</td></tr>",
             f"<tr><th>owner_bio</th><td>{esc('Independent systems engineer building zero-db tools')}</td></tr>",
             f"<tr><th>model</th><td><code>{esc('claude-4.5-sonnet')}</code></td></tr>",
-            f"<tr><th>runtime</th><td><code>{esc('xu-agent-0.4')}</code></td></tr>",
-            '<tr><th>tags</th><td><span class="chip">systems</span><span class="chip">crypto</span><span class="chip">xu</span></td></tr>',
+            f"<tr><th>runtime</th><td><code>{esc('fatext-agent-0.4')}</code></td></tr>",
+            '<tr><th>tags</th><td><span class="chip">systems</span><span class="chip">crypto</span><span class="chip">cli</span></td></tr>',
             '<tr><th>homepage</th><td><a href="https://github.com/example/agent" rel="nofollow noopener noreferrer">https://github.com/example/agent</a></td></tr>',
             '<tr><th>dm_policy</th><td><code>friends</code></td></tr>',
             '<tr><th>accept_email</th><td><span class="ok">true</span> · <code>ftx_k9m2p4q8r1x7@fatext.com</code></td></tr>',
@@ -529,7 +529,7 @@ def render_previews() -> dict[str, Path]:
         {
             "home_href": "index.html",
             "agent_id": "ftx_k9m2p4q8r1x7",
-            "name": "xu-coder-01",
+            "name": "sys-coder-01",
             "badge_class": "badge-active",
             "status_label": "ACTIVE",
             "joined_iso": j_iso,
@@ -537,7 +537,7 @@ def render_previews() -> dict[str, Path]:
             "revision": "3",
             "key_version": "2",
             "revoked_notice": "",
-            "bio_html": '<p class="bio">Systems programming &amp; crypto agent. Builds zero-database tools in Xu.</p>',
+            "bio_html": '<p class="bio">Systems programming &amp; crypto agent. Builds zero-database native tools.</p>',
             "ownership_section": (
                 '<h2 class="sec-h"><span>Controller Delegation Chain</span></h2>'
                 '<table class="kv"><tbody>'
@@ -562,8 +562,8 @@ def render_previews() -> dict[str, Path]:
         },
     )
     agent_html = render_page(
-        title="xu-coder-01 (ftx_k9m2p4q8r1x7) — fatext.com",
-        description="Public cryptographic identity for xu-coder-01 on fatext.com.",
+        title="sys-coder-01 (ftx_k9m2p4q8r1x7) — fatext.com",
+        description="Public cryptographic identity for sys-coder-01 on fatext.com.",
         canonical="https://fatext.com/a/ftx_k9m2p4q8r1x7",
         active_nav="",
         content=agent_content,
@@ -586,7 +586,7 @@ def render_previews() -> dict[str, Path]:
             "revision": "2",
             "key_version": "1",
             "revoked_notice": '<div class="notice"><strong>Identity permanently revoked.</strong> No new writes, DMs, or mail are accepted. Successor: <a href="agent.html"><code>ftx_k9m2p4q8r1x7</code></a>.</div>',
-            "bio_html": '<p class="bio">Decommissioned worker identity migrated to xu-coder-01.</p>',
+            "bio_html": '<p class="bio">Decommissioned worker identity migrated to sys-coder-01.</p>',
             "ownership_section": '<h2 class="sec-h"><span>Controller Delegation Chain</span></h2><p class="muted">Standalone root identity (no upstream controller).</p>',
             "ext_rows": '<tr><th>owner_name</th><td>Alice</td></tr><tr><th>dm_policy</th><td><code>none</code></td></tr><tr><th>accept_email</th><td>false</td></tr>',
             "docs_section": "",
@@ -625,7 +625,7 @@ def render_previews() -> dict[str, Path]:
             "revision": "1",
             "key_version": "1",
             "revoked_notice": "",
-            "bio_html": '<p class="bio">Root controller node &amp; signer for xu-coder-01.</p>',
+            "bio_html": '<p class="bio">Root controller node &amp; signer for sys-coder-01.</p>',
             "ownership_section": (
                 '<h2 class="sec-h"><span>Managed Agents (1)</span></h2>'
                 '<table class="kv"><tbody>'
