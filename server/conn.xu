@@ -307,28 +307,231 @@ fn is_valid_http_path(s &string) bool {
     << true
 }
 
-fn parse_content_length_hdr(names &[]string, vals &[]string) int {
-    $seen := false
+struct BodyFraming {
+    ok bool
+    is_chunked bool
+    clen int
+    err_msg string
+}
+
+fn framing_err(msg string) BodyFraming {
+    << BodyFraming{ok: false, is_chunked: false, clen: 0, err_msg: msg}
+}
+
+fn parse_body_framing(names &[]string, vals &[]string) BodyFraming {
+    $seen_cl := false
+    $seen_te := false
     $cl := 0
     for i in 0:names.len {
         if names[i] == "transfer-encoding" {
-            << -2
+            if seen_te { << framing_err("duplicate transfer-encoding") }
+            v := strings.to_lower(&strings.trim_space(&vals[i]))
+            if v != "chunked" { << framing_err("unsupported transfer-encoding") }
+            seen_te = true
         }
         if names[i] == "content-length" {
-            if seen { << -1 }
+            if seen_cl { << framing_err("duplicate content-length") }
             v := strings.trim_space(&vals[i])
-            if v.len == 0 || v.len > 10 { << -1 }
+            if v.len == 0 || v.len > 10 { << framing_err("invalid or oversized content-length") }
             for j in 0:v.len {
                 c := v[j] & 255
-                if c < 48 || c > 57 { << -1 }
+                if c < 48 || c > 57 { << framing_err("invalid or oversized content-length") }
             }
-            n := strconv.atoi(&v) or (err) { << -1 }
-            if n < 0 { << -1 }
-            seen = true
+            n := strconv.atoi(&v) or (err) { << framing_err("invalid or oversized content-length") }
+            if n < 0 { << framing_err("invalid or oversized content-length") }
+            seen_cl = true
             cl = n
         }
     }
-    << cl
+    if seen_te && seen_cl {
+        << framing_err("conflicting transfer-encoding and content-length")
+    }
+    if seen_te {
+        << BodyFraming{ok: true, is_chunked: true, clen: 0, err_msg: ""}
+    }
+    if cl > 262144 {
+        << framing_err("invalid or oversized content-length")
+    }
+    << BodyFraming{ok: true, is_chunked: false, clen: cl, err_msg: ""}
+}
+
+struct ChunkLineRes {
+    ok bool
+    is_timeout bool
+    err_msg string
+    line string
+    rest string
+}
+
+fn read_chunk_crlf_line(cc $&ClientConn, buf_in string, deadline_ns int, max_len int) ChunkLineRes {
+    $buf := buf_in + ""
+    while true {
+        idx := strings.index_of(&buf, "\r\n")
+        if idx >= 0 {
+            if idx > max_len {
+                << ChunkLineRes{ok: false, is_timeout: false, err_msg: "chunk line too large", line: "", rest: ""}
+            }
+            ln := buf[0:idx] + ""
+            $rem := ""
+            if idx + 2 < buf.len {
+                rem = buf[(idx + 2):buf.len] + ""
+            }
+            << ChunkLineRes{ok: true, is_timeout: false, err_msg: "", line: ln, rest: rem}
+        }
+        if buf.len > max_len {
+            << ChunkLineRes{ok: false, is_timeout: false, err_msg: "chunk line too large", line: "", rest: ""}
+        }
+        if deadline_ns > 0 {
+            rem_ns := deadline_ns - time.now()
+            if rem_ns <= 0 {
+                << ChunkLineRes{ok: false, is_timeout: true, err_msg: "request body read timeout", line: "", rest: ""}
+            }
+            cc_set_sock_timeout(cc, rem_ns)
+        }
+        chunk := cc_read(cc, 4096) or (err) {
+            emsg := err.msg()
+            if is_read_timeout_err(&emsg) {
+                << ChunkLineRes{ok: false, is_timeout: true, err_msg: "request body read timeout", line: "", rest: ""}
+            }
+            << ChunkLineRes{ok: false, is_timeout: false, err_msg: emsg, line: "", rest: ""}
+        }
+        if chunk.len == 0 {
+            << ChunkLineRes{ok: false, is_timeout: false, err_msg: "unexpected eof reading chunked body", line: "", rest: ""}
+        }
+        buf = buf + chunk
+    }
+    << ChunkLineRes{ok: false, is_timeout: false, err_msg: "chunk line error", line: "", rest: ""}
+}
+
+fn trim_ows(s &string) string {
+    $start := 0
+    while start < s.len {
+        c := s[start] & 255
+        if c != 32 && c != 9 { <- }
+        start += 1
+    }
+    $end := s.len
+    while end > start {
+        c := s[end - 1] & 255
+        if c != 32 && c != 9 { <- }
+        end -= 1
+    }
+    if start >= end { << "" }
+    << s[start:end] + ""
+}
+
+fn parse_chunk_size_hex_strict(line &string) int {
+    semi := strings.index_of(line, ";")
+    $raw := *line + ""
+    if semi >= 0 {
+        raw = line[0:semi] + ""
+    }
+    s := trim_ows(&raw)
+    if s.len == 0 || s.len > 8 { << -1 }
+    $val := 0
+    for i in 0:s.len {
+        c := s[i] & 255
+        $d := -1
+        if c >= 48 && c <= 57 { d = c - 48 }
+        else if c >= 97 && c <= 102 { d = 10 + (c - 97) }
+        else if c >= 65 && c <= 70 { d = 10 + (c - 65) }
+        if d < 0 { << -1 }
+        val = val * 16 + d
+    }
+    << val
+}
+
+struct ChunkBodyRes {
+    ok bool
+    is_timeout bool
+    err_msg string
+    body string
+    rest string
+}
+
+fn chunk_body_err(is_timeout bool, msg string) ChunkBodyRes {
+    << ChunkBodyRes{ok: false, is_timeout: is_timeout, err_msg: msg, body: "", rest: ""}
+}
+
+fn read_chunked_body(cc $&ClientConn, rest_in string, deadline_ns int) ChunkBodyRes {
+    $rest := rest_in + ""
+    $decoded := ""
+    while true {
+        sz_res := read_chunk_crlf_line(cc, rest, deadline_ns, 1024)
+        if !sz_res.ok {
+            << chunk_body_err(sz_res.is_timeout, sz_res.err_msg + "")
+        }
+        rest = sz_res.rest + ""
+        chunk_sz := parse_chunk_size_hex_strict(&sz_res.line)
+        if chunk_sz < 0 {
+            << chunk_body_err(false, "invalid chunk size")
+        }
+        if chunk_sz == 0 {
+            $trailer_lines := 0
+            $trailer_bytes := 0
+            while true {
+                tlr := read_chunk_crlf_line(cc, rest, deadline_ns, 1024)
+                if !tlr.ok {
+                    << chunk_body_err(tlr.is_timeout, tlr.err_msg + "")
+                }
+                rest = tlr.rest + ""
+                if tlr.line.len == 0 {
+                    <-
+                }
+                trailer_lines += 1
+                trailer_bytes += tlr.line.len + 2
+                if trailer_lines > 32 || trailer_bytes > 4096 {
+                    << chunk_body_err(false, "chunk trailers too large")
+                }
+                col := strings.index_of(&tlr.line, ":")
+                if col <= 0 {
+                    << chunk_body_err(false, "malformed chunk trailer")
+                }
+                k_raw := tlr.line[0:col] + ""
+                if !is_strict_header_name(&k_raw) {
+                    << chunk_body_err(false, "invalid chunk trailer name")
+                }
+            }
+            <-
+        }
+        if decoded.len + chunk_sz > 262144 {
+            << chunk_body_err(false, "chunked body too large")
+        }
+        need_bytes := chunk_sz + 2
+        while rest.len < need_bytes {
+            want := need_bytes - rest.len
+            $rmax := 8192
+            if want < rmax { rmax = want }
+            if deadline_ns > 0 {
+                rem_ns := deadline_ns - time.now()
+                if rem_ns <= 0 {
+                    << chunk_body_err(true, "request body read timeout")
+                }
+                cc_set_sock_timeout(cc, rem_ns)
+            }
+            chunk := cc_read(cc, rmax) or (err) {
+                emsg := err.msg()
+                if is_read_timeout_err(&emsg) {
+                    << chunk_body_err(true, "request body read timeout")
+                }
+                << chunk_body_err(false, emsg)
+            }
+            if chunk.len == 0 {
+                << chunk_body_err(false, "unexpected eof reading chunked body")
+            }
+            rest = rest + chunk
+        }
+        if (rest[chunk_sz] & 255) != 13 || (rest[chunk_sz + 1] & 255) != 10 {
+            << chunk_body_err(false, "malformed chunk terminator")
+        }
+        decoded = decoded + rest[0:chunk_sz]
+        if need_bytes < rest.len {
+            rest = rest[need_bytes:rest.len] + ""
+        } else {
+            rest = ""
+        }
+    }
+    << ChunkBodyRes{ok: true, is_timeout: false, err_msg: "", body: decoded, rest: rest}
 }
 
 pub struct ReadReqMeta {
@@ -503,55 +706,69 @@ pub fn read_http_request_split(cc $&ClientConn, idle_timeout_ns int, read_timeou
         hvals.push(v)
     }
 
-    clen := parse_content_length_hdr(&hnames, &hvals)
-    if clen == -2 {
+    framing := parse_body_framing(&hnames, &hvals)
+    if !framing.ok {
         cc_set_sock_timeout(cc, 0)
-        << read_fail_meta(false, "transfer-encoding not supported")
-    }
-    if clen < 0 || clen > 262144 {
-        cc_set_sock_timeout(cc, 0)
-        << read_fail_meta(false, "invalid or oversized content-length")
-    }
-    if clen > 0 && rest.len < clen && proto == "HTTP/1.1" && has_expect_100_continue(&hnames, &hvals) {
-        cont := "HTTP/1.1 100 Continue\r\n\r\n"
-        if cc_write_timeout(cc, &cont, 2000000000) < 0 {
-            cc_set_sock_timeout(cc, 0)
-            << read_fail_meta(false, "failed writing 100 Continue")
-        }
-    }
-    while rest.len < clen {
-        need := clen - rest.len
-        $rmax := 8192
-        if need < rmax { rmax = need }
-        if deadline_ns > 0 {
-            rem := deadline_ns - time.now()
-            if rem <= 0 {
-                cc_set_sock_timeout(cc, 0)
-                << read_fail_meta(true, "request body read timeout")
-            }
-            cc_set_sock_timeout(cc, rem)
-        }
-        chunk := cc_read(cc, rmax) or (err) {
-            emsg := err.msg()
-            cc_set_sock_timeout(cc, 0)
-            if is_read_timeout_err(&emsg) {
-                << read_fail_meta(true, "request body read timeout")
-            }
-            << read_fail_meta(false, emsg)
-        }
-        if chunk.len == 0 {
-            cc_set_sock_timeout(cc, 0)
-            << read_fail_meta(false, "unexpected eof reading body")
-        }
-        rest = rest + chunk
+        << read_fail_meta(false, framing.err_msg + "")
     }
     $body := ""
-    if rest.len > clen {
-        body = rest[0:clen]
-        cc.buf = rest[clen:rest.len]
+    if framing.is_chunked {
+        if rest.len == 0 && proto == "HTTP/1.1" && has_expect_100_continue(&hnames, &hvals) {
+            cont := "HTTP/1.1 100 Continue\r\n\r\n"
+            if cc_write_timeout(cc, &cont, 2000000000) < 0 {
+                cc_set_sock_timeout(cc, 0)
+                << read_fail_meta(false, "failed writing 100 Continue")
+            }
+        }
+        cb := read_chunked_body(cc, rest, deadline_ns)
+        if !cb.ok {
+            cc_set_sock_timeout(cc, 0)
+            << read_fail_meta(cb.is_timeout, cb.err_msg + "")
+        }
+        body = cb.body
+        cc.buf = cb.rest
     } else {
-        body = rest
-        cc.buf = ""
+        clen := framing.clen
+        if clen > 0 && rest.len < clen && proto == "HTTP/1.1" && has_expect_100_continue(&hnames, &hvals) {
+            cont := "HTTP/1.1 100 Continue\r\n\r\n"
+            if cc_write_timeout(cc, &cont, 2000000000) < 0 {
+                cc_set_sock_timeout(cc, 0)
+                << read_fail_meta(false, "failed writing 100 Continue")
+            }
+        }
+        while rest.len < clen {
+            need := clen - rest.len
+            $rmax := 8192
+            if need < rmax { rmax = need }
+            if deadline_ns > 0 {
+                rem := deadline_ns - time.now()
+                if rem <= 0 {
+                    cc_set_sock_timeout(cc, 0)
+                    << read_fail_meta(true, "request body read timeout")
+                }
+                cc_set_sock_timeout(cc, rem)
+            }
+            chunk := cc_read(cc, rmax) or (err) {
+                emsg := err.msg()
+                cc_set_sock_timeout(cc, 0)
+                if is_read_timeout_err(&emsg) {
+                    << read_fail_meta(true, "request body read timeout")
+                }
+                << read_fail_meta(false, emsg)
+            }
+            if chunk.len == 0 {
+                cc_set_sock_timeout(cc, 0)
+                << read_fail_meta(false, "unexpected eof reading body")
+            }
+            rest = rest + chunk
+        }
+        if rest.len > clen {
+            body = rest[0:clen]
+            cc.buf = rest[clen:rest.len]
+        } else {
+            body = rest
+            cc.buf = ""
+        }
     }
     cc_set_sock_timeout(cc, 0)
     out_req.req_method = meth

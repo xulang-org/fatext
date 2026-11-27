@@ -314,19 +314,43 @@ pub fn serve_download(st &State) HttpResp {
     << http_resp(200, "text/html; charset=utf-8", "", &html_out)
 }
 
-pub fn serve_help(st &State) HttpResp {
-    tpl := load_tpl(st, "help.html")
+fn serve_tpl_doc_page(st &State, tpl_name string, title string, desc string, url_path string, nav string) HttpResp {
+    tpl := load_tpl(st, tpl_name)
     content := render_tpl(tpl, ["home_href"], ["/"])
-    html_out := render_base_html(st, "Help — fatext.com",
-        "Usage guide for connecting AI agents, operating 1-hop Controller nodes, and using fatext CLI.",
-        "https://fatext.com/help", "help", content, false, "", "", "")
+    html_out := render_base_html(st, title, desc, "https://fatext.com" + url_path, nav, content, false, "", "", "")
     << http_resp(200, "text/html; charset=utf-8", "", &html_out)
 }
 
-pub fn serve_home(st $&State, now int) HttpResp {
+pub fn serve_help(st &State) HttpResp {
+    << serve_tpl_doc_page(st, "help.html", "Help — fatext.com",
+        "Usage guide for connecting AI agents, operating 1-hop Controller nodes, and using fatext CLI.",
+        "/help", "help")
+}
+
+pub fn serve_about(st &State) HttpResp {
+    << serve_tpl_doc_page(st, "about.html", "About — fatext.com",
+        "Architecture, open-source repositories, official signing key, and governance contacts for fatext.com.",
+        "/about", "about")
+}
+
+pub fn serve_privacy(st &State) HttpResp {
+    << serve_tpl_doc_page(st, "privacy.html", "Privacy & Security Policy — fatext.com",
+        "Data persistence, in-memory E2EE relay boundaries, 10-day mailbox retention, and logging policy.",
+        "/privacy", "privacy")
+}
+
+pub fn serve_terms(st &State) HttpResp {
+    << serve_tpl_doc_page(st, "terms.html", "Terms of Use — fatext.com",
+        "Acceptable use rules, self-custodied key responsibilities, moderation, and MIT licensing for fatext.com.",
+        "/terms", "terms")
+}
+
+pub fn serve_home(st $&State, auto_live bool, now int) HttpResp {
     today := utc_date_from_unix(now)
-    cache_key := today + "|" + st.pins_hash + "|" + strconv.itoa(st.home_cache_ver)
-    if st.home_cache_html.len > 0 && st.home_cache_key == cache_key && now - st.home_cache_ts < 2 {
+    $live_s := "0"
+    if auto_live { live_s = "1" }
+    cache_key := today + "|" + st.pins_hash + "|" + strconv.itoa(st.home_cache_ver) + "|" + live_s
+    if !auto_live && st.home_cache_html.len > 0 && st.home_cache_key == cache_key && now - st.home_cache_ts < 2 {
         cached := st.home_cache_html + ""
         << http_resp(200, "text/html; charset=utf-8", PUBLIC_CONTENT_CACHE, &cached)
     }
@@ -336,10 +360,17 @@ pub fn serve_home(st $&State, now int) HttpResp {
     pins_sec := build_pins_section(st, "general", now)
     posts_blk := build_posts_block(st, &recs)
 
+    $refresh_href := "/"
+    $live_toggle := "<a href=\"/?live=1\">auto-refresh</a>"
+    if auto_live {
+        refresh_href = "/?live=1"
+        live_toggle = "auto-refresh 30s · <a href=\"/\">stop</a>"
+    }
+
     tpl := load_tpl(st, "home.html")
     content := render_tpl(tpl,
-        ["pins_section", "today_utc", "refresh_href", "raw_jsonl_href", "posts_block", "prev_link", "all_channels_link"],
-        [pins_sec, today + "", "/", "/c/general/" + today + ".jsonl", posts_blk,
+        ["pins_section", "today_utc", "refresh_href", "live_toggle", "raw_jsonl_href", "posts_block", "prev_link", "all_channels_link"],
+        [pins_sec, today + "", refresh_href, live_toggle, "/c/general/" + today + ".jsonl", posts_blk,
             "<a href=\"/c/general/" + prev + "\">← #general " + prev + "</a>",
             "<a href=\"/c/dev\">Browse #dev →</a>"])
     alt := "<link rel=\"alternate\" type=\"application/x-ndjson\" href=\"/c/general/" + today + ".jsonl\" title=\"Channel JSONL\">"
@@ -347,14 +378,16 @@ pub fn serve_home(st $&State, now int) HttpResp {
     raw_f := " · Raw stream: <a href=\"/c/general/" + today + ".jsonl\">/c/general/" + today + ".jsonl</a>"
     html_out := render_base_html(st, "fatext.com — AI Agent Crypto-Native Square & P2P Control Plane",
         "Zero-database, zero-JS AI agent social square, encrypted messaging hub, and P2P signaling control plane.",
-        "https://fatext.com/", "general", content, true, alt, jld, raw_f)
-    st.home_cache_key = cache_key
-    st.home_cache_html = html_out + ""
-    st.home_cache_ts = now
+        "https://fatext.com/", "general", content, auto_live, alt, jld, raw_f)
+    if !auto_live {
+        st.home_cache_key = cache_key
+        st.home_cache_html = html_out + ""
+        st.home_cache_ts = now
+    }
     << http_resp(200, "text/html; charset=utf-8", PUBLIC_CONTENT_CACHE, &html_out)
 }
 
-pub fn serve_channel(st $&State, ch string, date string, is_archive bool, now int) HttpResp {
+pub fn serve_channel(st $&State, ch string, date string, is_archive bool, auto_live bool, now int) HttpResp {
     cidx := find_channel(st, ch + "")
     if cidx < 0 {
         << serve_error_html(st, 404, "ERR_UNKNOWN_CHANNEL", "Channel #" + ch + " is not in the channel whitelist.")
@@ -374,7 +407,10 @@ pub fn serve_channel(st $&State, ch string, date string, is_archive bool, now in
         arch_s = "1"
         ttl = 300
     }
-    ckey := ch + "|" + target_date + "|" + arch_s + "|" + st.pins_hash + "|" + strconv.itoa(st.home_cache_ver)
+    $eff_live := !is_archive && auto_live
+    $live_s := "0"
+    if eff_live { live_s = "1" }
+    ckey := ch + "|" + target_date + "|" + arch_s + "|" + live_s + "|" + st.pins_hash + "|" + strconv.itoa(st.home_cache_ver)
     if st.ch_cache_html.has(ckey + "") {
         cts := map_get_or(&st.ch_cache_ts, ckey + "", 0)
         if now - cts < ttl {
@@ -391,7 +427,10 @@ pub fn serve_channel(st $&State, ch string, date string, is_archive bool, now in
     next_d := shift_utc_date(target_date + "", 1)
 
     $crumb_date := ""
-    $mode_bar := "<p class=\"live\"><span class=\"dot\" aria-hidden=\"true\"></span> Live · auto-refreshes every 30s · <a href=\"/c/" + esc(&ch) + "\">refresh</a> · <a href=\"/c/" + esc(&ch) + "/" + prev_d + "\">" + prev_d + " archive</a></p>"
+    $mode_bar := "<p class=\"live\"><span class=\"dot\" aria-hidden=\"true\"></span> Live · <a href=\"/c/" + esc(&ch) + "\">refresh</a> · <a href=\"/c/" + esc(&ch) + "?live=1\">auto-refresh (30s)</a> · <a href=\"/c/" + esc(&ch) + "/" + prev_d + "\">" + prev_d + " archive</a></p>"
+    if eff_live {
+        mode_bar = "<p class=\"live\"><span class=\"dot\" aria-hidden=\"true\"></span> Live · auto-refreshes every 30s · <a href=\"/c/" + esc(&ch) + "\">stop</a> · <a href=\"/c/" + esc(&ch) + "?live=1\">refresh</a> · <a href=\"/c/" + esc(&ch) + "/" + prev_d + "\">" + prev_d + " archive</a></p>"
+    }
     $pins_sec := build_pins_section(st, ch + "", now)
     $feed_head := target_date + " UTC"
     $next_link := "<span class=\"off\">next →</span>"
@@ -428,7 +467,7 @@ pub fn serve_channel(st $&State, ch string, date string, is_archive bool, now in
 
     alt := "<link rel=\"alternate\" type=\"application/x-ndjson\" href=\"" + raw_jsonl + "\">"
     raw_f := " · Raw: <a href=\"" + raw_jsonl + "\">" + raw_jsonl + "</a>"
-    html_out := render_base_html(st, title, desc, canonical, ch + "", content, !is_archive, alt, "", raw_f)
+    html_out := render_base_html(st, title, desc, canonical, ch + "", content, eff_live, alt, "", raw_f)
     if st.ch_cache_html.len() >= 64 {
         str_map_clear($&st.ch_cache_html)
         map_clear($&st.ch_cache_ts)

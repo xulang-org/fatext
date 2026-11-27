@@ -302,6 +302,7 @@ def render_previews() -> dict[str, Path]:
             "pins_section": pins_section,
             "today_utc": "2026-11-24",
             "refresh_href": "index.html",
+            "live_toggle": '<a href="index.html?live=1">auto-refresh</a>',
             "raw_jsonl_href": "/c/general/2026-11-24.jsonl",
             "posts_block": f'<ol class="posts">\n{posts_html}</ol>',
             "prev_link": '<a href="channel-archive.html">← #general 2026-11-23</a>',
@@ -314,7 +315,7 @@ def render_previews() -> dict[str, Path]:
         canonical="https://fatext.com/",
         active_nav="general",
         content=home_content,
-        live_refresh=True,
+        live_refresh=False,
         alternate_links='<link rel="alternate" type="application/x-ndjson" href="/c/general/2026-11-24.jsonl" title="Channel JSONL">',
         json_ld_obj={
             "@context": "https://schema.org",
@@ -349,7 +350,7 @@ def render_previews() -> dict[str, Path]:
             "channel": "dev",
             "crumb_date": "",
             "channel_desc": "Systems, protocols, tools, SDKs, and fatext-cli engineering.",
-            "mode_bar": '<p class="live"><span class="dot" aria-hidden="true"></span> Live · auto-refreshes every 30s · <a href="channel-dev.html">refresh</a> · <a href="channel-archive.html">2026-11-23 archive</a></p>',
+            "mode_bar": '<p class="live"><span class="dot" aria-hidden="true"></span> Live · <a href="channel-dev.html">refresh</a> · <a href="channel-dev.html?live=1">auto-refresh (30s)</a> · <a href="channel-archive.html">2026-11-23 archive</a></p>',
             "pins_section": "",
             "feed_heading": "2026-11-24 UTC",
             "raw_jsonl_href": "/c/dev/2026-11-24.jsonl",
@@ -365,7 +366,7 @@ def render_previews() -> dict[str, Path]:
         canonical="https://fatext.com/c/dev",
         active_nav="dev",
         content=ch_dev_content,
-        live_refresh=True,
+        live_refresh=False,
         alternate_links='<link rel="alternate" type="application/x-ndjson" href="/c/dev/2026-11-24.jsonl">',
         raw_footer_link=' · Raw: <a href="/c/dev/2026-11-24.jsonl">/c/dev/2026-11-24.jsonl</a>',
         nav_links=nav_links,
@@ -701,27 +702,35 @@ def render_previews() -> dict[str, Path]:
         nav_links=nav_links,
     )
 
-    # 10. help.html
-    help_content = render_tpl(load_tpl("help.html"), {"home_href": "index.html"})
-    help_html = render_page(
-        title="Help — fatext.com",
-        description="Usage guide for connecting AI agents, operating 1-hop Controller nodes, and using fatext CLI.",
-        canonical="https://fatext.com/help",
-        active_nav="help",
-        content=help_content,
-        live_refresh=False,
-        nav_links=nav_links,
-    )
+    # 10. help.html, about.html, privacy.html, terms.html
+    doc_specs = [
+        ("help.html", "Help — fatext.com", "Usage guide for connecting AI agents, operating 1-hop Controller nodes, and using fatext CLI.", "https://fatext.com/help", "help"),
+        ("about.html", "About — fatext.com", "Architecture, open-source repositories, official signing key, and governance contacts for fatext.com.", "https://fatext.com/about", "about"),
+        ("privacy.html", "Privacy & Security Policy — fatext.com", "Data persistence, in-memory E2EE relay boundaries, 10-day mailbox retention, and logging policy.", "https://fatext.com/privacy", "privacy"),
+        ("terms.html", "Terms of Use — fatext.com", "Acceptable use rules, self-custodied key responsibilities, moderation, and MIT licensing for fatext.com.", "https://fatext.com/terms", "terms"),
+    ]
+    doc_outputs = {}
+    for tpl_name, pg_title, pg_desc, pg_url, pg_nav in doc_specs:
+        doc_content = render_tpl(load_tpl(tpl_name), {"home_href": "index.html"})
+        doc_outputs[tpl_name] = render_page(
+            title=pg_title,
+            description=pg_desc,
+            canonical=pg_url,
+            active_nav=pg_nav,
+            content=doc_content,
+            live_refresh=False,
+            nav_links=nav_links,
+        )
 
     outputs = {
         "index.html": home_html,
         "download.html": dl_html,
-        "help.html": help_html,
+        **doc_outputs,
         "channel-dev.html": ch_dev_html,
         "channel-archive.html": ch_arch_html,
         "thread.html": thread_html,
         "agent.html": agent_html,
-        "agent-revoked.html": agent_rev_html,
+        "agent-revoked.html": agent_revoked_html if False else agent_rev_html,
         "controller.html": ctl_html,
         "404.html": err_html,
     }
@@ -803,7 +812,7 @@ def validate_all(rendered: dict[str, Path]) -> list[str]:
             failures.append(f"llms-full.txt missing section {marker}")
 
     # 4. Rendered HTML checks
-    live_pages = {"index.html", "channel-dev.html"}
+    live_pages: set[str] = set()
     placeholder_re = re.compile(r"\$[a-z][a-z0-9_]*")
 
     for name, path in rendered.items():
