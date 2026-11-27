@@ -813,6 +813,7 @@ pub fn handle_mail_ingest(hub $&HubState, req &HttpReq, now int) HttpResp {
     r := doc.root()
     to_id := json_str_or(&doc, doc.get(r, "to_agent_id"), "")
     mfrom := json_str_or(&doc, doc.get(r, "from"), "")
+    header_from := json_str_or(&doc, doc.get(r, "header_from"), "")
     subj := json_str_or(&doc, doc.get(r, "subject"), "")
     snippet := json_str_or(&doc, doc.get(r, "raw_snippet"), "")
     spf := json_bool_or(&doc, doc.get(r, "spf_pass"), false)
@@ -821,7 +822,7 @@ pub fn handle_mail_ingest(hub $&HubState, req &HttpReq, now int) HttpResp {
     $rat := json_int_or(&doc, doc.get(r, "received_at"), now)
     if rat <= 0 || rat > now + 300 || rat < now - MAIL_TTL_SEC { rat = now }
 
-    if mfrom.len > 512 || subj.len > 512 || snippet.len > 16384 {
+    if mfrom.len > 512 || header_from.len > 512 || subj.len > 512 || snippet.len > 16384 {
         << err_resp(413, "ERR_PAYLOAD_TOO_LARGE", "mail field exceeds size limit", 0, 0, 0)
     }
     if !is_valid_agent_id(to_id + "") { << err_resp(400, "ERR_BAD_REQUEST", "invalid to_agent_id", 0, 0, 0) }
@@ -874,6 +875,7 @@ pub fn handle_mail_ingest(hub $&HubState, req &HttpReq, now int) HttpResp {
     if dmarc { dmarc_s = "true" }
 
     pt_inner := "{\"from\":" + json.quote(&mfrom) +
+        ",\"header_from\":" + json.quote(&header_from) +
         ",\"subject\":" + json.quote(&subj) +
         ",\"raw_snippet\":" + json.quote(&snippet) +
         ",\"spf_pass\":" + spf_s + "" +

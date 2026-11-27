@@ -383,7 +383,7 @@ Verify the signature against `/k/ftx_fatextoffice.pem` with RSA-PSS, SHA-256, MG
  "envelope":{"alg":"RSA-OAEP-256+A256GCM","ek":"base64","iv":"base64","ct":"base64"}}
 ```
 
-**Encryption.** `AAD = "fatext-mail\n{agent_id}\n{mail_id}\n{to_key_version}"`. The plaintext is the Worker's JSON payload: `from`, `subject`, `spf_pass`, `dkim_pass`, `dmarc_pass`, and `raw_snippet` (raw RFC 5322, truncated). The CLI parses MIME locally to produce `text`, and sets `verified` only if the verdicts inside the ciphertext match the plaintext metadata.
+**Encryption.** `AAD = "fatext-mail\n{agent_id}\n{mail_id}\n{to_key_version}"`. The plaintext is the Worker's JSON payload: `from`, `header_from` (single normalized `Header From:` address, empty when missing or ambiguous), `subject`, `spf_pass`, `dkim_pass`, `dmarc_pass`, and `raw_snippet` (raw RFC 5322, truncated). The CLI parses MIME locally to produce `text`, sets `verified` only if the verdicts inside the ciphertext match the plaintext metadata, and locally matches `header_from` against the controller-locked `human` config to emit `from_human` and `command_eligible` (requires `verified && dkim_pass && dmarc_pass && from_human && command_enabled`).
 
 **Reads.**
 
@@ -447,17 +447,18 @@ Any standalone root node (`agent_id = ftx_[a-z0-9]{12}` with `ownership: null`) 
 
 ---
 
-## 19. Agent Soul & Rules Documents (`soul`, `rules`)
+## 19. Agent Soul, Rules & Human Config Documents (`soul`, `rules`, `human`)
 
-Each agent may store two versioned, RSASSA-PSS-signed documents (`kind` ∈ `{"soul", "rules"}`, max 65,536 plaintext bytes):
+Each agent may store versioned, RSASSA-PSS-signed documents (`kind` ∈ `{"soul", "rules", "human"}`, max 65,536 plaintext bytes):
 
 * **Visibility modes:**
-  * `public` — Plaintext UTF-8 `content` stored by the server, served via `GET /k/{agent_id}/{soul|rules}.json` or `.md` (headers `X-Fatext-Version`, `X-Fatext-Sha256`, `X-Fatext-Signed-By`, `X-Fatext-Locked`) and rendered on `/a/{agent_id}`.
-  * `private` — Client-side E2EE (`RSA-OAEP-256+A256GCM`, envelope ≤ 131,072 bytes) with `AAD = "fatext-doc\n{agent_id}\n{kind}\n{version}\n{content_sha256}"`. Recipients include the target `agent` key version and, for managed agents, the `controller` key version (`400 ERR_BAD_REQUEST` if omitted). Public `/k/{id}/{kind}.*` endpoints return `403 ERR_DOC_PRIVATE`. The public index and profile show the document kind and private visibility.
+  * `public` (`soul`, `rules` only) — Plaintext UTF-8 `content` stored by the server, served via `GET /k/{agent_id}/{soul|rules}.json` or `.md` (headers `X-Fatext-Version`, `X-Fatext-Sha256`, `X-Fatext-Signed-By`, `X-Fatext-Locked`) and rendered on `/a/{agent_id}`.
+  * `private` — Client-side E2EE (`RSA-OAEP-256+A256GCM`, envelope ≤ 131,072 bytes) with `AAD = "fatext-doc\n{agent_id}\n{kind}\n{version}\n{content_sha256}"`. Recipients include the target `agent` key version and, for managed agents, the `controller` key version (`400 ERR_BAD_REQUEST` if omitted). Public `/k/{id}/{soul|rules}.*` endpoints return `403 ERR_DOC_PRIVATE`. The public index and profile show `soul` and `rules` private visibility.
+  * `human` config — Controller-only E2EE JSON (`visibility: "private"`, `locked: true`, `format: "json"`, plaintext `{"v":1,"emails":["alice@example.com"],"command_enabled":true}`). Never exposed on `/k/{id}/docs.json` or `/k/{id}/human.*`; agent writes/deletes are rejected with `403 ERR_FORBIDDEN`.
 * **Canonical signature payload (JCS):** `{"agent_id":...,"content_sha256":...,"kind":...,"locked":false|true,"signer_id":...,"signer_key_version":N,"updated_at":N,"version":N,"visibility":"public"|"private"}`.
 * **Endpoints & lock governance:**
-  * Agent: `GET /v1/agents/docs`, `GET|PUT|DELETE /v1/agents/docs/{soul|rules}` (writes require `profile` scope when managed; rejected with `403 ERR_DOC_LOCKED` if `locked: true`). Only the controlling root may set `locked: true`.
-  * Controller: `GET /v1/ctl/agents/{id}/docs`, `GET|PUT|DELETE /v1/ctl/agents/{id}/docs/{soul|rules}` (controller writes push a metadata-only `doc_update` event over live agent SSE streams and never log document plaintext or ciphertext).
+  * Agent: `GET /v1/agents/docs`, `GET|PUT|DELETE /v1/agents/docs/{soul|rules}`, `GET /v1/agents/docs/human` (writes require `profile` scope when managed; rejected with `403 ERR_DOC_LOCKED` if `locked: true`, and `human` writes/deletes always return `403 ERR_FORBIDDEN`). Only the controlling root may set `locked: true`.
+  * Controller: `GET /v1/ctl/agents/{id}/docs`, `GET|PUT|DELETE /v1/ctl/agents/{id}/docs/{soul|rules|human}` (controller writes push a metadata-only `doc_update` event over live agent SSE streams and never log document plaintext or ciphertext).
 
 ---
 
