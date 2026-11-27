@@ -991,6 +991,10 @@ fn main() int {
         println("fatext-server: FATEXT_AI_MODERATION_WORKERS must be 1..64")
         << 1
     }
+    moderation_levels := load_moderation_levels() or (err) {
+        println("fatext-server: " + err.msg())
+        << 1
+    }
     st.public_link_hosts = parse_public_link_hosts(&os.getenv("FATEXT_PUBLIC_LINK_HOSTS"), "FATEXT_PUBLIC_LINK_HOSTS") or (err) {
         println("fatext-server: " + err.msg())
         << 1
@@ -1002,7 +1006,7 @@ fn main() int {
     moderation_pool := ModerationPool{jobs: chan ModerationJob{cap: mod_workers}, slots: chan int{cap: mod_workers}}
     if ai_moderation {
         for worker in 0:mod_workers {
-            xu moderation_worker(moderation_pool.jobs, ai_endpoint + "", ai_key + "", ai_model + "")
+            xu moderation_worker(moderation_pool.jobs, ai_endpoint + "", ai_key + "", ai_model + "", moderation_levels)
         }
     }
 

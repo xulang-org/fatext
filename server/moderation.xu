@@ -362,7 +362,7 @@ pub fn handle_public_report(st $&State, req &HttpReq, web bool, now int) HttpRes
     token := mint_report_token()
     if token.len == 0 { << err_resp(503, "ERR_REPORT_UNAVAILABLE", "report storage unavailable", 0, 0, 0) }
     token_hash := sha256.sum256(token + "")
-    body := "{\"source\":\"public\",\"status_token_hash\":" + json.quote(&token_hash) + ",\"thread_id\":" + json.quote(&thread) +
+    body := "{\"source\":\"public\",\"priority\":\"medium\",\"status_token_hash\":" + json.quote(&token_hash) + ",\"thread_id\":" + json.quote(&thread) +
         ",\"msg_id\":" + json.quote(&message) + ",\"reason\":" + json.quote(&reason) +
         ",\"details\":" + json.quote(&details) + ",\"reporter_id\":" + json.quote(&reporter) +
         ",\"created_at\":" + strconv.itoa(now) + "}\n"
@@ -376,6 +376,55 @@ pub fn handle_public_report(st $&State, req &HttpReq, web bool, now int) HttpRes
     out := "{\"receipt\":" + json.quote(&id) + ",\"date\":" + json.quote(&date) +
         ",\"token\":" + json.quote(&token) + "}"
     << http_resp(201, "application/json; charset=utf-8", PUBLIC_CONTENT_CACHE, &out)
+}
+
+fn valid_moderation_priority(priority &string) bool {
+    << *priority == "low" || *priority == "medium" || *priority == "high"
+}
+
+fn report_priority(report &json.Doc) string {
+    priority := json_str_or(report, report.get(report.root(), "priority"), "medium")
+    if valid_moderation_priority(&priority) { << priority }
+    << "medium"
+}
+
+fn report_status(st &State, date string, id string, now int) string {
+    decision := read_case_decision(st, date, id)
+    if decision.status == "approved" && decision.expires_at <= now { << "expired" }
+    << decision.status + ""
+}
+
+pub fn handle_report_priority_admin(hub $&HubState, req &HttpReq, date string, id string, now int) HttpResp {
+    if req.method() != "PUT" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+    if !case_date_retained(&hub.st, &date, now) || !is_receipt_id(&id) {
+        << err_resp(400, "ERR_BAD_REQUEST", "invalid date or receipt", 0, 0, 0)
+    }
+    input := json.parse(&req.req_body)
+    priority := json_str_or(&input, input.get(input.root(), "priority"), "")
+    reason := json_str_or(&input, input.get(input.root(), "reason"), "")
+    if !input.ok() || !valid_moderation_priority(&priority) || !is_valid_tag(&reason) {
+        << err_resp(400, "ERR_BAD_REQUEST", "priority must be low, medium, or high and reason must be a short code", 0, 0, 0)
+    }
+    path := report_path(&hub.st, date, id + "")
+    raw := os.read(path + "") or (err) { << err_resp(404, "ERR_NOT_FOUND", "report not found", 0, 0, 0) }
+    report := json.parse(&raw)
+    root := report.root()
+    if !report.ok() || !report.is_dict(root) { << err_resp(500, "ERR_INTERNAL", "report record is invalid", 0, 0, 0) }
+    if report_priority(&report) != priority {
+        keys := report.dict_keys(root)
+        $fields := ["\"priority\":" + json.quote(&priority)]
+        for i in 0:keys.len {
+            key := keys[i] + ""
+            if key == "priority" { -> }
+            value := json_encode_or(&report, report.get(root, key + ""), "")
+            if value.len == 0 { << err_resp(500, "ERR_INTERNAL", "could not encode report record", 0, 0, 0) }
+            fields.push(json.quote(&key) + ":" + value)
+        }
+        saved := "{" + strings.join(fields, ",") + "}\n"
+        write_atomic_mode(path, &saved, 384) or (err) { << err_resp(500, "ERR_INTERNAL", "could not save report priority", 0, 0, 0) }
+        log_admin_action(hub, req, now, "moderation_priority_" + priority, id + "", reason)
+    }
+    << json_resp(200, "{\"priority\":" + json.quote(&priority) + "}")
 }
 
 pub fn handle_report_admin(st &State, req &HttpReq, now int) HttpResp {
@@ -395,8 +444,17 @@ pub fn handle_report_admin(st &State, req &HttpReq, now int) HttpResp {
         }
         clean := strings.trim_space(&raw)
         state := read_case_decision(st, date + "", id + "")
-        out := clean[0:(clean.len - 1)] + ",\"decision\":" + decision_json(&state) + "}"
+        $metadata := ""
+        if !report.has(report.root(), "priority") { metadata = ",\"priority\":\"medium\"" }
+        out := clean[0:(clean.len - 1)] + metadata + ",\"decision\":" + decision_json(&state) + "}"
         << http_resp(200, "application/json; charset=utf-8", PUBLIC_CONTENT_CACHE, &out)
+    }
+    priority := query_param_str(req.path(), "priority", "")
+    status := query_param_str(req.path(), "status", "")
+    if (priority.len > 0 && !valid_moderation_priority(&priority)) ||
+       (status.len > 0 && status != "pending" && status != "resolved" && status != "dismissed" && status != "approved" &&
+        status != "rejected" && status != "expired" && status != "approval_used") {
+        << err_resp(400, "ERR_BAD_REQUEST", "invalid priority or status filter", 0, 0, 0)
     }
     names := read_dir_or_empty(moderation_dir(st) + "/reports/" + date)
     entries := strings.split(&names, "\n")
@@ -404,7 +462,14 @@ pub fn handle_report_admin(st &State, req &HttpReq, now int) HttpResp {
     for i in 0:entries.len {
         if entries[i].len != 35 || !strings.has_suffix(&entries[i], ".json") { -> }
         rid := entries[i][0:30] + ""
-        if is_receipt_id(&rid) { receipts.push(rid) }
+        if !is_receipt_id(&rid) { -> }
+        if priority.len > 0 {
+            raw := read_file_or_empty(report_path(st, date + "", rid + ""))
+            report := json.parse(&raw)
+            if !report.ok() || !report.is_dict(report.root()) || report_priority(&report) != priority { -> }
+        }
+        if status.len > 0 && report_status(st, date + "", rid + "", now) != status { -> }
+        receipts.push(rid)
     }
     out := "{\"date\":" + json.quote(&date) + ",\"receipts\":" + encode_string_list(&receipts) + "}"
     << http_resp(200, "application/json; charset=utf-8", PUBLIC_CONTENT_CACHE, &out)

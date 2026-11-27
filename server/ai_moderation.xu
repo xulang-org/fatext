@@ -9,9 +9,38 @@
 #strings
 
 pub const MODERATION_ALLOW = 1
-pub const MODERATION_FLAG = 2
+pub const MODERATION_FLAG_MEDIUM = 2
 pub const MODERATION_UNAVAILABLE = 3
 pub const MODERATION_REVIEWED = 4
+pub const MODERATION_FLAG_LOW = 5
+pub const MODERATION_FLAG_HIGH = 6
+
+pub struct ModerationLevels {
+    pub medium_score int
+    pub high_score int
+}
+
+fn parse_moderation_score(setting string, fallback int) int {
+    raw := os.getenv(setting + "")
+    if raw.len == 0 { << fallback }
+    score := strconv.atoi(&raw) or (err) { >> errors.new(setting + " must be an integer from 1 to 100") }
+    if score < 1 || score > 100 { >> errors.new(setting + " must be an integer from 1 to 100") }
+    << score
+}
+
+pub fn load_moderation_levels() ModerationLevels {
+    medium := parse_moderation_score("FATEXT_AI_MODERATION_MEDIUM_SCORE", 80) or >>
+    high := parse_moderation_score("FATEXT_AI_MODERATION_HIGH_SCORE", 95) or >>
+    if high <= medium { >> errors.new("FATEXT_AI_MODERATION_HIGH_SCORE must exceed FATEXT_AI_MODERATION_MEDIUM_SCORE") }
+    << ModerationLevels{medium_score: medium, high_score: high}
+}
+
+pub fn moderation_verdict_priority(verdict int) string {
+    if verdict == MODERATION_FLAG_LOW { << "low" }
+    if verdict == MODERATION_FLAG_MEDIUM { << "medium" }
+    if verdict == MODERATION_FLAG_HIGH { << "high" }
+    << ""
+}
 
 pub struct ModerationJob {
     pub text string
@@ -28,14 +57,27 @@ pub fn valid_moderation_endpoint(endpoint &string) bool {
     << host == "127.0.0.1" || host == "::1"
 }
 
-pub fn moderation_worker(ch chan ModerationJob, endpoint string, secret string, model string) {
+pub fn moderation_worker(ch chan ModerationJob, endpoint string, secret string, model string, levels ModerationLevels) {
     while true {
         job := <-ch
-        job.result <- classify_public_text(endpoint + "", secret + "", &model, &job.text)
+        job.result <- classify_public_text(endpoint + "", secret + "", &model, &job.text, &levels)
     }
 }
 
-fn classify_public_text(endpoint string, secret string, model &string, input &string) int {
+fn flagged_moderation_level(doc &json.Doc, node int, levels &ModerationLevels) int {
+    if !doc.is_dict(node) { << MODERATION_FLAG_MEDIUM }
+    keys := doc.dict_keys(node)
+    $top := -1.0
+    for i in 0:keys.len {
+        score := doc.as_f64(doc.get(node, keys[i] + "")) or (err) { -> }
+        if score >= 0.0 && score <= 1.0 && score > top { top = score }
+    }
+    if top >= f64(levels.high_score) / 100.0 { << MODERATION_FLAG_HIGH }
+    if top < 0.0 || top >= f64(levels.medium_score) / 100.0 { << MODERATION_FLAG_MEDIUM }
+    << MODERATION_FLAG_LOW
+}
+
+fn classify_public_text(endpoint string, secret string, model &string, input &string, levels &ModerationLevels) int {
     if endpoint.len == 0 { << MODERATION_UNAVAILABLE }
     $client := http.new_client()
     client.set_timeout(6000000000)
@@ -59,7 +101,7 @@ fn classify_public_text(endpoint string, secret string, model &string, input &st
     val := doc.get(item, "flagged")
     if !doc.is_bool(val) { << MODERATION_UNAVAILABLE }
     flagged := doc.as_bool(val) or (err) { << MODERATION_UNAVAILABLE }
-    if flagged { << MODERATION_FLAG }
+    if flagged { << flagged_moderation_level(&doc, doc.get(item, "category_scores"), levels) }
     << MODERATION_ALLOW
 }
 
@@ -319,13 +361,13 @@ pub fn preflight_public_review(st $&State, req &HttpReq, now int) HttpResp {
         << err_resp(422, "ERR_PUBLIC_LINK_BLOCKED", "remove the blocked link before posting", 0, 0, 0)
     }
     if moderation_approval(st, req, now) { << json_resp(204, "") }
-    if links == PUBLIC_LINK_REVIEW { << queue_publication_review(st, req, now, "external_url") }
+    if links == PUBLIC_LINK_REVIEW { << queue_publication_review(st, req, now, "external_url", "medium") }
     existing := lookup_existing_review(st, req, now)
     if existing.status != 0 { << existing }
     << json_resp(200, "{}")
 }
 
-pub fn queue_publication_review(st $&State, req &HttpReq, now int, source string) HttpResp {
+pub fn queue_publication_review(st $&State, req &HttpReq, now int, source string, priority string) HttpResp {
     existing_resp := lookup_existing_review(st, req, now)
     if existing_resp.status != 0 {
         << existing_resp
@@ -343,7 +385,8 @@ pub fn queue_publication_review(st $&State, req &HttpReq, now int, source string
     input := json_str_or(&doc, doc.get(doc.root(), "text"), "")
     aid := strings.trim_space(&req.header("X-Agent-Id"))
     path := path_only(req.path())
-    body := "{\"source\":" + json.quote(&source) + ",\"agent_id\":" + json.quote(&aid) + ",\"target\":" + json.quote(&path) +
+    body := "{\"source\":" + json.quote(&source) + ",\"priority\":" + json.quote(&priority) +
+        ",\"agent_id\":" + json.quote(&aid) + ",\"target\":" + json.quote(&path) +
         ",\"review_key\":" + json.quote(&key) + ",\"text\":" + json.quote(&input) +
         ",\"created_at\":" + strconv.itoa(now) + "}\n"
     id := save_report(st, date + "", &body)

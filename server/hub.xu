@@ -1143,11 +1143,12 @@ pub fn hub_loop(hub_init HubState, jobs chan HubJob) {
         }
 
         $resp := json_resp(200, "{}")
-        if job.flag == MODERATION_FLAG {
+        priority := moderation_verdict_priority(job.flag)
+        if priority.len > 0 {
             resp = dispatch_http($&hub, &job.req, now, true, false)
             if resp.status == 200 {
                 consume_request_replay($&hub.st, &job.req, now)
-                resp = queue_publication_review($&hub.st, &job.req, now, "ai")
+                resp = queue_publication_review($&hub.st, &job.req, now, "ai", priority)
             }
         } else if job.flag == MODERATION_UNAVAILABLE {
             resp = err_resp(503, "ERR_MODERATION_UNAVAILABLE", "public content moderation unavailable", 5, 0, 0)

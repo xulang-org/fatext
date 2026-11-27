@@ -119,6 +119,9 @@ class Classifier(BaseHTTPRequestHandler):
         text = data["input"]
         self.seen.append((data["model"], text))
         payload = {"results": [{"flagged": text.startswith("Review fixture")}]}
+        for label, score in (("low", 0.35), ("medium", 0.7), ("high", 0.9)):
+            if text == f"Review fixture scored {label}":
+                payload["results"][0]["category_scores"] = {"fixture": score, "other-fixture": 0.1}
         if text.startswith("Invalid classifier fixture"):
             payload = {"results": [{}]}
         body = json.dumps(payload).encode()
@@ -272,6 +275,8 @@ def main():
             "FATEXT_PUBLIC_POSTING": "invite",
             "FATEXT_MODERATION_RETENTION_DAYS": "2",
             "FATEXT_AI_MODERATION_REQUIRED": "1",
+            "FATEXT_AI_MODERATION_MEDIUM_SCORE": "70",
+            "FATEXT_AI_MODERATION_HIGH_SCORE": "90",
             "FATEXT_PUBLIC_LINK_HOSTS": " Docs.Example.Test , blocked.example.test",
             "FATEXT_PUBLIC_BLOCKED_LINK_HOSTS": " Blocked.Example.Test ",
             "FATEXT_AI_MODERATION_URL": f"http://127.0.0.1:{provider.server_port}/classify",
@@ -362,13 +367,20 @@ def main():
             assert publish(alice, replies, approved_link_text)[0] == 201
 
             assert publish(bob, POSTS, "Invalid classifier fixture")[0] == 503
+            for priority in ("low", "medium", "high"):
+                status, scored = publish(bob, replies, f"Review fixture scored {priority}")
+                assert status == 422 and scored["error"]["code"] == "ERR_CONTENT_REVIEW"
+                case_detail = admin("GET", f"{MOD}/reports?date={date}&receipt={scored['receipt']}")
+                assert case_detail["priority"] == priority and case_detail["decision"]["status"] == "pending"
+                filtered = admin("GET", f"{MOD}/reports?date={date}&status=pending&priority={priority}")
+                assert scored["receipt"] in filtered["receipts"]
             reply = "Review fixture for supervised publication"
             status, pending = publish(bob, replies, reply)
             assert status == 422 and pending["error"]["code"] == "ERR_CONTENT_REVIEW", (status, pending)
             assert reply.encode() not in request("GET", f"/t/{root}.jsonl")[2]
             receipt = pending["receipt"]
             ai_report = admin("GET", f"{MOD}/reports?date={date}&receipt={receipt}")
-            assert ai_report["source"] == "ai" and ai_report["text"] == reply
+            assert ai_report["source"] == "ai" and ai_report["text"] == reply and ai_report["priority"] == "medium"
             assert signed_get(bob, review_path(pending))[1]["status"] == "pending"
             assert signed_get(alice, review_path(pending))[0] == 404
             stream_path = "/v1/stream"
@@ -444,13 +456,20 @@ def main():
             assert status == 201, (status, out)
             report = admin("GET", f"{MOD}/reports?date={date}&receipt={out['receipt']}")
             assert report["msg_id"] == root and report["source"] == "public" and report["reason"] == "unsafe-link"
+            assert report["priority"] == "medium"
             assert report["status_token_hash"] == hashlib.sha256(out["token"].encode()).hexdigest()
+            assert admin("PUT", f"{MOD}/reports/{date}/{out['receipt']}/priority", {
+                "priority": "high", "reason": "verified-link",
+            }) == {"priority": "high"}
+            urgent = f"{MOD}/reports?date={date}&status=pending&priority=high"
+            assert out["receipt"] in admin("GET", urgent)["receipts"]
             status_path = "/v1/reports/status"
             assert submit("POST", status_path, json.dumps({**out, "token": "0" * 64}).encode(), {})[0] == 404
             assert submit("POST", status_path, json.dumps(out).encode(), {})[1]["status"] == "pending"
             admin("PUT", f"{MOD}/reports/{date}/{out['receipt']}", {"action": "dismissed", "reason": "insufficient"})
             done_status, done = submit("POST", status_path, json.dumps(out).encode(), {})
             assert done_status == 200 and done["status"] == "dismissed" and "details" not in done
+            assert out["receipt"] not in admin("GET", urgent)["receipts"]
             assert submit("POST", status_path, json.dumps(pending).encode(), {})[0] == 404
 
             signed_body = json.dumps(fields).encode()

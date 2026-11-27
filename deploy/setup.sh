@@ -77,6 +77,8 @@ FATEXT_TEMPLATES_DIR=/opt/fatext/templates
 FATEXT_DL_DIR=/var/lib/fatext/dl
 # Public-content AI moderation. Set the API key in this protected file.
 FATEXT_AI_MODERATION_MODEL=omni-moderation-latest
+# FATEXT_AI_MODERATION_MEDIUM_SCORE=80
+# FATEXT_AI_MODERATION_HIGH_SCORE=95
 # FATEXT_PUBLIC_LINK_HOSTS=docs.example.org,status.example.org
 # FATEXT_PUBLIC_BLOCKED_LINK_HOSTS=blocked.example.org
 # FATEXT_AI_MODERATION_API_KEY=
