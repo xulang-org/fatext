@@ -2,9 +2,17 @@
 set -euo pipefail
 umask 022
 
-# Bootstrap fatext-server on Linux with built-in ACME Auto-TLS (no Caddy or certbot required).
+# Bootstrap fatext-server on Linux:
+#   - Default: built-in ACME Auto-TLS (no Caddy or certbot required)
+#   - --tunnel: loopback HTTP behind Cloudflare Tunnel (origin-hidden / DDoS-protected)
 # Usage (as root):
-#   sudo bash deploy/setup.sh [DOMAIN] [ACME_EMAIL]
+#   sudo bash deploy/setup.sh [--tunnel] [DOMAIN] [ACME_EMAIL]
+
+TUNNEL_MODE=0
+if [[ "${1:-}" == "--tunnel" ]]; then
+  TUNNEL_MODE=1
+  shift
+fi
 
 DOMAIN="${1:-fatext.com}"
 ACME_EMAIL="${2:-}"
@@ -17,7 +25,11 @@ else
 fi
 
 if [[ $EUID -ne 0 ]]; then
-  echo "Run as root (e.g. sudo bash deploy/setup.sh $DOMAIN $ACME_EMAIL)" >&2
+  if [[ "$TUNNEL_MODE" == 1 ]]; then
+    echo "Run as root (e.g. sudo bash deploy/setup.sh --tunnel $DOMAIN)" >&2
+  else
+    echo "Run as root (e.g. sudo bash deploy/setup.sh $DOMAIN $ACME_EMAIL)" >&2
+  fi
   exit 1
 fi
 
@@ -46,6 +58,8 @@ install -m 0755 "$REPO_ROOT/deploy/restore.sh" /opt/fatext/deploy/restore.sh
 install -m 0755 "$REPO_ROOT/deploy/graceful_stop.sh" /opt/fatext/deploy/graceful_stop.sh
 install -m 0755 "$REPO_ROOT/deploy/sync_dl.sh" /opt/fatext/deploy/sync_dl.sh
 install -m 0644 "$REPO_ROOT/deploy/webhook_signer.py" /opt/fatext/deploy/webhook_signer.py
+install -m 0644 "$REPO_ROOT/deploy/cloudflared.yml.example" /opt/fatext/deploy/cloudflared.yml.example
+install -m 0644 "$REPO_ROOT/deploy/fatext-tunnel.conf.example" /opt/fatext/deploy/fatext-tunnel.conf.example
 install -m 0644 "$REPO_ROOT/scripts/analyze_logs.py" /opt/fatext/scripts/analyze_logs.py
 
 if [[ -x "$REPO_ROOT/build/fatext-server" ]]; then
@@ -60,7 +74,49 @@ if [[ ! -f /etc/fatext/fatext.env ]]; then
   ADMIN_SECRET="$(openssl rand -hex 32)"
   (
     umask 077
-    cat >/etc/fatext/fatext.env <<EOF
+    if [[ "$TUNNEL_MODE" == 1 ]]; then
+      cat >/etc/fatext/fatext.env <<EOF
+FATEXT_ADDR=127.0.0.1:8080
+FATEXT_PUBLIC_HOST=${DOMAIN}
+# Loopback HTTP mode behind Cloudflare Tunnel (see /etc/systemd/system/fatext.service.d/tunnel.conf).
+# For direct native TLS without a tunnel, switch to FATEXT_ADDR=0.0.0.0:443 and set FATEXT_ACME_DOMAINS.
+FATEXT_DATA_DIR=/var/lib/fatext
+FATEXT_WWW_DIR=/opt/fatext/www
+FATEXT_TEMPLATES_DIR=/opt/fatext/templates
+FATEXT_DL_DIR=/var/lib/fatext/dl
+# Public-content AI moderation. Set the API key in this protected file.
+FATEXT_AI_MODERATION_MODEL=omni-moderation-latest
+# FATEXT_AI_MODERATION_WORKERS=12
+# FATEXT_AI_MODERATION_MEDIUM_SCORE=80
+# FATEXT_AI_MODERATION_HIGH_SCORE=95
+# FATEXT_MODERATION_RETENTION_DAYS=30
+# FATEXT_DAILY_FRIEND_REQUESTS=20
+# FATEXT_PUBLIC_LINK_HOSTS=docs.example.org,status.example.org
+# FATEXT_PUBLIC_BLOCKED_LINK_HOSTS=blocked.example.org
+# FATEXT_AI_MODERATION_API_KEY=
+# FATEXT_AI_MODERATION_URL=https://api.openai.com/v1/moderations
+FATEXT_POW_BITS=20
+FATEXT_IP_RPM=600
+FATEXT_MAX_CONNS=4096
+FATEXT_MAX_CONNS_PER_IP=0
+FATEXT_MAX_SSE=2048
+FATEXT_MAX_SSE_PER_AGENT=8
+FATEXT_DRAIN_MS=300
+FATEXT_LOG_DIR=/var/lib/fatext/logs
+FATEXT_LOG_RETENTION_DAYS=30
+FATEXT_SLOW_MS=200
+FATEXT_METRICS_INTERVAL_SEC=60
+FATEXT_LOG_STDOUT=1
+FATEXT_TRUST_PROXY=1
+FATEXT_PROXY_HEADER=cf
+# Restrict /internal/metrics & /internal/admin/* to loopback (127.0.0.1 / ::1); set 0 to scrape remotely:
+FATEXT_ADMIN_LOCAL_ONLY=1
+FATEXT_MAIL_INTERNAL_SECRET=${SECRET}
+FATEXT_SHUTDOWN_SECRET=${SHUTDOWN_SECRET}
+FATEXT_ADMIN_SECRET=${ADMIN_SECRET}
+EOF
+    else
+      cat >/etc/fatext/fatext.env <<EOF
 FATEXT_ADDR=0.0.0.0:443
 FATEXT_HTTP_REDIRECT_ADDR=0.0.0.0:80
 FATEXT_PUBLIC_HOST=${DOMAIN}
@@ -109,6 +165,7 @@ FATEXT_MAIL_INTERNAL_SECRET=${SECRET}
 FATEXT_SHUTDOWN_SECRET=${SHUTDOWN_SECRET}
 FATEXT_ADMIN_SECRET=${ADMIN_SECRET}
 EOF
+    fi
   )
   chmod 0600 /etc/fatext/fatext.env
   echo "Created /etc/fatext/fatext.env (generated mail, shutdown & admin secrets)."
@@ -128,15 +185,35 @@ install -m 0644 "$REPO_ROOT/deploy/fatext-backup.timer" /etc/systemd/system/fate
 install -m 0644 "$REPO_ROOT/deploy/fatext-log-report.service" /etc/systemd/system/fatext-log-report.service
 install -m 0644 "$REPO_ROOT/deploy/fatext-log-report.timer" /etc/systemd/system/fatext-log-report.timer
 install -m 0644 "$REPO_ROOT/deploy/fatext-webhook-signer.socket" "$REPO_ROOT/deploy/fatext-webhook-signer@.service" /etc/systemd/system/
-systemctl daemon-reload
-systemctl enable fatext.service fatext-backup.timer fatext-log-report.timer fatext-webhook-signer.socket
+if [[ "$TUNNEL_MODE" == 1 ]]; then
+  install -d -m 0755 /etc/systemd/system/fatext.service.d
+  install -m 0644 "$REPO_ROOT/deploy/fatext-tunnel.conf.example" /etc/systemd/system/fatext.service.d/tunnel.conf
+  systemctl daemon-reload
+  systemctl enable fatext.service fatext-backup.timer fatext-log-report.timer
+else
+  systemctl daemon-reload
+  systemctl enable fatext.service fatext-backup.timer fatext-log-report.timer fatext-webhook-signer.socket
+fi
 
 chmod 0700 /var/lib/fatext/acme
 
-echo "Setup complete (built-in ACME Auto-TLS enabled for ${ACME_DOMAINS})."
-echo "Ensure DNS A/AAAA records for ${ACME_DOMAINS} point to this host and ports 80/443 are open."
-echo "Next:"
-echo "  1. Set FATEXT_AI_MODERATION_API_KEY in /etc/fatext/fatext.env (required when FATEXT_AI_MODERATION_REQUIRED=1 for public channels)."
-echo "  2. Run: python3 $REPO_ROOT/scripts/init_official.py --data-dir /var/lib/fatext --out-dir /etc/fatext"
-echo "  3. Start service (automatically issues & renews TLS cert with zero downtime): systemctl start fatext fatext-backup.timer fatext-log-report.timer fatext-webhook-signer.socket && systemctl status fatext"
-echo "  4. Publish signed CLI binaries: bash /opt/fatext/deploy/sync_dl.sh latest /var/lib/fatext/dl https://${DOMAIN}/k/ftx_fatextoffice.pem"
+if [[ "$TUNNEL_MODE" == 1 ]]; then
+  echo "Setup complete (Cloudflare Tunnel loopback HTTP mode for ${DOMAIN})."
+  echo "Next:"
+  echo "  1. If migrating an existing host, disable direct outbound webhooks and update /etc/fatext/fatext.env (FATEXT_ADDR=127.0.0.1:8080, FATEXT_TRUST_PROXY=1, FATEXT_PROXY_HEADER=cf, FATEXT_MAX_CONNS_PER_IP=0):"
+  echo "     systemctl disable --now fatext-webhook-signer.socket || true"
+  echo "  2. Set FATEXT_AI_MODERATION_API_KEY in /etc/fatext/fatext.env (required when FATEXT_AI_MODERATION_REQUIRED=1 for public channels)."
+  echo "  3. Run: python3 $REPO_ROOT/scripts/init_official.py --data-dir /var/lib/fatext --out-dir /etc/fatext"
+  echo "  4. Start origin & verify loopback health: systemctl restart fatext fatext-backup.timer fatext-log-report.timer && curl -fsS http://127.0.0.1:8080/health"
+  echo "  5. Configure and start cloudflared using /opt/fatext/deploy/cloudflared.yml.example (keeps /internal/mail/ingest reachable and blocks other /internal/* paths)."
+  echo "  6. Switch ${DOMAIN} / www.${DOMAIN} DNS to proxied Tunnel CNAMEs, close public inbound ports 80/443 on the host firewall, and rotate the origin public IP if previously exposed."
+  echo "  7. Publish signed CLI binaries: bash /opt/fatext/deploy/sync_dl.sh latest /var/lib/fatext/dl https://${DOMAIN}/k/ftx_fatextoffice.pem"
+else
+  echo "Setup complete (built-in ACME Auto-TLS enabled for ${ACME_DOMAINS})."
+  echo "Ensure DNS A/AAAA records for ${ACME_DOMAINS} point to this host and ports 80/443 are open."
+  echo "Next:"
+  echo "  1. Set FATEXT_AI_MODERATION_API_KEY in /etc/fatext/fatext.env (required when FATEXT_AI_MODERATION_REQUIRED=1 for public channels)."
+  echo "  2. Run: python3 $REPO_ROOT/scripts/init_official.py --data-dir /var/lib/fatext --out-dir /etc/fatext"
+  echo "  3. Start service (automatically issues & renews TLS cert with zero downtime): systemctl start fatext fatext-backup.timer fatext-log-report.timer fatext-webhook-signer.socket && systemctl status fatext"
+  echo "  4. Publish signed CLI binaries: bash /opt/fatext/deploy/sync_dl.sh latest /var/lib/fatext/dl https://${DOMAIN}/k/ftx_fatextoffice.pem"
+fi

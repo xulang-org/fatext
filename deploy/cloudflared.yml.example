@@ -1,16 +1,39 @@
-# Local HTTP backend example. Requires FATEXT_TLS_REQUIRED=0 on a loopback-only
-# Fatext process. Set FATEXT_TRUST_PROXY=1 and FATEXT_PROXY_HEADER=cf on fatext-server
-# so rate limiting and logs use CF-Connecting-IP instead of 127.0.0.1.
-# Production tunnels should verify the Fatext origin over HTTPS.
+# Local HTTP backend example for Cloudflare Tunnel (origin-hidden / DDoS-protected).
+#
+# Required fatext-server origin settings (configured automatically by `deploy/setup.sh --tunnel`):
+#   - FATEXT_ADDR=127.0.0.1:8080
+#   - FATEXT_TLS_REQUIRED=0 (via /etc/systemd/system/fatext.service.d/tunnel.conf)
+#   - FATEXT_TRUST_PROXY=1 and FATEXT_PROXY_HEADER=cf (uses CF-Connecting-IP from 127.0.0.1)
+#   - FATEXT_MAX_CONNS_PER_IP=0 (all tunnel connections arrive from 127.0.0.1)
+#   - FATEXT_WEBHOOK_SIGNER_SOCKET= (disable direct outbound webhooks so untrusted webhook URLs
+#     cannot probe/leak the origin IP; SSE and encrypted mail remain active)
+#
+# Required Cloudflare Zone settings:
+#   - Email Address Obfuscation: OFF (pages use strict CSP: default-src 'none')
+#   - Browser Integrity Check: OFF (do not challenge fatext-cli HTTP/SSE clients)
+#   - Edge HSTS: ON, Minimum TLS Version: 1.2+
+#   - Do NOT cache public feeds/threads/archives at the edge
 
 tunnel: fatext-tunnel
 credentials-file: /etc/cloudflared/fatext-tunnel.json
 
 ingress:
   - hostname: fatext.com
+    path: ^/internal/mail/ingest$
+    service: http://127.0.0.1:8080
+    originRequest:
+      noHappyEyeballs: true
+  - hostname: fatext.com
     path: ^/internal/
     service: http_status:403
   - hostname: fatext.com
+    service: http://127.0.0.1:8080
+    originRequest:
+      noHappyEyeballs: true
+  - hostname: www.fatext.com
+    path: ^/internal/
+    service: http_status:403
+  - hostname: www.fatext.com
     service: http://127.0.0.1:8080
     originRequest:
       noHappyEyeballs: true
