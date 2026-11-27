@@ -139,7 +139,12 @@ fn render_base_html(st &State, title string, desc string, canonical string, acti
 fn render_pin_html(st $&State, pin &PinEntry, rec &PostRecord) string {
     tpl := load_tpl(st, "partials/pin.html")
     $pclass := ""
-    if pin.pin_type == "sponsored" { pclass = " pin-sponsored" }
+    $label := "ANNOUNCEMENT"
+    if pin.pin_type == "sponsored" {
+        pclass = " pin-sponsored"
+        label = "SPONSORED"
+    }
+    if pin.label.len > 0 && pin.label != label { label = label + " · " + pin.label }
     $exp_note := ""
     if pin.expires_at > 0 {
         exp_note = " <span class=\"muted\">· expires " + esc(&utc_human_from_unix(pin.expires_at)) + "</span>"
@@ -149,7 +154,7 @@ fn render_pin_html(st $&State, pin &PinEntry, rec &PostRecord) string {
     keys := ["pin_class", "label", "author_href", "author_name", "sender_id",
         "iso_time", "human_time", "expires_note", "text", "thread_href",
         "reply_count", "msg_id", "key_version", "ts", "channel", "sig_full"]
-    vals := [pclass, esc(&pin.label), "/a/" + esc(&rec.sender_id), esc(&aname), esc(&rec.sender_id),
+    vals := [pclass, esc(&label), "/a/" + esc(&rec.sender_id), esc(&aname), esc(&rec.sender_id),
         esc(&utc_iso_from_unix(rec.ts)), esc(&utc_human_from_unix(rec.ts)), exp_note, esc(&rec.text),
         "/t/" + esc(&rec.msg_id), strconv.itoa(rcnt), esc(&rec.msg_id),
         strconv.itoa(rec.key_version), strconv.itoa(rec.ts), esc(&rec.channel), esc(&rec.sig)]
@@ -200,9 +205,9 @@ fn build_pins_section(st $&State, ch string, now int) string {
     $cards := ""
     for i in 0:pins.len {
         if !public_message_visible(st, pins[i].msg_id + "") { -> }
-        recs := read_jsonl_records(thread_path(st, pins[i].msg_id + ""))
-        if recs.len > 0 {
-            cards = cards + render_pin_html(st, &pins[i], &recs[0])
+        root := read_thread_root(st, pins[i].msg_id + "")
+        if root.msg_id == pins[i].msg_id && root.public_body_ok {
+            cards = cards + render_pin_html(st, &pins[i], &root)
         }
     }
     if cards.len == 0 { << "" }
@@ -438,7 +443,7 @@ pub fn serve_thread(st $&State, msg_id string) HttpResp {
         << serve_error_html(st, 404, "ERR_NOT_FOUND", "Thread not found.")
     }
     recs := read_public_post_records(st, thread_path(st, msg_id + ""))
-    if recs.len == 0 {
+    if recs.len == 0 || recs[0].msg_id != msg_id {
         << serve_error_html(st, 404, "ERR_NOT_FOUND", "Thread " + msg_id + " does not exist.")
     }
     root := &recs[0]

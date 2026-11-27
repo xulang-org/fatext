@@ -440,7 +440,7 @@ def main() -> int:
             # Pins upsert + GET /v1/channels/general/pins + delete
             st_pin, _, _ = http_req(
                 port, "POST", "/internal/admin/pins",
-                body=json.dumps({"msg_id": msg_id, "channels": ["general"], "pin_type": "official", "label": "Pinned!", "priority": 99}).encode("utf-8"),
+                body=json.dumps({"msg_id": msg_id, "channels": ["general"], "pin_type": "sponsored", "label": "Pinned!", "priority": 99}).encode("utf-8"),
                 headers={"X-Fatext-Admin-Secret": ADMIN_SECRET},
             )
             assert_eq(st_pin, 200, "upsert pin 200")

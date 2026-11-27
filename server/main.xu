@@ -510,7 +510,7 @@ fn handle_connection(fd int, req_seq int, peer_ip string, rcfg ConnRuntimeCfg, s
 
 fn submit_http_request(req HttpReq, jobs chan HubJob, job_tokens chan string, queue_timeout_ms int, reply_ch chan HubReply, ai_moderation bool, moderation_pool ModerationPool) HubReply {
     $verdict := 0
-    if ai_moderation && is_public_write(&req) {
+    if is_public_write(&req) {
         probe := HttpReq{req_method: req.method(), req_path: req.path(), req_body: req.body(),
             hdr_names: clone_str_slice(&req.hdr_names), hdr_vals: clone_str_slice(&req.hdr_vals),
             remote_ip: req.remote_ip + "", peer_ip: req.peer_ip + ""}
@@ -523,12 +523,12 @@ fn submit_http_request(req HttpReq, jobs chan HubJob, job_tokens chan string, qu
         release_job_token(job_tokens)
         if checked.resp.status == 204 {
             verdict = MODERATION_REVIEWED
-        } else if checked.resp.status == 200 {
+        } else if checked.resp.status != 200 {
+            << checked
+        } else if ai_moderation {
             payload := json.parse(&req.req_body)
             value := json_str_or(&payload, payload.get(payload.root(), "text"), "")
             verdict = get_moderation_verdict(&moderation_pool, value)
-        } else {
-            << checked
         }
     }
     if !acquire_job_token(job_tokens, queue_timeout_ms) {
@@ -686,8 +686,17 @@ fn metrics_ticker_loop(interval_sec int, jobs chan HubJob) {
     }
 }
 
-fn ignore_sigpipe_quiet() {
-    _ := signal.ignore(signal.SIGPIPE) or (err) { << }
+extern "C" {
+    fn libc_signal(sig c_int, handler c_ptr) c_ptr = "signal"
+}
+
+fn ignore_sigpipe() bool {
+    // Xu 0.14.1's signal.ignore does not install a POSIX handler.
+    // SIG_IGN is the pointer value 1 on the supported Linux and macOS targets.
+    unsafe {
+        previous := libc_signal(i32(signal.SIGPIPE), c_ptr(1))
+        << int(previous) != -1
+    }
 }
 
 fn watch_signal_quiet(ch chan int, sig int) {
@@ -758,7 +767,10 @@ fn flush_logs_before_exit(log_ch chan string, flush_done chan int) {
 }
 
 fn main() int {
-    ignore_sigpipe_quiet()
+    if !ignore_sigpipe() {
+        println("fatext-server: could not ignore SIGPIPE")
+        << 1
+    }
     addr := getenv_or("FATEXT_ADDR", "127.0.0.1:8080")
     data_dir := getenv_or("FATEXT_DATA_DIR", "/var/lib/fatext")
     www_dir := getenv_or("FATEXT_WWW_DIR", "./www")
@@ -920,6 +932,7 @@ fn main() int {
     xu acme_chal_loop(chal_ch)
 
     $st := new_state(addr + "", data_dir + "", www_dir + "", tpl_dir + "", dl_dir + "", pow_bits, mail_secret + "", ip_rpm)
+    fresh_public := fresh_public_store(&st)
     init_state($&st)
     moderation_retention_days := getenv_int_or("FATEXT_MODERATION_RETENTION_DAYS", 30)
     if moderation_retention_days < 1 || moderation_retention_days > 3650 {
@@ -933,7 +946,8 @@ fn main() int {
         << 1
     }
     st.daily_friend_req_limit = daily_friend_reqs
-    init_public_moderation($&st, getenv_or("FATEXT_PUBLIC_POSTING", "open"))
+    init_public_moderation($&st, getenv_or("FATEXT_PUBLIC_POSTING", "open"), fresh_public)
+    if !st.public_visibility_ready { println("fatext-server: public reads and writes paused; recover moderation/hidden.json and check recovery-required") }
 
     $ch_names := []string{}
     for ci in 0:st.channels.len {
@@ -977,10 +991,22 @@ fn main() int {
         println("fatext-server: FATEXT_AI_MODERATION_WORKERS must be 1..64")
         << 1
     }
+    moderation_levels := load_moderation_levels() or (err) {
+        println("fatext-server: " + err.msg())
+        << 1
+    }
+    st.public_link_hosts = parse_public_link_hosts(&os.getenv("FATEXT_PUBLIC_LINK_HOSTS"), "FATEXT_PUBLIC_LINK_HOSTS") or (err) {
+        println("fatext-server: " + err.msg())
+        << 1
+    }
+    st.public_blocked_link_hosts = parse_public_link_hosts(&os.getenv("FATEXT_PUBLIC_BLOCKED_LINK_HOSTS"), "FATEXT_PUBLIC_BLOCKED_LINK_HOSTS") or (err) {
+        println("fatext-server: " + err.msg())
+        << 1
+    }
     moderation_pool := ModerationPool{jobs: chan ModerationJob{cap: mod_workers}, slots: chan int{cap: mod_workers}}
     if ai_moderation {
         for worker in 0:mod_workers {
-            xu moderation_worker(moderation_pool.jobs, ai_endpoint + "", ai_key + "", ai_model + "")
+            xu moderation_worker(moderation_pool.jobs, ai_endpoint + "", ai_key + "", ai_model + "", moderation_levels)
         }
     }
 

@@ -155,9 +155,12 @@ pub fn normalize_pem(pem_str &string) string {
 }
 
 pub fn new_ulid() string {
-    b32 := "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
-    ms := time.now_time().unix_milli()
     rnd := rand.read(10) or >>
+    << encode_ulid(time.now_time().unix_milli(), &rnd)
+}
+
+fn encode_ulid(ms int, rnd &string) string {
+    b32 := "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
     $out := ""
     // 48-bit timestamp in 10 Crockford base32 characters (2 leading zero bits)
     $shift := 45

@@ -49,11 +49,15 @@ if [[ ( -n "${FATEXT_TLS_CERT:-}" && -n "${FATEXT_TLS_KEY:-}" ) || -n "${FATEXT_
   fi
 fi
 
-curl -q -fsS "${CURL_ARGS[@]}" -X POST -K - \
-  --max-time 5 \
-  "$URL" >/dev/null 2>&1 <<EOF || exit 0
+curl_rc=0
+result=$(curl -q -fsS "${CURL_ARGS[@]}" -X POST -K - \
+  --max-time 5 -o /dev/null --write-out 'http=%{http_code} tls_verify=%{ssl_verify_result}' \
+  "$URL" <<EOF
 header = "X-Fatext-Shutdown-Secret: ${SECRET}"
 EOF
+) || curl_rc=$?
+echo "fatext stop: curl=$curl_rc $result" >&2
+if [[ "$curl_rc" != 0 ]]; then exit 0; fi
 
 if [[ -n "${MAINPID:-}" && "${MAINPID}" =~ ^[0-9]+$ ]]; then
   for _ in $(seq 1 50); do

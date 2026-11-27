@@ -1,0 +1,134 @@
+@main
+
+#errors
+#maps
+#net/url
+#strings
+
+fn non_ascii(r int) bool {
+    << r > 127
+}
+
+pub fn parse_public_link_hosts(raw &string, setting string) maps.StrInt {
+    $hosts := maps.new_str_int()
+    entries := strings.split(raw, ",")
+    for i in 0:entries.len {
+        entry := strings.trim_space(&entries[i])
+        host := strings.to_lower(&entry)
+        if host.len == 0 { -> }
+        if strings.contains_func(&entry, non_ascii) || !is_valid_acme_domain(&host) {
+            >> errors.new(setting + " expects comma-separated DNS hostnames")
+        }
+        hosts.set(host, 1)
+    }
+    << hosts
+}
+
+// Grant an exception only to a complete HTTPS token with an exact configured
+// authority and a simple path. Ambiguous syntax goes through human review.
+fn trusted_public_link(token &string, hosts &maps.StrInt) bool {
+    if hosts.len() == 0 || !strings.has_prefix(token, "https://") { << false }
+    rest := token[8:token.len] + ""
+    if strings.contains(&rest, "//") { << false }
+    $end := strings.index_of(&rest, "/")
+    if end < 0 { end = rest.len }
+    if !hosts.has(rest[0:end] + "") { << false }
+    for i in end:rest.len {
+        c := rest[i] & 255
+        if !is_lower_alnum(c) && c != 47 && c != 45 && c != 46 && c != 95 && c != 126 { << false }
+    }
+    << true
+}
+
+fn looks_like_public_link(word &string) bool {
+    if strings.contains(word, "//") || strings.contains(word, "http:") || strings.contains(word, "https:") ||
+       strings.contains(word, "www.") || strings.has_prefix(word, "javascript:") ||
+       strings.has_prefix(word, "file:") || strings.has_prefix(word, "data:") { << true }
+    // Common bare domains, internationalized labels and dotted IPv4 literals.
+    $numeric_dots := 0
+    for i in 1:word.len {
+        c := word[i] & 255
+        if c >= 48 && c <= 57 { -> }
+        if c == 46 && i + 1 < word.len {
+            prev := word[i - 1] & 255
+            next := word[i + 1] & 255
+            if (is_lower_alnum(prev) || prev >= 128) && ((next >= 97 && next <= 122) || next >= 128) { << true }
+            if prev >= 48 && prev <= 57 && next >= 48 && next <= 57 {
+                numeric_dots += 1
+                if numeric_dots >= 3 { << true }
+                ->
+            }
+        }
+        numeric_dots = 0
+    }
+    << false
+}
+
+fn normalize_domain_dots(s &string) string {
+    << strings.replace_all(&strings.replace_all(&strings.replace_all(s, "．", "."), "。", "."), "｡", ".")
+}
+
+fn link_punctuation(r int) bool {
+    << strings.contains_rune(&"[]{}<>\"`，；：（）《》「」、！？", r)
+}
+
+// Examine the authority only. A blocked name in an ordinary URL path or
+// query is not its destination. Use the last @ to skip optional user info.
+fn public_link_host(piece &string) string {
+    candidate := strings.trim_left(piece, "('!,;")
+    $start := 0
+    scheme := strings.index_of(&candidate, "://")
+    first_sep := strings.index_any(&candidate, "/?#\\")
+    if scheme >= 0 && first_sep == scheme + 1 {
+        start = scheme + 3
+    } else if strings.has_prefix(&candidate, "//") {
+        start = 2
+    }
+    rest := candidate[start:candidate.len]
+    $end := strings.index_any(&rest, "/?#\\")
+    if end < 0 { end = rest.len }
+    authority := rest[0:end]
+    after_user := strings.last_index(&authority, "@") + 1
+    host_port := authority[after_user:authority.len]
+    $port := strings.index_of(&host_port, ":")
+    if port < 0 { port = host_port.len }
+    host_text := host_port[0:port]
+    decoded := url.path_unescape(&host_text) or (err) { << "" }
+    << strings.trim_right(&normalize_domain_dots(&strings.to_lower(&decoded)), ".)',;!")
+}
+
+fn blocked_link_host(host &string, blocked &maps.StrInt) bool {
+    if host.len == 0 || host.len > 253 { << false }
+    if blocked.has(*host + "") { << true }
+    for i in 0:host.len {
+        if host[i] == 46 && blocked.has(host[(i + 1):host.len]) { << true }
+    }
+    << false
+}
+
+pub const PUBLIC_LINK_ALLOW = 0
+pub const PUBLIC_LINK_REVIEW = 1
+pub const PUBLIC_LINK_BLOCK = 2
+
+pub fn public_link_policy(text &string, trusted &maps.StrInt, blocked &maps.StrInt) int {
+    $decision := PUBLIC_LINK_ALLOW
+    words := strings.fields(text)
+    for i in 0:words.len {
+        token := strings.to_lower(&words[i])
+        // Ideographic stops can delimit DNS labels or sentences. Require a
+        // DNS-shaped host before sending ordinary CJK prose for link review.
+        has_stop := strings.contains(&token, "。") || strings.contains(&token, "｡")
+        if has_stop || (blocked.len() > 0 && strings.contains_any(&token, ".%．")) {
+            pieces := strings.fields_func(&token, link_punctuation)
+            for j in 0:pieces.len {
+                host := public_link_host(&pieces[j])
+                if blocked.len() > 0 && blocked_link_host(&host, blocked) { << PUBLIC_LINK_BLOCK }
+                if has_stop && is_valid_acme_domain(&host) { decision = PUBLIC_LINK_REVIEW }
+            }
+        }
+        if trusted_public_link(&token, trusted) && !strings.contains_func(&words[i], non_ascii) { -> }
+        word := strings.replace_all(&token, "．", ".")
+        if looks_like_public_link(&word) { decision = PUBLIC_LINK_REVIEW }
+    }
+    << decision
+}
