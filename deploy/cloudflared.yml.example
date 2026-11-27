@@ -1,5 +1,7 @@
 # Local HTTP backend example. Requires FATEXT_TLS_REQUIRED=0 on a loopback-only
-# Fatext process. Production tunnels should verify the Fatext origin over HTTPS.
+# Fatext process. Set FATEXT_TRUST_PROXY=1 and FATEXT_PROXY_HEADER=cf on fatext-server
+# so rate limiting and logs use CF-Connecting-IP instead of 127.0.0.1.
+# Production tunnels should verify the Fatext origin over HTTPS.
 
 tunnel: fatext-tunnel
 credentials-file: /etc/cloudflared/fatext-tunnel.json

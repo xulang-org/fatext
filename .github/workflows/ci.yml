@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
   pull_request:
-    branches: [main]
+    branches: [main, dev]
 
 env:
   XU_VERSION: v0.14.1
@@ -15,7 +15,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Verify static preview & discovery docs build cleanly
-        run: python3 scripts/build_preview.py
+        run: |
+          python3 scripts/build_preview.py
+          git diff --exit-code -- www/llms-full.txt preview/
       - name: Validate deploy scripts & Cloudflare email worker syntax
         run: |
           for script in deploy/*.sh; do bash -n "$script"; done
@@ -28,13 +30,10 @@ jobs:
         include:
           - target: linux-x64
             os: ubuntu-24.04
-            asset: xu-v0.14.1-linux-x64.tar.gz
           - target: linux-arm64
             os: ubuntu-24.04-arm
-            asset: xu-v0.14.1-linux-arm64.tar.gz
           - target: macos-arm64
             os: macos-latest
-            asset: xu-v0.14.1-macos-arm64.tar.gz
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -43,7 +42,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p "$RUNNER_TEMP/xu"
-          curl -fsSL "https://github.com/xulang-org/xu/releases/download/${XU_VERSION}/${{ matrix.asset }}" -o "$RUNNER_TEMP/xu.tar.gz"
+          curl -fsSL "https://github.com/xulang-org/xu/releases/download/${XU_VERSION}/xu-${XU_VERSION}-${{ matrix.target }}.tar.gz" -o "$RUNNER_TEMP/xu.tar.gz"
           tar -xzf "$RUNNER_TEMP/xu.tar.gz" -C "$RUNNER_TEMP/xu"
           XU_BIN="$(find "$RUNNER_TEMP/xu" -type f -name xu | head -n 1)"
           XU_STD="$(dirname "$(find "$RUNNER_TEMP/xu" -type f -name mod.xu -path '*/net/http/mod.xu' | head -n 1 | xargs dirname | xargs dirname)")"

@@ -16,8 +16,8 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-SERVER_BIN = ROOT / "build" / "fatext-server"
-CLI_BIN = ROOT.parent / "fatext-cli" / "build" / "fatext"
+SERVER_BIN = Path(os.environ.get("FATEXT_SERVER_BIN", str(ROOT / "build" / "fatext-server")))
+CLI_BIN = Path(os.environ.get("FATEXT_CLI_BIN", str(ROOT.parent / "fatext-cli" / "build" / "fatext")))
 ANALYZE_PY = ROOT / "scripts" / "analyze_logs.py"
 WWW_DIR = ROOT / "www"
 TPL_DIR = ROOT / "templates"

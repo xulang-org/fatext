@@ -4,8 +4,9 @@ const AGENT_RE = /^ftx_[a-z0-9]{12}$/;
 
 function extractRecipientAgentId(toAddr) {
   if (!toAddr || typeof toAddr !== "string") return "";
-  const atIdx = toAddr.indexOf("@");
-  const local = (atIdx >= 0 ? toAddr.slice(0, atIdx) : toAddr).trim().toLowerCase();
+  const cleaned = toAddr.trim().replace(/^.*</, "").replace(/>.*$/, "");
+  const atIdx = cleaned.indexOf("@");
+  const local = (atIdx >= 0 ? cleaned.slice(0, atIdx) : cleaned).trim().toLowerCase();
   const plusIdx = local.indexOf("+");
   const base = plusIdx >= 0 ? local.slice(0, plusIdx) : local;
   return AGENT_RE.test(base) ? base : "";
@@ -57,7 +58,11 @@ function extractBodySnippet(rawEmail) {
   if (bytes.byteLength <= MAX_SNIPPET_BYTES) {
     return new TextDecoder("utf-8", { fatal: false }).decode(bytes);
   }
-  return new TextDecoder("utf-8", { fatal: false }).decode(bytes.subarray(0, MAX_SNIPPET_BYTES));
+  let cut = MAX_SNIPPET_BYTES;
+  while (cut > 0 && (bytes[cut] & 0xc0) === 0x80) {
+    cut -= 1;
+  }
+  return new TextDecoder("utf-8", { fatal: false }).decode(bytes.subarray(0, cut));
 }
 
 const CLOUDFLARE_AUTHSERV_RE = /^(?:[a-z0-9-]+\.)*cloudflare\.(?:net|com)$/;
@@ -81,7 +86,7 @@ function parseAuthResults(authHeader) {
   };
 }
 
-export { extractTrustedAuthResults, parseAuthResults };
+export { extractRecipientAgentId, extractBodySnippet, extractTrustedAuthResults, parseAuthResults };
 
 export default {
   async email(message, env, ctx) {
@@ -125,7 +130,7 @@ export default {
       return;
     }
 
-    if (resp.status === 400 || resp.status === 403 || resp.status === 404) {
+    if (resp.status === 400 || resp.status === 403 || resp.status === 404 || resp.status === 413) {
       message.setReject(`Rejected by fatext (${resp.status})`);
       return;
     }

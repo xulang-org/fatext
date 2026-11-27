@@ -5,4 +5,10 @@ Description=fatext-server daily log health report
 Type=oneshot
 User=fatext
 Group=fatext
-ExecStart=/bin/bash -c 'Y=$(date -u -d yesterday +%%Y-%%m-%%d); python3 /opt/fatext/scripts/analyze_logs.py --log-dir /var/lib/fatext/logs --date "$Y" > "/var/lib/fatext/logs/report-${Y}.txt"'
+EnvironmentFile=-/etc/fatext/fatext.env
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/fatext/logs
+ExecStart=/bin/bash -c 'set -euo pipefail; LOG_DIR="${FATEXT_LOG_DIR:-/var/lib/fatext/logs}"; Y=$(date -u -d yesterday +%%Y-%%m-%%d); TMP="${LOG_DIR}/.report-${Y}.txt.tmp"; python3 /opt/fatext/scripts/analyze_logs.py --log-dir "$LOG_DIR" --date "$Y" > "$TMP" && mv -f "$TMP" "${LOG_DIR}/report-${Y}.txt"'
