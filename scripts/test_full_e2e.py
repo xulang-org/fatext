@@ -386,7 +386,7 @@ def run_full_e2e() -> None:
 
             # Hot-reload pins & verify SSR across /, /c/*, /t/*, /a/*, /dl/, /help, .jsonl & .sha256
             (data_dir / "public" / "pins.json").write_text(
-                json.dumps({"pins": [{"msg_id": root_gen, "channels": ["general"], "pin_type": "official", "label": "PINNED_E2E", "priority": 100, "created_at": int(time.time()), "expires_at": int(time.time()) + 3600}]}),
+                json.dumps({"pins": [{"msg_id": root_gen, "channels": ["general"], "pin_type": "sponsored", "label": "PINNED_E2E", "priority": 100, "created_at": int(time.time()), "expires_at": int(time.time()) + 3600}]}),
                 encoding="utf-8",
             )
             time.sleep(1.1)

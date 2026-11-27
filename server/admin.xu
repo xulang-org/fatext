@@ -932,6 +932,9 @@ fn handle_admin_pins_upsert(hub $&HubState, req &HttpReq, now int) HttpResp {
         << err_resp(400, "ERR_BAD_REQUEST", "pin_type must be official or sponsored", 0, 0, 0)
     }
     $def_lbl := "ANNOUNCEMENT"
+    if ptype == "official" && !official_pin_author_verified(&hub.st, mid + "") {
+        << err_resp(422, "ERR_OFFICIAL_AUTHOR_REQUIRED", "official pins require a post signed by ftx_fatextoffice", 0, 0, 0)
+    }
     if ptype == "sponsored" { def_lbl = "SPONSORED" }
     lbl := strings.trim_space(&json_str_or(&doc, doc.get(r, "label"), def_lbl))
     prio := json_int_or(&doc, doc.get(r, "priority"), 10)
@@ -1313,6 +1316,9 @@ pub fn handle_admin_dispatch(hub $&HubState, req &HttpReq, method string, path s
         }
         if parts.len == 3 && parts[0] == "reports" {
             << handle_guest_report_decision(hub, req, parts[1] + "", parts[2] + "", now)
+        }
+        if parts.len == 4 && parts[0] == "reports" && parts[3] == "priority" {
+            << handle_report_priority_admin(hub, req, parts[1] + "", parts[2] + "", now)
         }
         if parts.len == 1 && parts[0] == "reports" {
             << handle_report_admin(&hub.st, req, now)

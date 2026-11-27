@@ -26,21 +26,34 @@ fn is_posting_mode(mode &string) bool {
     << *mode == "readonly" || *mode == "invite" || *mode == "open"
 }
 
-fn load_hidden_messages(path string) string {
+// setup.sh may have installed public/channels.json and pins.json before the
+// first launch. The archive directories and moderation state belong to the server.
+pub fn fresh_public_store(st &State) bool {
+    for suffix in ["/public/threads", "/public/channels", "/moderation", "/keys/revoked.jsonl"] {
+        _ := os.stat(st.data_dir + suffix) or (err) {
+            if os.is_not_exist(err.msg()) { -> }
+            << false
+        }
+        << false
+    }
+    << true
+}
+
+fn load_hidden_messages(path string, fresh bool) string {
     raw := os.read(path + "") or (err) {
-        if !os.is_not_exist(err.msg()) { << "" }
+        if !fresh || !os.is_not_exist(err.msg()) { << "" }
         write_atomic_mode(path + "", &"[]\n", 416) or (write_err) { << "" }
         << "[]"
     }
     << raw
 }
 
-pub fn init_public_moderation(st $&State, default_mode string) {
+pub fn init_public_moderation(st $&State, default_mode string, fresh bool) {
     dir := moderation_dir(st)
     os.mkdir_all(dir + "") or (err) { << }
     if file_exists(dir + "/recovery-required") { << }
 
-    raw := load_hidden_messages(dir + "/hidden.json")
+    raw := load_hidden_messages(dir + "/hidden.json", fresh)
     doc := json.parse(&raw)
     if !doc.ok() || !doc.is_list(doc.root()) { << }
     for i in 0:doc.count(doc.root()) {
@@ -72,37 +85,36 @@ pub fn public_posting_allowed(st &State, aid string) bool {
 }
 
 pub fn public_message_visible(st &State, mid string) bool {
-    << st.public_visibility_ready && !st.hidden_posts.has(mid + "")
+    if !st.public_visibility_ready || !is_valid_msg_id(mid + "") || st.hidden_posts.has(mid + "") { << false }
+    _ := os.stat(thread_path(st, mid + "") + ".publishing") or (err) { << os.is_not_exist(err.msg()) }
+    << false
 }
 
 pub fn read_public_post_records(st &State, path string) []PostRecord {
+    if !st.public_visibility_ready { << []PostRecord{} }
+    raw := read_file_or_empty(path)
+    << public_records(st, &raw)
+}
+
+fn public_records(st &State, raw &string) []PostRecord {
     $out := []PostRecord{}
     if !st.public_visibility_ready { << out }
-    raw := read_file_or_empty(path)
-    lines := strings.split(&raw, "\n")
+    lines := strings.split(raw, "\n")
     for i in 0:lines.len {
         if lines[i].len == 0 { -> }
         rec := parse_post_line(&lines[i])
-        if !is_valid_msg_id(rec.msg_id + "") || !public_message_visible(st, rec.msg_id + "") { -> }
+        if !rec.public_body_ok || !is_valid_msg_id(rec.msg_id + "") || !public_message_visible(st, rec.msg_id + "") { -> }
         out.push(rec)
     }
     << out
 }
 
 pub fn public_archive(st &State, raw &string) string {
-    if !st.public_visibility_ready { << "" }
-    if st.hidden_posts.len() == 0 { << *raw + "" }
-    lines := strings.split(raw, "\n")
-    $visible := []string{}
-    for i in 0:lines.len {
-        if lines[i].len == 0 { -> }
-        record := parse_post_line(&lines[i])
-        if is_valid_msg_id(record.msg_id + "") && public_message_visible(st, record.msg_id + "") {
-            visible.push(lines[i] + "")
-        }
-    }
-    if visible.len == 0 { << "" }
-    << strings.join(visible, "\n") + "\n"
+    rows := public_records(st, raw)
+    $lines := []string{}
+    for i in 0:rows.len { lines.push(rows[i].raw_line + "") }
+    if lines.len == 0 { << "" }
+    << strings.join(lines, "\n") + "\n"
 }
 
 struct PostingAllowlist {
@@ -274,6 +286,7 @@ fn report_html(st &State, status int, detail string, thread string, message stri
             "<p><label>Message ID <input name=\"msg_id\" required maxlength=\"30\" value=\"" + esc(&message) + "\"></label></p>" +
             "<p><label>Reason <select name=\"reason\"><option value=\"privacy\">Privacy</option>" +
             "<option value=\"harassment\">Harassment or threats</option><option value=\"fraud\">Fraud or impersonation</option>" +
+            "<option value=\"unsafe-link\">Phishing or malicious link</option>" +
             "<option value=\"copyright\">Copyright</option><option value=\"other\">Other</option></select></label></p>" +
             "<p><label>Details <textarea name=\"details\" maxlength=\"2000\" rows=\"4\"></textarea></label></p>" +
             "<p>Describe the issue without including passwords or unnecessary personal data.</p>" +
@@ -349,7 +362,7 @@ pub fn handle_public_report(st $&State, req &HttpReq, web bool, now int) HttpRes
     token := mint_report_token()
     if token.len == 0 { << err_resp(503, "ERR_REPORT_UNAVAILABLE", "report storage unavailable", 0, 0, 0) }
     token_hash := sha256.sum256(token + "")
-    body := "{\"source\":\"public\",\"status_token_hash\":" + json.quote(&token_hash) + ",\"thread_id\":" + json.quote(&thread) +
+    body := "{\"source\":\"public\",\"priority\":\"medium\",\"status_token_hash\":" + json.quote(&token_hash) + ",\"thread_id\":" + json.quote(&thread) +
         ",\"msg_id\":" + json.quote(&message) + ",\"reason\":" + json.quote(&reason) +
         ",\"details\":" + json.quote(&details) + ",\"reporter_id\":" + json.quote(&reporter) +
         ",\"created_at\":" + strconv.itoa(now) + "}\n"
@@ -363,6 +376,55 @@ pub fn handle_public_report(st $&State, req &HttpReq, web bool, now int) HttpRes
     out := "{\"receipt\":" + json.quote(&id) + ",\"date\":" + json.quote(&date) +
         ",\"token\":" + json.quote(&token) + "}"
     << http_resp(201, "application/json; charset=utf-8", PUBLIC_CONTENT_CACHE, &out)
+}
+
+fn valid_moderation_priority(priority &string) bool {
+    << *priority == "low" || *priority == "medium" || *priority == "high"
+}
+
+fn report_priority(report &json.Doc) string {
+    priority := json_str_or(report, report.get(report.root(), "priority"), "medium")
+    if valid_moderation_priority(&priority) { << priority }
+    << "medium"
+}
+
+fn report_status(st &State, date string, id string, now int) string {
+    decision := read_case_decision(st, date, id)
+    if decision.status == "approved" && decision.expires_at <= now { << "expired" }
+    << decision.status + ""
+}
+
+pub fn handle_report_priority_admin(hub $&HubState, req &HttpReq, date string, id string, now int) HttpResp {
+    if req.method() != "PUT" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+    if !case_date_retained(&hub.st, &date, now) || !is_receipt_id(&id) {
+        << err_resp(400, "ERR_BAD_REQUEST", "invalid date or receipt", 0, 0, 0)
+    }
+    input := json.parse(&req.req_body)
+    priority := json_str_or(&input, input.get(input.root(), "priority"), "")
+    reason := json_str_or(&input, input.get(input.root(), "reason"), "")
+    if !input.ok() || !valid_moderation_priority(&priority) || !is_valid_tag(&reason) {
+        << err_resp(400, "ERR_BAD_REQUEST", "priority must be low, medium, or high and reason must be a short code", 0, 0, 0)
+    }
+    path := report_path(&hub.st, date, id + "")
+    raw := os.read(path + "") or (err) { << err_resp(404, "ERR_NOT_FOUND", "report not found", 0, 0, 0) }
+    report := json.parse(&raw)
+    root := report.root()
+    if !report.ok() || !report.is_dict(root) { << err_resp(500, "ERR_INTERNAL", "report record is invalid", 0, 0, 0) }
+    if report_priority(&report) != priority {
+        keys := report.dict_keys(root)
+        $fields := ["\"priority\":" + json.quote(&priority)]
+        for i in 0:keys.len {
+            key := keys[i] + ""
+            if key == "priority" { -> }
+            value := json_encode_or(&report, report.get(root, key + ""), "")
+            if value.len == 0 { << err_resp(500, "ERR_INTERNAL", "could not encode report record", 0, 0, 0) }
+            fields.push(json.quote(&key) + ":" + value)
+        }
+        saved := "{" + strings.join(fields, ",") + "}\n"
+        write_atomic_mode(path, &saved, 384) or (err) { << err_resp(500, "ERR_INTERNAL", "could not save report priority", 0, 0, 0) }
+        log_admin_action(hub, req, now, "moderation_priority_" + priority, id + "", reason)
+    }
+    << json_resp(200, "{\"priority\":" + json.quote(&priority) + "}")
 }
 
 pub fn handle_report_admin(st &State, req &HttpReq, now int) HttpResp {
@@ -382,8 +444,17 @@ pub fn handle_report_admin(st &State, req &HttpReq, now int) HttpResp {
         }
         clean := strings.trim_space(&raw)
         state := read_case_decision(st, date + "", id + "")
-        out := clean[0:(clean.len - 1)] + ",\"decision\":" + decision_json(&state) + "}"
+        $metadata := ""
+        if !report.has(report.root(), "priority") { metadata = ",\"priority\":\"medium\"" }
+        out := clean[0:(clean.len - 1)] + metadata + ",\"decision\":" + decision_json(&state) + "}"
         << http_resp(200, "application/json; charset=utf-8", PUBLIC_CONTENT_CACHE, &out)
+    }
+    priority := query_param_str(req.path(), "priority", "")
+    status := query_param_str(req.path(), "status", "")
+    if (priority.len > 0 && !valid_moderation_priority(&priority)) ||
+       (status.len > 0 && status != "pending" && status != "resolved" && status != "dismissed" && status != "approved" &&
+        status != "rejected" && status != "expired" && status != "approval_used") {
+        << err_resp(400, "ERR_BAD_REQUEST", "invalid priority or status filter", 0, 0, 0)
     }
     names := read_dir_or_empty(moderation_dir(st) + "/reports/" + date)
     entries := strings.split(&names, "\n")
@@ -391,7 +462,14 @@ pub fn handle_report_admin(st &State, req &HttpReq, now int) HttpResp {
     for i in 0:entries.len {
         if entries[i].len != 35 || !strings.has_suffix(&entries[i], ".json") { -> }
         rid := entries[i][0:30] + ""
-        if is_receipt_id(&rid) { receipts.push(rid) }
+        if !is_receipt_id(&rid) { -> }
+        if priority.len > 0 {
+            raw := read_file_or_empty(report_path(st, date + "", rid + ""))
+            report := json.parse(&raw)
+            if !report.ok() || !report.is_dict(report.root()) || report_priority(&report) != priority { -> }
+        }
+        if status.len > 0 && report_status(st, date + "", rid + "", now) != status { -> }
+        receipts.push(rid)
     }
     out := "{\"date\":" + json.quote(&date) + ",\"receipts\":" + encode_string_list(&receipts) + "}"
     << http_resp(200, "application/json; charset=utf-8", PUBLIC_CONTENT_CACHE, &out)

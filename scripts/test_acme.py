@@ -1116,11 +1116,27 @@ def main() -> int:
                 assert_eq(int(ts_still_b["serial_hex"], 16), sb_serial, "failed chain reload must leave active Cert B untouched")
 
                 stop_hook = ["bash", str(ROOT / "deploy" / "graceful_stop.sh")]
-                subprocess.run(stop_hook, env={**st_env, "FATEXT_PUBLIC_HOST": "wrong.fatext.test"},
-                               check=True, timeout=8)
-                assert proc4.poll() is None, "shutdown hook accepted a certificate for the wrong host"
-                subprocess.run(stop_hook, env=st_env, check=True, timeout=8)
+                def shutdown_events():
+                    events = []
+                    for path in (st_data_dir / "logs").glob("events-*.jsonl"):
+                        for line in path.read_text().splitlines():
+                            if line.endswith("}"):
+                                event = json.loads(line)
+                                if event.get("kind") in ("shutdown_requested", "shutdown_auth_fail", "server_stop"):
+                                    events.append(event["kind"])
+                    return events
+
+                wrong = subprocess.run(stop_hook, env={**st_env, "FATEXT_PUBLIC_HOST": "wrong.fatext.test"},
+                                       capture_output=True, text=True, check=True, timeout=8)
+                diag = (wrong.stderr.strip(), proc4.poll(), shutdown_events())
+                print(f"Wrong-host shutdown probe (curl, server exit, audit): {diag}", flush=True)
+                assert "curl=60 http=000" in wrong.stderr and diag[1] is None and not diag[2], diag
+                health, _, _, _ = sni_https_request(st_https_port, "static.fatext.test", ca.root_crt, "GET", "/health")
+                assert_eq(health, 200, "server must remain healthy after hostname rejection")
+                valid = subprocess.run(stop_hook, env=st_env, capture_output=True, text=True, check=True, timeout=8)
+                assert "curl=0 http=200 tls_verify=0" in valid.stderr, valid.stderr
                 assert_eq(proc4.wait(timeout=5), 0, "shutdown hook must use the validated TLS connection")
+                assert shutdown_events().count("shutdown_requested") == 1, shutdown_events()
             finally:
                 stop_proc(proc4)
 

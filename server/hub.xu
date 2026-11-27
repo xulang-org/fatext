@@ -1125,37 +1125,30 @@ pub fn hub_loop(hub_init HubState, jobs chan HubJob) {
         }
 
         if job.kind == HUB_MODERATION_PREFLIGHT {
-            resp := dispatch_http($&hub, &job.req, now, true, false)
+            $resp := dispatch_http($&hub, &job.req, now, true, false)
             if resp.status == 200 {
-                if moderation_approval(&hub.st, &job.req, now) {
-                    job.reply_ch <- reply_http(json_resp(204, ""), q_ms, 0, "", "agent", job.req.header("X-Agent-Id"))
-                } else {
-                    existing := lookup_existing_review(&hub.st, &job.req, now)
-                    if existing.status != 0 {
-                        consume_request_replay($&hub.st, &job.req, now)
-                        h_ms := (time.now() - t_start) / 1000000
-                        ec := extract_err_code(existing.status, &existing.body)
-                        slow := hub.slow_ms
-                        metrics_record_http($&hub.metrics, existing.status, job.req.req_body.len, existing.body.len, q_ms, h_ms, q_ms + h_ms, slow)
-                        job.reply_ch <- reply_http(http_resp(existing.status, existing.ctype + "", existing.extra + "", &existing.body), q_ms, h_ms, ec, "agent", job.req.header("X-Agent-Id"))
-                    } else {
-                        ec := extract_err_code(resp.status, &resp.body)
-                        job.reply_ch <- reply_http(http_resp(resp.status, resp.ctype + "", resp.extra + "", &resp.body), q_ms, 0, ec, "agent", job.req.header("X-Agent-Id"))
-                    }
+                resp = preflight_public_review($&hub.st, &job.req, now)
+                if resp.status >= 400 {
+                    consume_request_replay($&hub.st, &job.req, now)
                 }
-            } else {
-                ec := extract_err_code(resp.status, &resp.body)
-                job.reply_ch <- reply_http(http_resp(resp.status, resp.ctype + "", resp.extra + "", &resp.body), q_ms, 0, ec, "agent", job.req.header("X-Agent-Id"))
             }
+            h_ms := (time.now() - t_start) / 1000000
+            ec := extract_err_code(resp.status, &resp.body)
+            if resp.status >= 400 {
+                slow := hub.slow_ms
+                metrics_record_http($&hub.metrics, resp.status, job.req.req_body.len, resp.body.len, q_ms, h_ms, q_ms + h_ms, slow)
+            }
+            job.reply_ch <- reply_http(resp, q_ms, h_ms, ec, "agent", job.req.header("X-Agent-Id"))
             ->
         }
 
         $resp := json_resp(200, "{}")
-        if job.flag == MODERATION_FLAG {
+        priority := moderation_verdict_priority(job.flag)
+        if priority.len > 0 {
             resp = dispatch_http($&hub, &job.req, now, true, false)
             if resp.status == 200 {
                 consume_request_replay($&hub.st, &job.req, now)
-                resp = queue_ai_review($&hub.st, &job.req, now)
+                resp = queue_publication_review($&hub.st, &job.req, now, "ai", priority)
             }
         } else if job.flag == MODERATION_UNAVAILABLE {
             resp = err_resp(503, "ERR_MODERATION_UNAVAILABLE", "public content moderation unavailable", 5, 0, 0)

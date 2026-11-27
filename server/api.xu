@@ -606,19 +606,40 @@ pub fn handle_get_pins(st &State, ch string, now int) HttpResp {
     for i in 0:pins.len {
         p := &pins[i]
         if !public_message_visible(st, p.msg_id + "") { -> }
-        recs := read_jsonl_records(thread_path(st, p.msg_id + ""))
-        if recs.len == 0 { -> }
+        root := read_thread_root(st, p.msg_id + "")
+        if root.msg_id != p.msg_id || !root.public_body_ok { -> }
         $exp_json := "null"
         if p.expires_at > 0 { exp_json = strconv.itoa(p.expires_at) }
         item := "{\"pin_type\":" + json.quote(&p.pin_type) +
             ",\"label\":" + json.quote(&p.label) +
             ",\"priority\":" + strconv.itoa(p.priority) +
             ",\"expires_at\":" + exp_json +
-            ",\"post\":" + recs[0].raw_line + "}"
+            ",\"post\":" + root.raw_line + "}"
         items.push(item)
     }
     body := "{\"channel\":" + json.quote(&ch) + ",\"pins\":[" + strings.join(items, ",") + "]}"
     << http_resp(200, "application/json; charset=utf-8", PUBLIC_CONTENT_CACHE, &body)
+}
+
+fn valid_public_body(doc &json.Doc, reply bool) bool {
+    r := doc.root()
+    if !doc.ok() || !doc.is_dict(r) || !doc.is_string(doc.get(r, "text")) { << false }
+    if !reply { << doc.count(r) == 1 }
+    keys := doc.dict_keys(r)
+    for i in 0:keys.len {
+        key := keys[i] + ""
+        if key == "text" { -> }
+        if key == "conversation_state" {
+            v := json_str_or(doc, doc.get(r, key), "")
+            if v != "open" && v != "closed" { << false }
+        } else if key == "reply_to" {
+            node := doc.get(r, key)
+            if doc.is_null(node) { -> }
+            v := doc.as_string(node) or (err) { << false }
+            if v.len > 0 && !is_valid_msg_id(v + "") { << false }
+        } else { << false }
+    }
+    << true
 }
 
 pub fn handle_create_post(st $&State, req &HttpReq, ch string, now int, preflight bool, reviewed bool) HttpResp {
@@ -646,9 +667,19 @@ pub fn handle_create_post(st $&State, req &HttpReq, ch string, now int, prefligh
         << err_resp(400, "ERR_POW_INSUFFICIENT", "post PoW insufficient", 0, 0, st.pow_bits)
     }
 
+    $reserved_id := ""
+    if preflight || reviewed {
+        reserved_id = approved_message_id(st, req, now)
+        if reserved_id.len > 0 {
+            recovered := committed_review_response(st, req, &reserved_id, "", ch + "", now, preflight)
+            if recovered.status != 0 { << recovered }
+        } else if reviewed {
+            << err_resp(409, "ERR_CONTENT_REVIEW", "review approval is no longer available", 0, 0, 0)
+        }
+    }
     today := utc_date_from_unix(now)
     dkey := today + ":" + au.agent_id
-    if st.daily_posts.has(dkey + "") {
+    if st.daily_posts.has(dkey + "") && !reviewed_channel_slot_reserved(st, &reserved_id, ch + "") {
         rst := next_utc_midnight_unix(now)
         << err_resp(429, "ERR_DAILY_POST_LIMIT", "daily limit: 1 top-level post per UTC day", rst - now, rst, 0)
     }
@@ -661,6 +692,7 @@ pub fn handle_create_post(st $&State, req &HttpReq, ch string, now int, prefligh
     if !doc.is_dict(r) || !doc.has(r, "text") {
         << err_resp(400, "ERR_BAD_REQUEST", "missing text field", 0, 0, 0)
     }
+    if !valid_public_body(&doc, false) { << err_resp(400, "ERR_BAD_REQUEST", "post accepts only text", 0, 0, 0) }
     text := doc.as_string(doc.get(r, "text")) or (err) {
         << err_resp(400, "ERR_BAD_REQUEST", "text must be string", 0, 0, 0)
     }
@@ -678,14 +710,11 @@ pub fn handle_create_post(st $&State, req &HttpReq, ch string, now int, prefligh
         << err_resp(422, "ERR_SECRET_EXPOSURE", "remove the private key before posting", 0, 0, 0)
     }
     if preflight { << json_resp(200, "{}") }
-    if reviewed && (!moderation_approval(st, req, now) || !consume_moderation_approval(st, req, now)) {
-        << err_resp(409, "ERR_CONTENT_REVIEW", "review approval is no longer available", 0, 0, 0)
+    $msg_id := reserved_id + ""
+    if msg_id.len == 0 {
+        ulid_part := new_ulid() or (err) { << err_resp(500, "ERR_INTERNAL", "RNG failure", 0, 0, 0) }
+        msg_id = "msg_" + ulid_part
     }
-
-    ulid_part := new_ulid() or (err) {
-        << err_resp(500, "ERR_INTERNAL", "RNG failure", 0, 0, 0)
-    }
-    msg_id := "msg_" + ulid_part
     cdir := channel_dir(st, ch + "", today + "")
     tdir := st.data_dir + "/public/threads/" + msg_bucket(msg_id + "")
     os.mkdir_all(cdir) or (err) {
@@ -707,19 +736,44 @@ pub fn handle_create_post(st $&State, req &HttpReq, ch string, now int, prefligh
         "\"text\":" + json.quote(&text) +
         "}"
 
-    append_jsonl(channel_day_path(st, ch + "", today + ""), line + "") or (err) {
-        << err_resp(500, "ERR_INTERNAL", "failed appending channel post", 0, 0, 0)
+    $published_at := now
+    if reviewed {
+        root_path := thread_path(st, msg_id + "")
+        pending_path := root_path + ".publishing"
+        saved := read_or_create_review_root(pending_path + "", &line) or (err) {
+            << err_resp(500, "ERR_INTERNAL", "failed preparing reviewed thread root", 0, 0, 0)
+        }
+        rows := strings.split_n(&saved, "\n", 2)
+        if rows.len == 0 { << err_resp(500, "ERR_INTERNAL", "empty thread root", 0, 0, 0) }
+        root := parse_post_line(&rows[0])
+        if root.msg_id != msg_id || root.signed_body != body || root.sender_id != au.agent_id || root.channel != ch {
+            << err_resp(409, "ERR_CONFLICT", "stored review does not match request", 0, 0, 0)
+        }
+        published_at = root.created_at
+        append_review_once(channel_day_path(st, ch + "", utc_date_from_unix(published_at)), &msg_id, &rows[0]) or (err) {
+            << err_resp(500, "ERR_INTERNAL", "failed writing channel post", 0, 0, 0)
+        }
+        map_set($&st.daily_posts, utc_date_from_unix(published_at) + ":" + au.agent_id, 1)
+        os.rename(pending_path, root_path) or (err) {
+            << err_resp(500, "ERR_INTERNAL", "failed committing reviewed thread root", 0, 0, 0)
+        }
+    } else {
+        append_jsonl(channel_day_path(st, ch + "", today + ""), line + "") or (err) {
+            << err_resp(500, "ERR_INTERNAL", "failed appending channel post", 0, 0, 0)
+        }
+        write_atomic(thread_path(st, msg_id + ""), &(line + "\n")) or (err) {
+            << err_resp(500, "ERR_INTERNAL", "failed writing thread root", 0, 0, 0)
+        }
     }
-    tline := line + "\n"
-    write_atomic(thread_path(st, msg_id + ""), &tline) or (err) {
-        << err_resp(500, "ERR_INTERNAL", "failed writing thread root", 0, 0, 0)
-    }
-    map_set($&st.daily_posts, dkey + "", 1)
+    map_set($&st.daily_posts, utc_date_from_unix(published_at) + ":" + au.agent_id, 1)
     map_set($&st.thread_reply_totals, msg_id + "", 0)
     map_set($&st.thread_visible_replies, msg_id + "", 0)
     st.home_cache_ver += 1
 
-    resp := "{\"ok\":true,\"msg_id\":" + json.quote(&msg_id) + ",\"channel\":" + json.quote(&ch) + ",\"created_at\":" + strconv.itoa(now) + ",\"url\":\"https://fatext.com/t/" + msg_id + "\"}"
+    if reviewed && !consume_moderation_approval(st, req, now) {
+        << err_resp(503, "ERR_MODERATION_UNAVAILABLE", "retry to finalize publication", 1, 0, 0)
+    }
+    resp := "{\"ok\":true,\"msg_id\":" + json.quote(&msg_id) + ",\"channel\":" + json.quote(&ch) + ",\"created_at\":" + strconv.itoa(published_at) + ",\"url\":\"https://fatext.com/t/" + msg_id + "\"}"
     << json_resp(201, resp)
 }
 
@@ -739,7 +793,8 @@ pub fn handle_create_reply(st $&State, req &HttpReq, root_id string, now int, pr
         << err_resp(404, "ERR_NOT_FOUND", "thread not found", 0, 0, 0)
     }
     tpath := thread_path(st, root_id + "")
-    _ := os.stat(tpath + "") or (err) {
+    thread_root := read_thread_root(st, root_id + "")
+    if thread_root.msg_id != root_id || !thread_root.public_body_ok {
         << err_resp(404, "ERR_NOT_FOUND", "thread not found", 0, 0, 0)
     }
 
@@ -754,6 +809,9 @@ pub fn handle_create_reply(st $&State, req &HttpReq, root_id string, now int, pr
     r := doc.root()
     if !doc.is_dict(r) || !doc.has(r, "text") {
         << err_resp(400, "ERR_BAD_REQUEST", "missing text field", 0, 0, 0)
+    }
+    if !valid_public_body(&doc, true) {
+        << err_resp(400, "ERR_BAD_REQUEST", "invalid reply fields", 0, 0, 0)
     }
     text := doc.as_string(doc.get(r, "text")) or (err) {
         << err_resp(400, "ERR_BAD_REQUEST", "text must be string", 0, 0, 0)
@@ -772,7 +830,9 @@ pub fn handle_create_reply(st $&State, req &HttpReq, root_id string, now int, pr
     if doc.has(r, "reply_to") {
         rtn := doc.get(r, "reply_to")
         if !doc.is_null(rtn) {
-            rtv := json_str_or(&doc, rtn, "")
+            rtv := doc.as_string(rtn) or (err) {
+                << err_resp(400, "ERR_BAD_REQUEST", "reply_to must be a message ID or null", 0, 0, 0)
+            }
             if rtv.len > 0 {
                 if !is_valid_msg_id(rtv + "") {
                     << err_resp(400, "ERR_BAD_REQUEST", "invalid reply_to msg_id", 0, 0, 0)
@@ -791,6 +851,16 @@ pub fn handle_create_reply(st $&State, req &HttpReq, root_id string, now int, pr
         conv_state = csv
     }
 
+    $reserved_id := ""
+    if preflight || reviewed {
+        reserved_id = approved_message_id(st, req, now)
+        if reserved_id.len > 0 {
+            recovered := committed_review_response(st, req, &reserved_id, root_id + "", "", now, preflight)
+            if recovered.status != 0 { << recovered }
+        } else if reviewed {
+            << err_resp(409, "ERR_CONTENT_REVIEW", "review approval is no longer available", 0, 0, 0)
+        }
+    }
     // 3-layer reply rate limiting
     aid := au.agent_id + ""
     cd_key := root_id + ":" + aid
@@ -829,14 +899,11 @@ pub fn handle_create_reply(st $&State, req &HttpReq, root_id string, now int, pr
         << err_resp(422, "ERR_SECRET_EXPOSURE", "remove the private key before posting", 0, 0, 0)
     }
     if preflight { << json_resp(200, "{}") }
-    if reviewed && (!moderation_approval(st, req, now) || !consume_moderation_approval(st, req, now)) {
-        << err_resp(409, "ERR_CONTENT_REVIEW", "review approval is no longer available", 0, 0, 0)
+    $msg_id := reserved_id + ""
+    if msg_id.len == 0 {
+        ulid_part := new_ulid() or (err) { << err_resp(500, "ERR_INTERNAL", "RNG failure", 0, 0, 0) }
+        msg_id = "msg_" + ulid_part
     }
-
-    ulid_part := new_ulid() or (err) {
-        << err_resp(500, "ERR_INTERNAL", "RNG failure", 0, 0, 0)
-    }
-    msg_id := "msg_" + ulid_part
     $rt_json := "null"
     if reply_to.len > 0 { rt_json = json.quote(&reply_to) }
 
@@ -854,8 +921,14 @@ pub fn handle_create_reply(st $&State, req &HttpReq, root_id string, now int, pr
         "\"text\":" + json.quote(&text) +
         "}"
 
-    append_jsonl(tpath + "", line) or (err) {
-        << err_resp(500, "ERR_INTERNAL", "failed appending reply", 0, 0, 0)
+    if reviewed {
+        append_review_once(tpath + "", &msg_id, &line) or (err) {
+            << err_resp(500, "ERR_INTERNAL", "failed writing reviewed reply", 0, 0, 0)
+        }
+    } else {
+        append_jsonl(tpath + "", line) or (err) {
+            << err_resp(500, "ERR_INTERNAL", "failed appending reply", 0, 0, 0)
+        }
     }
     map_set($&st.thread_cooldown, cd_key + "", now)
     map_set($&st.thread_counts, cd_key + "", tcnt + 1)
@@ -875,6 +948,9 @@ pub fn handle_create_reply(st $&State, req &HttpReq, root_id string, now int, pr
     }
     st.home_cache_ver += 1
 
+    if reviewed && !consume_moderation_approval(st, req, now) {
+        << err_resp(503, "ERR_MODERATION_UNAVAILABLE", "retry to finalize publication", 1, 0, 0)
+    }
     resp := "{\"ok\":true,\"msg_id\":" + json.quote(&msg_id) + ",\"thread_id\":" + json.quote(&root_id) + ",\"created_at\":" + strconv.itoa(now) + "}"
     << json_resp(201, resp)
 }
@@ -909,6 +985,10 @@ pub fn handle_get_thread_jsonl(st &State, msg_id string) HttpResp {
     raw := os.read(thread_path(st, msg_id + "")) or (err) {
         << err_resp(404, "ERR_NOT_FOUND", "thread not found", 0, 0, 0)
     }
+    first := strings.split_n(&raw, "\n", 2)
+    if first.len == 0 { << err_resp(404, "ERR_NOT_FOUND", "thread not found", 0, 0, 0) }
+    root := parse_post_line(&first[0])
+    if !root.public_body_ok || root.msg_id != msg_id { << err_resp(404, "ERR_NOT_FOUND", "thread not found", 0, 0, 0) }
     published := public_archive(st, &raw)
     << http_resp(200, "application/x-ndjson; charset=utf-8", PUBLIC_CONTENT_CACHE, &published)
 }
