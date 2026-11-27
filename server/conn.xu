@@ -215,7 +215,7 @@ fn http_reason(status int) string {
     << "Internal Server Error"
 }
 
-pub fn format_http_resp_ka_tls(r &HttpResp, keep_alive bool, is_tls bool) string {
+pub fn format_http_resp_ka_tls_head(r &HttpResp, keep_alive bool, is_tls bool, omit_body bool) string {
     $out := "HTTP/1.1 " + strconv.itoa(r.status) + " " + http_reason(r.status) + "\r\n"
     out = out + "Content-Type: " + r.ctype + "\r\n"
     out = out + "Content-Length: " + strconv.itoa(r.body.len) + "\r\n"
@@ -236,8 +236,14 @@ pub fn format_http_resp_ka_tls(r &HttpResp, keep_alive bool, is_tls bool) string
     } else {
         out = out + "Connection: close\r\n\r\n"
     }
-    out = out + r.body
+    if !omit_body {
+        out = out + r.body
+    }
     << out
+}
+
+pub fn format_http_resp_ka_tls(r &HttpResp, keep_alive bool, is_tls bool) string {
+    << format_http_resp_ka_tls_head(r, keep_alive, is_tls, false)
 }
 
 pub fn format_http_resp_ka(r &HttpResp, keep_alive bool) string {
@@ -248,9 +254,13 @@ pub fn format_http_resp(r &HttpResp) string {
     << format_http_resp_ka(r, false)
 }
 
-pub fn write_http_resp_ka(cc $&ClientConn, r &HttpResp, keep_alive bool) int {
-    wire := format_http_resp_ka_tls(r, keep_alive, cc.is_tls)
+pub fn write_http_resp_ka_head(cc $&ClientConn, r &HttpResp, keep_alive bool, omit_body bool) int {
+    wire := format_http_resp_ka_tls_head(r, keep_alive, cc.is_tls, omit_body)
     << cc_write_timeout(cc, &wire, HTTP_WRITE_TIMEOUT_NS)
+}
+
+pub fn write_http_resp_ka(cc $&ClientConn, r &HttpResp, keep_alive bool) int {
+    << write_http_resp_ka_head(cc, r, keep_alive, false)
 }
 
 pub fn write_http_resp(cc $&ClientConn, r &HttpResp) int {

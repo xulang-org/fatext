@@ -458,6 +458,12 @@ for (const spoof of [
   assert(!r1.spf_pass && !r1.dkim_pass && !r1.dmarc_pass, "w1 accepted spoof: " + spoof);
 }
 assert(w1.extractRecipientAgentId("Alice <ftx_abc123def456+tag@fatext.com>") === "ftx_abc123def456", "recipient display name + tag");
+assert(w1.extractHeaderFrom("Alice <Alice@Example.COM>") === "alice@example.com", "extractHeaderFrom display name");
+assert(w1.extractHeaderFrom("bob@example.com") === "bob@example.com", "extractHeaderFrom bare");
+assert(w1.extractHeaderFrom("a@b.com, c@d.com") === "", "extractHeaderFrom rejects multi-address");
+assert(w1.extractHeaderFrom("a@b.com\r\nBcc: x@y.com") === "", "extractHeaderFrom rejects CRLF");
+assert(w1.hasMultipleFromHeaders("From: a@b.com\r\nSubject: hi\r\n\r\nbody") === false, "single From header");
+assert(w1.hasMultipleFromHeaders("From: evil@x.com\r\nFrom: alice@example.com\r\n\r\nbody") === true, "duplicate From header rejected");
 const cjkSnippet = w1.extractBodySnippet("\r\n\r\n" + "中".repeat(5000));
 assert(Buffer.byteLength(cjkSnippet, "utf8") <= 8192, "snippet UTF-8 bytes bounded <= 8192");
 '''

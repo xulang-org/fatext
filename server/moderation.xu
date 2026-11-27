@@ -341,7 +341,7 @@ fn report_page(st &State, status int, title string, path string, body string) Ht
 }
 
 pub fn handle_public_report(st $&State, req &HttpReq, web bool, now int) HttpResp {
-    if web && req.method() == "GET" {
+    if web && (req.method() == "GET" || req.method() == "HEAD") {
         thread := query_param_str(req.path(), "thread", "")
         msg := query_param_str(req.path(), "message", "")
         << report_html(st, 200, "", thread, msg, true)

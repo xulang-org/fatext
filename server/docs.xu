@@ -249,6 +249,9 @@ fn store_agent_doc(
     r := doc.root()
 
     cur := read_agent_doc(&hub.st, aid + "", kind + "")
+    if kind == "human" && actor_type != "controller" {
+        << err_resp(403, "ERR_FORBIDDEN", "human config can only be managed by controller", 0, 0, 0)
+    }
     if actor_type == "agent" && cur.found && cur.locked {
         << err_resp(403, "ERR_DOC_LOCKED", "document is locked by controller", 0, 0, 0)
     }
@@ -271,6 +274,9 @@ fn store_agent_doc(
     if !is_valid_doc_visibility(vis + "") {
         << err_resp(400, "ERR_BAD_REQUEST", "visibility must be public or private", 0, 0, 0)
     }
+    if kind == "human" && vis != "private" {
+        << err_resp(400, "ERR_BAD_REQUEST", "human config must be private", 0, 0, 0)
+    }
 
     $fmt := "markdown"
     if doc.has(r, "format") && !doc.is_null(doc.get(r, "format")) {
@@ -282,6 +288,12 @@ fn store_agent_doc(
             << err_resp(400, "ERR_BAD_REQUEST", "format must be markdown or text", 0, 0, 0)
         }
     }
+    if kind == "human" && fmt != "json" {
+        << err_resp(400, "ERR_BAD_REQUEST", "human config format must be json", 0, 0, 0)
+    }
+    if kind != "human" && fmt == "json" {
+        << err_resp(400, "ERR_BAD_REQUEST", "format must be markdown or text", 0, 0, 0)
+    }
 
     $locked := false
     if doc.has(r, "locked") {
@@ -292,6 +304,9 @@ fn store_agent_doc(
     }
     if actor_type == "agent" && locked {
         << err_resp(403, "ERR_FORBIDDEN", "only owning controller can lock documents", 0, 0, 0)
+    }
+    if kind == "human" && !locked {
+        << err_resp(400, "ERR_BAD_REQUEST", "human config must be locked", 0, 0, 0)
     }
 
     if !doc.has(r, "content_sha256") || !doc.is_string(doc.get(r, "content_sha256")) {
@@ -443,7 +458,8 @@ pub fn handle_agent_docs_list(st $&State, req &HttpReq, now int) HttpResp {
     if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
     sd := read_agent_doc(st, au.agent_id + "", "soul")
     rd := read_agent_doc(st, au.agent_id + "", "rules")
-    << json_resp(200, "{\"agent_id\":" + json.quote(&au.agent_id) + ",\"soul\":" + doc_meta_json(&sd) + ",\"rules\":" + doc_meta_json(&rd) + "}")
+    hd := read_agent_doc(st, au.agent_id + "", "human")
+    << json_resp(200, "{\"agent_id\":" + json.quote(&au.agent_id) + ",\"soul\":" + doc_meta_json(&sd) + ",\"rules\":" + doc_meta_json(&rd) + ",\"human\":" + doc_meta_json(&hd) + "}")
 }
 
 pub fn handle_agent_doc_get(st $&State, req &HttpReq, kind string, now int) HttpResp {
@@ -462,6 +478,9 @@ pub fn handle_agent_doc_put(hub $&HubState, req &HttpReq, kind string, now int) 
     if !is_valid_doc_kind(kind + "") {
         << err_resp(404, "ERR_NOT_FOUND", "unknown document kind", 0, 0, 0)
     }
+    if kind == "human" {
+        << err_resp(403, "ERR_FORBIDDEN", "human config can only be managed by controller", 0, 0, 0)
+    }
     au := authenticate_scoped($&hub.st, req, now, "profile")
     if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
     body := req.body()
@@ -471,6 +490,9 @@ pub fn handle_agent_doc_put(hub $&HubState, req &HttpReq, kind string, now int) 
 pub fn handle_agent_doc_delete(hub $&HubState, req &HttpReq, kind string, now int) HttpResp {
     if !is_valid_doc_kind(kind + "") {
         << err_resp(404, "ERR_NOT_FOUND", "unknown document kind", 0, 0, 0)
+    }
+    if kind == "human" {
+        << err_resp(403, "ERR_FORBIDDEN", "human config can only be managed by controller", 0, 0, 0)
     }
     au := authenticate_scoped($&hub.st, req, now, "profile")
     if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
@@ -504,7 +526,8 @@ pub fn handle_ctl_agent_docs_list(st $&State, req &HttpReq, aid string, now int)
     if ag.controller_id != au.agent_id { << err_resp(403, "ERR_FORBIDDEN", "not controller of agent", 0, 0, 0) }
     sd := read_agent_doc(st, aid + "", "soul")
     rd := read_agent_doc(st, aid + "", "rules")
-    << json_resp(200, "{\"agent_id\":" + json.quote(&aid) + ",\"controller_id\":" + json.quote(&au.agent_id) + ",\"soul\":" + doc_meta_json(&sd) + ",\"rules\":" + doc_meta_json(&rd) + "}")
+    hd := read_agent_doc(st, aid + "", "human")
+    << json_resp(200, "{\"agent_id\":" + json.quote(&aid) + ",\"controller_id\":" + json.quote(&au.agent_id) + ",\"soul\":" + doc_meta_json(&sd) + ",\"rules\":" + doc_meta_json(&rd) + ",\"human\":" + doc_meta_json(&hd) + "}")
 }
 
 pub fn handle_ctl_agent_doc_get(st $&State, req &HttpReq, aid string, kind string, now int) HttpResp {
@@ -587,7 +610,7 @@ pub fn handle_public_docs_list(st &State, aid string) HttpResp {
 }
 
 pub fn handle_public_doc_get(st &State, aid string, kind string, raw_md bool) HttpResp {
-    if !is_valid_agent_id(aid + "") || !is_valid_doc_kind(kind + "") {
+    if !is_valid_agent_id(aid + "") || !is_valid_doc_kind(kind + "") || kind == "human" {
         << err_resp(404, "ERR_NOT_FOUND", "document not found", 0, 0, 0)
     }
     d := read_agent_doc(st, aid + "", kind + "")

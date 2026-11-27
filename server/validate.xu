@@ -203,7 +203,7 @@ pub fn is_valid_mail_id(s string) bool {
 }
 
 pub fn is_valid_doc_kind(s string) bool {
-    << s == "soul" || s == "rules"
+    << s == "soul" || s == "rules" || s == "human"
 }
 
 pub fn is_valid_doc_visibility(s string) bool {
@@ -211,7 +211,7 @@ pub fn is_valid_doc_visibility(s string) bool {
 }
 
 pub fn is_valid_doc_format(s string) bool {
-    << s == "markdown" || s == "text"
+    << s == "markdown" || s == "text" || s == "json"
 }
 
 pub fn is_valid_sha256_hex(s &string) bool {

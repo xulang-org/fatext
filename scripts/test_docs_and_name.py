@@ -192,6 +192,8 @@ def main() -> int:
         srv_env["FATEXT_POW_BITS"] = "12"
         srv_env["FATEXT_LOG_DIR"] = str(log_dir)
         srv_env["FATEXT_METRICS_INTERVAL_SEC"] = "60"
+        mail_sec = "docs-test-mail-secret-123"
+        srv_env["FATEXT_MAIL_INTERNAL_SECRET"] = mail_sec
 
         srv = subprocess.Popen([str(SERVER_BIN)], env=srv_env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
@@ -210,6 +212,7 @@ def main() -> int:
 
             rc, out, err = run_cli(["--json", "init", "--controller-only", "--name", "OwnerTwo"], agent_home=ch_2, api_url=api_url)
             assert_eq(rc, 0, f"ctl2 init failed: {err}")
+            cid2 = json.loads(out.strip())["agent_id"]
 
             # Voucher WITHOUT profile scope; agent must STILL persist initial --name/--bio on register!
             v1 = td_p / "v1.json"
@@ -485,10 +488,206 @@ def main() -> int:
             rc, _, err = run_cli(["--json", "ctl", "rules", "rm", aid_owned], agent_home=ch_1, api_url=api_url)
             assert_eq(rc, 0, f"ctl rules rm failed: {err}")
 
+            print("[5/6] Controller-locked E2EE human email config & mail pull matching...")
+            ah_mail = str(td_p / "agent_mail")
+            ah_mail2 = str(td_p / "agent_mail2")
+            v_mail = td_p / "v_mail.json"
+            rc, _, err = run_cli(
+                ["--json", "ctl", "cred", "issue", "--scopes", "all", "--out", str(v_mail)],
+                agent_home=ch_2,
+                api_url=api_url,
+            )
+            assert_eq(rc, 0, f"cred issue for mail agent failed: {err}")
+            rc, out, err = run_cli(
+                ["--json", "init", "--name", "MailBot", "--credential", str(v_mail)],
+                agent_home=ah_mail,
+                api_url=api_url,
+            )
+            assert_eq(rc, 0, f"mail agent init failed: {err}")
+            aid_mail = json.loads(out.strip())["agent_id"]
+
+            v_mail2 = td_p / "v_mail2.json"
+            rc, _, err = run_cli(
+                ["--json", "ctl", "cred", "issue", "--scopes", "all", "--out", str(v_mail2)],
+                agent_home=ch_2,
+                api_url=api_url,
+            )
+            assert_eq(rc, 0, f"cred issue for mail agent 2 failed: {err}")
+            rc, out, err = run_cli(
+                ["--json", "init", "--name", "MailBot2", "--credential", str(v_mail2)],
+                agent_home=ah_mail2,
+                api_url=api_url,
+            )
+            assert_eq(rc, 0, f"mail agent 2 init failed: {err}")
+            aid_mail2 = json.loads(out.strip())["agent_id"]
+
+            # Controller sets encrypted locked human allowlist
+            rc, out, err = run_cli(
+                ["--json", "ctl", "human", "set", aid_mail, "Alice@Example.com,bob@example.com"],
+                agent_home=ch_2,
+                api_url=api_url,
+            )
+            assert_eq(rc, 0, f"ctl human set failed: {err}")
+            h_put_j = json.loads(out)
+            assert_eq(h_put_j["kind"], "human", "human doc kind")
+            assert_eq(h_put_j["visibility"], "private", "human doc private")
+            assert_eq(h_put_j["locked"], True, "human doc locked")
+
+            # Foreign controller cannot access aid_mail's human config (403)
+            rc, _, err = run_cli(["--json", "ctl", "human", "get", aid_mail], agent_home=ch_1, api_url=api_url)
+            assert_eq(rc, 5, f"foreign controller ctl human get expected exit 5, got {rc}: {err}")
+
+            # Public endpoints must never expose human config
+            st_dj2, _, dj2_txt = http_get(f"{api_url}/k/{aid_mail}/docs.json")
+            assert_eq(st_dj2, 200, "public docs.json 200")
+            assert_true("human" not in json.loads(dj2_txt), f"public docs.json must omit human: {dj2_txt}")
+            st_pub_h, _, _ = http_get(f"{api_url}/k/{aid_mail}/human.json")
+            assert_eq(st_pub_h, 404, f"public /k/{{id}}/human.json must return 404, got {st_pub_h}")
+
+            # Agent cannot overwrite or delete human config
+            bad_h_sha = hashlib.sha256(b'{"v":1,"emails":["evil@attacker.test"],"command_enabled":true}').hexdigest()
+            bad_h_uat = int(time.time())
+            bad_h_canon = canonical_doc_payload(aid_mail, bad_h_sha, "human", True, aid_mail, 1, bad_h_uat, 2, "private")
+            bad_h_sig = openssl_sign_pss(Path(ah_mail) / "private.pem", bad_h_canon)
+            st_ag_put, _ = signed_agent_put(
+                api_url, aid_mail, Path(ah_mail) / "private.pem", "/v1/agents/docs/human",
+                {
+                    "version": 2,
+                    "visibility": "private",
+                    "locked": True,
+                    "format": "json",
+                    "content_sha256": bad_h_sha,
+                    "content_bytes": 62,
+                    "envelope": {"v": 1, "alg": "RSA-OAEP-256+A256GCM", "iv": "AA==", "ct": "AA==", "recipients": [{"role": "agent", "id": aid_mail, "key_version": 1, "ek": "AA=="}, {"role": "controller", "id": cid2, "key_version": 1, "ek": "AA=="}]},
+                    "updated_at": bad_h_uat,
+                    "signature": bad_h_sig,
+                },
+            )
+            assert_eq(st_ag_put, 403, f"agent PUT human must return 403, got {st_ag_put}")
+
+            # Controller cannot store public or unlocked human config
+            pub_h_plain = '{"v":1,"emails":["alice@example.com"],"command_enabled":true}'
+            pub_h_sha = hashlib.sha256(pub_h_plain.encode("utf-8")).hexdigest()
+            pub_h_uat = int(time.time())
+            pub_h_canon = canonical_doc_payload(aid_mail, pub_h_sha, "human", True, cid2, 1, pub_h_uat, 2, "public")
+            pub_h_sig = openssl_sign_pss(Path(ch_2) / "private.pem", pub_h_canon)
+            st_pub_put, _ = signed_agent_put(
+                api_url, cid2, Path(ch_2) / "private.pem", f"/v1/ctl/agents/{aid_mail}/docs/human",
+                {
+                    "version": 2,
+                    "visibility": "public",
+                    "locked": True,
+                    "format": "json",
+                    "content_sha256": pub_h_sha,
+                    "content": pub_h_plain,
+                    "updated_at": pub_h_uat,
+                    "signature": pub_h_sig,
+                },
+            )
+            assert_eq(st_pub_put, 400, f"public human config must return 400, got {st_pub_put}")
+
+            unl_h_canon = canonical_doc_payload(aid_mail, pub_h_sha, "human", False, cid2, 1, pub_h_uat, 2, "private")
+            unl_h_sig = openssl_sign_pss(Path(ch_2) / "private.pem", unl_h_canon)
+            st_unl_put, _ = signed_agent_put(
+                api_url, cid2, Path(ch_2) / "private.pem", f"/v1/ctl/agents/{aid_mail}/docs/human",
+                {
+                    "version": 2,
+                    "visibility": "private",
+                    "locked": False,
+                    "format": "json",
+                    "content_sha256": pub_h_sha,
+                    "content_bytes": len(pub_h_plain),
+                    "envelope": {"v": 1, "alg": "RSA-OAEP-256+A256GCM", "iv": "AA==", "ct": "AA==", "recipients": [{"role": "agent", "id": aid_mail, "key_version": 1, "ek": "AA=="}, {"role": "controller", "id": cid2, "key_version": 1, "ek": "AA=="}]},
+                    "updated_at": pub_h_uat,
+                    "signature": unl_h_sig,
+                },
+            )
+            assert_eq(st_unl_put, 400, f"unlocked human config must return 400, got {st_unl_put}")
+
+            # Both controller and managed agent verify & decrypt human config
+            rc, out, err = run_cli(["--json", "ctl", "human", "get", aid_mail], agent_home=ch_2, api_url=api_url)
+            assert_eq(rc, 0, f"ctl human get failed: {err}")
+            hj_ctl = json.loads(out)
+            assert_eq(hj_ctl["emails"], ["alice@example.com", "bob@example.com"], "ctl human emails")
+            assert_eq(hj_ctl["command_enabled"], True, "ctl human command_enabled")
+
+            rc, out, err = run_cli(["--json", "human", "get"], agent_home=ah_mail, api_url=api_url)
+            assert_eq(rc, 0, f"agent human get failed: {err}")
+            hj_ag = json.loads(out)
+            assert_eq(hj_ag["emails"], ["alice@example.com", "bob@example.com"], "agent human emails")
+            assert_eq(hj_ag["controller_id"], cid2, "agent human controller_id")
+
+            # Enable email on aid_mail and ingest 4 test messages
+            rc, _, err = run_cli(["ctl", "policy", aid_mail, "--accept-email", "true"], agent_home=ch_2, api_url=api_url)
+            assert_eq(rc, 0, f"ctl policy accept-email failed: {err}")
+
+            def ingest_mail(subj: str, mfrom: str, header_from: str, spf: bool, dkim: bool, dmarc: bool) -> None:
+                payload = json.dumps({
+                    "to_agent_id": aid_mail,
+                    "from": mfrom,
+                    "header_from": header_from,
+                    "subject": subj,
+                    "raw_snippet": f"COMMAND_SECRET_CMD:{subj}",
+                    "spf_pass": spf,
+                    "dkim_pass": dkim,
+                    "dmarc_pass": dmarc,
+                    "received_at": int(time.time()),
+                }).encode("utf-8")
+                mreq = urllib.request.Request(
+                    f"{api_url}/internal/mail/ingest",
+                    data=payload,
+                    method="POST",
+                    headers={"Content-Type": "application/json", "X-Internal-Secret": mail_sec},
+                )
+                with urllib.request.urlopen(mreq, timeout=5.0) as mr:
+                    assert_eq(mr.status, 201, f"mail ingest {subj} 201")
+
+            ingest_mail("m1-ok", "bounce@example.com", "Alice <Alice@Example.com>", True, True, True)
+            ingest_mail("m2-nodkim", "bob@example.com", "bob@example.com", True, False, False)
+            ingest_mail("m3-stranger", "stranger@example.com", "stranger@example.com", True, True, True)
+            ingest_mail("m4-multi", "alice@example.com", "alice@example.com, evil@example.com", True, True, True)
+
+            rc, mp_out, err = run_cli(["--json", "mail", "pull"], agent_home=ah_mail, api_url=api_url)
+            assert_eq(rc, 0, f"mail pull failed: {err}")
+            by_subj = {json.loads(ln)["subject"]: json.loads(ln) for ln in mp_out.strip().splitlines() if ln.strip()}
+            assert_true(by_subj["m1-ok"]["verified"] is True and by_subj["m1-ok"]["from_human"] is True and by_subj["m1-ok"]["command_eligible"] is True, f"m1-ok mismatch: {by_subj['m1-ok']}")
+            assert_eq(by_subj["m1-ok"]["header_from"], "Alice <Alice@Example.com>", "m1 header_from")
+            assert_true(by_subj["m2-nodkim"]["from_human"] is True and by_subj["m2-nodkim"]["command_eligible"] is False, f"m2-nodkim mismatch: {by_subj['m2-nodkim']}")
+            assert_true(by_subj["m3-stranger"]["from_human"] is False and by_subj["m3-stranger"]["command_eligible"] is False, f"m3-stranger mismatch: {by_subj['m3-stranger']}")
+            assert_true(by_subj["m4-multi"]["from_human"] is False and by_subj["m4-multi"]["command_eligible"] is False, f"m4-multi mismatch: {by_subj['m4-multi']}")
+
+            # --disabled flips command_eligible to False while keeping from_human=True
+            rc, _, err = run_cli(["--json", "ctl", "human", "set", aid_mail, "alice@example.com", "--disabled"], agent_home=ch_2, api_url=api_url)
+            assert_eq(rc, 0, f"ctl human set --disabled failed: {err}")
+            rc, mp_dis, err = run_cli(["--json", "mail", "pull"], agent_home=ah_mail, api_url=api_url)
+            assert_eq(rc, 0, f"mail pull disabled failed: {err}")
+            by_dis = {json.loads(ln)["subject"]: json.loads(ln) for ln in mp_dis.strip().splitlines() if ln.strip()}
+            assert_true(by_dis["m1-ok"]["from_human"] is True and by_dis["m1-ok"]["command_eligible"] is False, f"disabled mismatch: {by_dis['m1-ok']}")
+
+            # Remove human config -> fail closed
+            rc, _, err = run_cli(["--json", "ctl", "human", "rm", aid_mail], agent_home=ch_2, api_url=api_url)
+            assert_eq(rc, 0, f"ctl human rm failed: {err}")
+            rc, mp_rm, err = run_cli(["--json", "mail", "pull"], agent_home=ah_mail, api_url=api_url)
+            assert_eq(rc, 0, f"mail pull after rm failed: {err}")
+            by_rm = {json.loads(ln)["subject"]: json.loads(ln) for ln in mp_rm.strip().splitlines() if ln.strip()}
+            assert_true(by_rm["m1-ok"]["from_human"] is False and by_rm["m1-ok"]["command_eligible"] is False, f"after rm mismatch: {by_rm['m1-ok']}")
+
+            # --all batch set & rm across both active managed agents under ch_2
+            rc, out, err = run_cli(["--json", "ctl", "human", "set", "--all", "owner@example.com"], agent_home=ch_2, api_url=api_url)
+            assert_eq(rc, 0, f"ctl human set --all failed: {err}")
+            upd_ids = json.loads(out)["updated"]
+            assert_true(aid_mail in upd_ids and aid_mail2 in upd_ids, f"--all updated mismatch: {upd_ids}")
+            for ah_x in (ah_mail, ah_mail2):
+                rc, hg_x, err = run_cli(["--json", "human", "get"], agent_home=ah_x, api_url=api_url)
+                assert_eq(rc, 0, f"human get after --all failed: {err}")
+                assert_eq(json.loads(hg_x)["emails"], ["owner@example.com"], "batch email match")
+            rc, out, err = run_cli(["--json", "ctl", "human", "rm", "--all"], agent_home=ch_2, api_url=api_url)
+            assert_eq(rc, 0, f"ctl human rm --all failed: {err}")
+
             # Wait briefly for async logger flush
             time.sleep(0.3)
 
-            print("[5/5] Verifying doc_update audit logs & strict zero-leak privacy scan...")
+            print("[6/6] Verifying doc_update audit logs & strict zero-leak privacy scan...")
             ev_files = list(log_dir.glob("events-*.jsonl"))
             assert_true(len(ev_files) >= 1, "events log created")
             ev_records = []
@@ -501,7 +700,10 @@ def main() -> int:
 
             for lf in log_dir.rglob("*.jsonl"):
                 raw_log = lf.read_text(encoding="utf-8")
-                for secret in (priv_soul_secret, ctl_locked_rules, auto_priv_rules, public_soul, public_rules):
+                for secret in (
+                    priv_soul_secret, ctl_locked_rules, auto_priv_rules, public_soul, public_rules,
+                    "alice@example.com", "bob@example.com", "owner@example.com", "COMMAND_SECRET_CMD",
+                ):
                     assert_true(secret not in raw_log, f"PRIVACY LEAK in {lf.name}: found {secret!r}")
 
         finally:
@@ -509,7 +711,7 @@ def main() -> int:
                 srv.terminate()
                 srv.wait(timeout=5)
 
-    print("ALL 5 AGENT NAME + SOUL/RULES E2EE & LOCK TESTS PASSED.")
+    print("ALL 6 AGENT NAME + SOUL/RULES/HUMAN E2EE & LOCK TESTS PASSED.")
     return 0
 
 
