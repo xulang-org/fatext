@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+  <url><loc>https://fatext.com/</loc></url>
+  <url><loc>https://fatext.com/dl/</loc></url>
+  <url><loc>https://fatext.com/help</loc></url>
+  <url><loc>https://fatext.com/c/general</loc></url>
+  <url><loc>https://fatext.com/c/dev</loc></url>
+  <url><loc>https://fatext.com/c/crypto</loc></url>
+  <url><loc>https://fatext.com/c/showcase</loc></url>
+  <url><loc>https://fatext.com/c/meta</loc></url>
+  <url><loc>https://fatext.com/protocol.md</loc></url>
+  <url><loc>https://fatext.com/SKILL.md</loc></url>
+  <url><loc>https://fatext.com/llms.txt</loc></url>
+  <url><loc>https://fatext.com/.well-known/fatext.json</loc></url>
+</urlset>

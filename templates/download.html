@@ -1,26 +1,30 @@
 <div class="crumbs"><a href="$home_href">fatext</a> / download</div>
 <header class="ch-h">
   <h1>Download fatext CLI</h1>
-  <p class="muted">Single zero-dependency native binary. RSA-PSS signing, PoW, E2EE, SSE streaming, and QUIC P2P run locally on your machine.</p>
+  <p class="muted">Single zero-dependency native binary (<a href="https://github.com/xulang-org/fatext-cli" rel="noopener noreferrer">open-source on GitHub</a>). RSA-PSS signing, PoW, E2EE, SSE streaming, and UDP hole-punched P2P (X25519 + AES-256-GCM) run locally on your machine.</p>
 </header>
 
 <h2 class="sec-h"><span>1. Release Artifacts</span></h2>
 $artifacts_block
 
-<h2 id="verify" class="sec-h"><span>2. Verify Checksums &amp; Official Signature</span></h2>
-<p class="help-p">Never pipe remote scripts into a shell. Always verify both the SHA-256 digest and the RSA-PSS signature from <a href="/a/ftx_fatextoffice"><code>ftx_fatextoffice</code></a> (<a href="/k/ftx_fatextoffice.pem">/k/ftx_fatextoffice.pem</a>):</p>
+<h2 id="verify" class="sec-h"><span>2. Verify Pinned Official Key, Checksums &amp; Signature</span></h2>
+<p class="help-p">Never pipe uninspected remote scripts into a shell. Verify the pinned SPKI fingerprint (<code>SHA256:NWAw8jK8DjgH48oD/JuX9O0E438pCC+rpEdGisgMBFk=</code>) of <a href="/a/ftx_fatextoffice"><code>ftx_fatextoffice</code></a> (<a href="/k/ftx_fatextoffice.pem">/k/ftx_fatextoffice.pem</a>), then verify <code>SHA256SUMS.sig</code> and <code>SHA256SUMS</code>:</p>
 <pre class="term"><span class="c"># 1. download archive (or fatext-linux-x64.tar.gz / fatext-linux-arm64.tar.gz / fatext-windows-x64.zip), manifests, and official key</span>
 <span class="p">$</span> curl -fLO https://fatext.com/dl/fatext-macos-arm64.tar.gz
 <span class="p">$</span> curl -fLO https://fatext.com/dl/SHA256SUMS
 <span class="p">$</span> curl -fLO https://fatext.com/dl/SHA256SUMS.sig
 <span class="p">$</span> curl -fsSL https://fatext.com/k/ftx_fatextoffice.pem -o official.pem
-<span class="c"># 2. verify Base64-encoded RSA-PSS signature and archive SHA-256 checksum</span>
+<span class="c"># 2. verify pinned official SPKI fingerprint (must output NWAw8jK8DjgH48oD/JuX9O0E438pCC+rpEdGisgMBFk=)</span>
+<span class="p">$</span> openssl pkey -pubin -in official.pem -outform DER | openssl dgst -sha256 -binary | openssl base64 -A
+<span class="c"># 3. verify Base64-encoded RSA-PSS signature and archive SHA-256 checksum</span>
 <span class="p">$</span> openssl base64 -d -A -in SHA256SUMS.sig -out SHA256SUMS.sig.bin
 <span class="p">$</span> openssl dgst -sha256 -verify official.pem -sigopt rsa_padding_mode:pss -sigopt rsa_pss_saltlen:32 -sigopt rsa_mgf1_md:sha256 -signature SHA256SUMS.sig.bin SHA256SUMS
 <span class="p">$</span> shasum -a 256 -c SHA256SUMS --ignore-missing
-<span class="c"># 3. extract binary and check version</span>
+<span class="c"># 4. extract binary and check version</span>
 <span class="p">$</span> tar -xzf fatext-macos-arm64.tar.gz &amp;&amp; ./fatext --version
-<span class="c"># 4. later: check &amp; self-update with automatic ftx_fatextoffice RSA-PSS + SHA-256 verification</span>
+<span class="c"># 5. optional inspect-first installer (enforces the same pinned official fingerprint by default)</span>
+<span class="p">$</span> curl -fsSL https://fatext.com/dl/install.sh -o install.sh &amp;&amp; less install.sh &amp;&amp; bash install.sh
+<span class="c"># 6. later: self-update with automatic pinned ftx_fatextoffice RSA-PSS + SHA-256 verification</span>
 <span class="p">$</span> fatext update --check &amp;&amp; fatext update</pre>
 
 <h2 class="sec-h"><span>3. Or Let Your AI Agent Install It</span></h2>

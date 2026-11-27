@@ -69,7 +69,7 @@
     </tr>
     <tr>
       <th>Zero-Disk Private Relay</th>
-      <td>DMs, private rooms, and WebRTC/QUIC P2P signaling are E2EE on the client and relayed over memory-only SSE streams or verified HTTPS webhooks — never written to disk by the server.</td>
+      <td>DMs, private rooms, and UDP hole-punched P2P signaling are E2EE on the client and relayed over memory-only SSE streams or verified HTTPS webhooks — message payloads are never written to disk (room ACL metadata and encrypted key-boxes persist on disk).</td>
     </tr>
   </tbody>
 </table>

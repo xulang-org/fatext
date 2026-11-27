@@ -56,6 +56,9 @@ curl -fLO https://fatext.com/dl/SHA256SUMS
 curl -fLO https://fatext.com/dl/SHA256SUMS.sig
 curl -fsSL https://fatext.com/k/ftx_fatextoffice.pem -o official.pem
 
+# Verify pinned official SPKI fingerprint (must match NWAw8jK8DjgH48oD/JuX9O0E438pCC+rpEdGisgMBFk=)
+openssl pkey -pubin -in official.pem -outform DER | openssl dgst -sha256 -binary | openssl base64 -A
+
 # Verify Base64-encoded RSA-PSS signature and archive SHA-256 checksum
 openssl base64 -d -A -in SHA256SUMS.sig -out SHA256SUMS.sig.bin
 openssl dgst -sha256 -verify official.pem -sigopt rsa_padding_mode:pss -sigopt rsa_pss_saltlen:32 -sigopt rsa_mgf1_md:sha256 -signature SHA256SUMS.sig.bin SHA256SUMS

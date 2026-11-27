@@ -705,11 +705,15 @@ pub fn serve_agent(st $&State, aid string) HttpResp {
         }
     }
     $ssig := "(unsigned initial revision)"
+    $sig_summary := "[!] Unsigned initial revision"
     if doc.ok() && doc.has(doc.root(), "signature") {
         sn := doc.get(doc.root(), "signature")
         if doc.is_string(sn) {
             sv := json_str_or(&doc, sn, "")
-            if sv.len > 0 { ssig = sv }
+            if sv.len > 0 {
+                ssig = sv
+                sig_summary = "[✓ RSA] Self-signed identity document"
+            }
         }
     }
 
@@ -719,14 +723,14 @@ pub fn serve_agent(st $&State, aid string) HttpResp {
         ["home_href", "agent_id", "name", "badge_class", "status_label",
             "joined_iso", "joined_date", "revision", "key_version", "revoked_notice",
             "bio_html", "ownership_section", "docs_section", "ext_rows", "key_count", "key_history_html",
-            "fingerprint", "updated_iso", "updated_human", "self_sig",
+            "fingerprint", "updated_iso", "updated_human", "sig_summary", "self_sig",
             "json_href", "pem_href"],
         ["/", esc(&aid), esc(&disp), bclass, slabel,
             esc(&utc_iso_from_unix(ag.created_at)), esc(&utc_date_from_unix(ag.created_at)),
             strconv.itoa(ag.revision), strconv.itoa(ag.key_version), rnotice,
             bio_html, own_sec, docs_sec, render_ext_rows(&doc, aid + ""), strconv.itoa(kcnt), kh_html,
             esc(&fp), esc(&utc_iso_from_unix(ag.updated_at)), esc(&utc_human_from_unix(ag.updated_at)),
-            esc(&ssig), "/k/" + esc(&aid) + ".json", "/k/" + esc(&aid) + ".pem"])
+            esc(&sig_summary), esc(&ssig), "/k/" + esc(&aid) + ".json", "/k/" + esc(&aid) + ".pem"])
     alt := "<link rel=\"alternate\" type=\"application/json\" href=\"/k/" + esc(&aid) + ".json\">"
     raw_f := " · Identity: <a href=\"/k/" + esc(&aid) + ".json\">/k/" + esc(&aid) + ".json</a>"
     html_out := render_base_html(st, disp + " (" + aid + ") — fatext.com",
@@ -889,6 +893,12 @@ pub fn serve_static_allowlisted(st &State, path string) HttpResp {
     } else if path == "/static/logo.svg" {
         disk_path = st.www_dir + "/static/logo.svg"
         ctype = "image/svg+xml"
+    } else if path == "/robots.txt" {
+        disk_path = st.www_dir + "/robots.txt"
+        ctype = "text/plain; charset=utf-8"
+    } else if path == "/sitemap.xml" {
+        disk_path = st.www_dir + "/sitemap.xml"
+        ctype = "application/xml; charset=utf-8"
     } else {
         << HttpResp{status: 0, ctype: "", extra: "", body: ""}
     }
@@ -936,9 +946,9 @@ pub fn static_loop(www_dir string, dl_dir string, ip_rpm int, ch chan StaticJob)
     $ip_hits := maps.new_str_int()
     $ip_window := 0
 
-    static_paths := ["/llms.txt", "/llms-full.txt", "/SKILL.md", "/protocol.md", "/.well-known/fatext.json", "/static/fatext.css", "/static/favicon.svg", "/favicon.ico", "/static/logo.svg"]
-    static_disk := ["/llms.txt", "/llms-full.txt", "/SKILL.md", "/protocol.md", "/.well-known/fatext.json", "/static/fatext.css", "/static/favicon.svg", "/static/favicon.svg", "/static/logo.svg"]
-    static_types := ["text/plain; charset=utf-8", "text/plain; charset=utf-8", "text/markdown; charset=utf-8", "text/markdown; charset=utf-8", "application/json; charset=utf-8", "text/css; charset=utf-8", "image/svg+xml", "image/svg+xml", "image/svg+xml"]
+    static_paths := ["/llms.txt", "/llms-full.txt", "/SKILL.md", "/protocol.md", "/.well-known/fatext.json", "/static/fatext.css", "/static/favicon.svg", "/favicon.ico", "/static/logo.svg", "/robots.txt", "/sitemap.xml"]
+    static_disk := ["/llms.txt", "/llms-full.txt", "/SKILL.md", "/protocol.md", "/.well-known/fatext.json", "/static/fatext.css", "/static/favicon.svg", "/static/favicon.svg", "/static/logo.svg", "/robots.txt", "/sitemap.xml"]
+    static_types := ["text/plain; charset=utf-8", "text/plain; charset=utf-8", "text/markdown; charset=utf-8", "text/markdown; charset=utf-8", "application/json; charset=utf-8", "text/css; charset=utf-8", "image/svg+xml", "image/svg+xml", "image/svg+xml", "text/plain; charset=utf-8", "application/xml; charset=utf-8"]
     for i in 0:static_paths.len {
         raw := read_file_or_empty(www_dir + static_disk[i])
         if raw.len > 0 {
