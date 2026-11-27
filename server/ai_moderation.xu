@@ -2,6 +2,7 @@
 
 #crypto/sha256
 #encoding/json
+#errors
 #net/http
 #os
 #strconv
@@ -100,12 +101,13 @@ fn approvals_dir(st &State) string {
 
 struct ReviewApproval {
     available bool
+    expires_at int
     date string
     receipt string
 }
 
 fn empty_review_approval() ReviewApproval {
-    << ReviewApproval{available: false, date: "", receipt: ""}
+    << ReviewApproval{available: false, expires_at: 0, date: "", receipt: ""}
 }
 
 fn parse_approval_pointer(st &State, raw &string, now int) ReviewApproval {
@@ -115,7 +117,7 @@ fn parse_approval_pointer(st &State, raw &string, now int) ReviewApproval {
     }
     decision := read_case_decision(st, parts[0] + "", parts[1] + "")
     if decision.status != "approved" || decision.expires_at <= now { << empty_review_approval() }
-    << ReviewApproval{available: true, date: parts[0] + "", receipt: parts[1] + ""}
+    << ReviewApproval{available: true, expires_at: decision.expires_at, date: parts[0] + "", receipt: parts[1] + ""}
 }
 
 fn find_review_approval(st &State, key string, now int) ReviewApproval {
@@ -130,7 +132,91 @@ fn find_review_approval(st &State, key string, now int) ReviewApproval {
     // Keep one-time approvals already issued by the previous release usable.
     legacy := read_file_or_empty(dir + "/" + key)
     expires := strconv.atoi(&legacy) or (err) { << empty_review_approval() }
-    << ReviewApproval{available: expires > now, date: "", receipt: ""}
+    << ReviewApproval{available: expires > now, expires_at: expires, date: "", receipt: ""}
+}
+
+fn approved_message_id(st &State, req &HttpReq, now int) string {
+    key := review_key(req)
+    approval := find_review_approval(st, key + "", now)
+    if !approval.available { << "" }
+    digest := sha256.sum256_bytes("publication\n" + key + "\n" + approval.receipt)
+    encoded := encode_ulid(approval.expires_at * 1000, &digest)
+    if approval.receipt.len > 0 {
+        << "msg_" + approval.receipt[4:14] + encoded[10:26]
+    }
+    << "msg_" + encoded
+}
+
+fn stored_review_line(raw &string, mid &string) string {
+    lines := strings.split(raw, "\n")
+    for i in 0:lines.len {
+        if !strings.contains(&lines[i], *mid + "") { -> }
+        rec := parse_post_line(&lines[i])
+        if rec.msg_id == *mid { << lines[i] + "" }
+    }
+    << ""
+}
+
+// Reviewed writes run on the serialized hub. Atomic replacement makes a
+// retry safe even when the previous operation stopped partway through I/O.
+fn read_or_create_review_root(path string, line &string) string {
+    raw := os.read(path + "") or (err) {
+        if !os.is_not_exist(err.msg()) { >> err }
+        signed_root := *line + "\n"
+        write_atomic(path, &signed_root) or >>
+        << signed_root
+    }
+    << raw
+}
+
+fn reviewed_channel_slot_reserved(st &State, mid &string, ch string) bool {
+    if mid.len == 0 { << false }
+    staged := read_file_or_empty(thread_path(st, *mid + "") + ".publishing")
+    if staged.len == 0 { << false }
+    root := parse_post_line(&staged)
+    if root.msg_id != *mid || root.channel != ch { << false }
+    archive := read_file_or_empty(channel_day_path(st, ch, utc_date_from_unix(root.created_at)))
+    << stored_review_line(&archive, mid).len > 0
+}
+
+fn append_review_once(path string, mid &string, line &string) int {
+    previous := os.read(path + "") or (err) {
+        if !os.is_not_exist(err.msg()) { >> err }
+        write_atomic(path, &(*line + "\n")) or >>
+        << 0
+    }
+    if stored_review_line(&previous, mid).len > 0 { << 0 }
+    if previous.len > 0 && !strings.has_suffix(&previous, "\n") { >> errors.new("incomplete public archive") }
+    write_atomic(path, &(previous + *line + "\n")) or >>
+    << 0
+}
+
+fn committed_review_response(st $&State, req &HttpReq, mid &string, root string, ch string, now int, preflight bool) HttpResp {
+    $thread := *mid + ""
+    if root.len > 0 { thread = root + "" }
+    raw := os.read(thread_path(st, thread)) or (err) {
+        if root.len == 0 && os.is_not_exist(err.msg()) { << json_resp(0, "") }
+        << err_resp(503, "ERR_MODERATION_UNAVAILABLE", "reviewed thread storage unavailable", 1, 0, 0)
+    }
+    $line := ""
+    if root.len > 0 {
+        line = stored_review_line(&raw, mid)
+        if line.len == 0 { << json_resp(0, "") }
+    } else {
+        first := strings.split_n(&raw, "\n", 2)
+        if first.len > 0 { line = first[0] + "" }
+    }
+    post := parse_post_line(&line)
+    if post.msg_id != *mid || post.signed_body != req.req_body || post.sender_id != strings.trim_space(&req.header("X-Agent-Id")) {
+        << err_resp(409, "ERR_CONFLICT", "stored review does not match request", 0, 0, 0)
+    }
+    if preflight { << json_resp(200, "{}") }
+    if !consume_moderation_approval(st, req, now) {
+        << err_resp(503, "ERR_MODERATION_UNAVAILABLE", "retry to finalize publication", 1, 0, 0)
+    }
+    $target := "\"thread_id\":" + json.quote(&root)
+    if ch.len > 0 { target = "\"channel\":" + json.quote(&ch) + ",\"url\":\"https://fatext.com/t/" + *mid + "\"" }
+    << json_resp(200, "{\"ok\":true,\"msg_id\":" + json.quote(mid) + "," + target + ",\"created_at\":" + strconv.itoa(post.created_at) + "}")
 }
 
 pub fn moderation_approval(st &State, req &HttpReq, now int) bool {
@@ -154,6 +240,12 @@ fn legacy_review_expiry(raw &string) int {
     << strconv.atoi(raw) or (err) { << 0 }
 }
 
+fn is_publication_review(doc &json.Doc) bool {
+    if !doc.ok() { << false }
+    source := json_str_or(doc, doc.get(doc.root(), "source"), "")
+    << source == "ai" || source == "external_url"
+}
+
 pub fn handle_own_review(st $&State, req &HttpReq, now int) HttpResp {
     if req.method() != "GET" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
     au := authenticate_scoped(st, req, now, "")
@@ -165,7 +257,7 @@ pub fn handle_own_review(st $&State, req &HttpReq, now int) HttpResp {
     }
     raw := read_file_or_empty(report_path(st, date + "", id + ""))
     report := json.parse(&raw)
-    if !report.ok() || json_str_or(&report, report.get(report.root(), "source"), "") != "ai" ||
+    if !is_publication_review(&report) ||
        json_str_or(&report, report.get(report.root(), "agent_id"), "") != au.agent_id {
         << err_resp(404, "ERR_NOT_FOUND", "review not found", 0, 0, 0)
     }
@@ -214,7 +306,26 @@ pub fn lookup_existing_review(st &State, req &HttpReq, now int) HttpResp {
     << lookup_review_in_date(st, yesterday, &key, now)
 }
 
-pub fn queue_ai_review(st $&State, req &HttpReq, now int) HttpResp {
+pub fn preflight_public_review(st $&State, req &HttpReq, now int) HttpResp {
+    stamp := strings.trim_space(&req.header("X-Timestamp"))
+    ts := strconv.atoi(&stamp) or (err) { << err_resp(400, "ERR_BAD_REQUEST", "invalid signed timestamp", 0, 0, 0) }
+    if path_only(req.path()) != req.path() || strconv.itoa(ts) != stamp {
+        << err_resp(400, "ERR_BAD_REQUEST", "public signatures require a query-free path and decimal Unix timestamp", 0, 0, 0)
+    }
+    doc := json.parse(&req.req_body)
+    text := json_str_or(&doc, doc.get(doc.root(), "text"), "")
+    links := public_link_policy(&text, &st.public_link_hosts, &st.public_blocked_link_hosts)
+    if links == PUBLIC_LINK_BLOCK {
+        << err_resp(422, "ERR_PUBLIC_LINK_BLOCKED", "remove the blocked link before posting", 0, 0, 0)
+    }
+    if moderation_approval(st, req, now) { << json_resp(204, "") }
+    if links == PUBLIC_LINK_REVIEW { << queue_publication_review(st, req, now, "external_url") }
+    existing := lookup_existing_review(st, req, now)
+    if existing.status != 0 { << existing }
+    << json_resp(200, "{}")
+}
+
+pub fn queue_publication_review(st $&State, req &HttpReq, now int, source string) HttpResp {
     existing_resp := lookup_existing_review(st, req, now)
     if existing_resp.status != 0 {
         << existing_resp
@@ -232,7 +343,7 @@ pub fn queue_ai_review(st $&State, req &HttpReq, now int) HttpResp {
     input := json_str_or(&doc, doc.get(doc.root(), "text"), "")
     aid := strings.trim_space(&req.header("X-Agent-Id"))
     path := path_only(req.path())
-    body := "{\"source\":\"ai\",\"agent_id\":" + json.quote(&aid) + ",\"target\":" + json.quote(&path) +
+    body := "{\"source\":" + json.quote(&source) + ",\"agent_id\":" + json.quote(&aid) + ",\"target\":" + json.quote(&path) +
         ",\"review_key\":" + json.quote(&key) + ",\"text\":" + json.quote(&input) +
         ",\"created_at\":" + strconv.itoa(now) + "}\n"
     id := save_report(st, date + "", &body)
@@ -272,7 +383,7 @@ pub fn handle_ai_review_admin(hub $&HubState, req &HttpReq, date string, id stri
         << err_resp(404, "ERR_NOT_FOUND", "review not found", 0, 0, 0)
     }
     report := json.parse(&raw)
-    if !report.ok() || json_str_or(&report, report.get(report.root(), "source"), "") != "ai" {
+    if !is_publication_review(&report) {
         << err_resp(404, "ERR_NOT_FOUND", "review not found", 0, 0, 0)
     }
     key := json_str_or(&report, report.get(report.root(), "review_key"), "")

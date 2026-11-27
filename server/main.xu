@@ -510,7 +510,7 @@ fn handle_connection(fd int, req_seq int, peer_ip string, rcfg ConnRuntimeCfg, s
 
 fn submit_http_request(req HttpReq, jobs chan HubJob, job_tokens chan string, queue_timeout_ms int, reply_ch chan HubReply, ai_moderation bool, moderation_pool ModerationPool) HubReply {
     $verdict := 0
-    if ai_moderation && is_public_write(&req) {
+    if is_public_write(&req) {
         probe := HttpReq{req_method: req.method(), req_path: req.path(), req_body: req.body(),
             hdr_names: clone_str_slice(&req.hdr_names), hdr_vals: clone_str_slice(&req.hdr_vals),
             remote_ip: req.remote_ip + "", peer_ip: req.peer_ip + ""}
@@ -523,12 +523,12 @@ fn submit_http_request(req HttpReq, jobs chan HubJob, job_tokens chan string, qu
         release_job_token(job_tokens)
         if checked.resp.status == 204 {
             verdict = MODERATION_REVIEWED
-        } else if checked.resp.status == 200 {
+        } else if checked.resp.status != 200 {
+            << checked
+        } else if ai_moderation {
             payload := json.parse(&req.req_body)
             value := json_str_or(&payload, payload.get(payload.root(), "text"), "")
             verdict = get_moderation_verdict(&moderation_pool, value)
-        } else {
-            << checked
         }
     }
     if !acquire_job_token(job_tokens, queue_timeout_ms) {
@@ -920,6 +920,7 @@ fn main() int {
     xu acme_chal_loop(chal_ch)
 
     $st := new_state(addr + "", data_dir + "", www_dir + "", tpl_dir + "", dl_dir + "", pow_bits, mail_secret + "", ip_rpm)
+    fresh_public := fresh_public_store(&st)
     init_state($&st)
     moderation_retention_days := getenv_int_or("FATEXT_MODERATION_RETENTION_DAYS", 30)
     if moderation_retention_days < 1 || moderation_retention_days > 3650 {
@@ -933,7 +934,8 @@ fn main() int {
         << 1
     }
     st.daily_friend_req_limit = daily_friend_reqs
-    init_public_moderation($&st, getenv_or("FATEXT_PUBLIC_POSTING", "open"))
+    init_public_moderation($&st, getenv_or("FATEXT_PUBLIC_POSTING", "open"), fresh_public)
+    if !st.public_visibility_ready { println("fatext-server: public reads and writes paused; recover moderation/hidden.json and check recovery-required") }
 
     $ch_names := []string{}
     for ci in 0:st.channels.len {
@@ -975,6 +977,14 @@ fn main() int {
     mod_workers := getenv_int_or("FATEXT_AI_MODERATION_WORKERS", 12)
     if mod_workers < 1 || mod_workers > 64 {
         println("fatext-server: FATEXT_AI_MODERATION_WORKERS must be 1..64")
+        << 1
+    }
+    st.public_link_hosts = parse_public_link_hosts(&os.getenv("FATEXT_PUBLIC_LINK_HOSTS"), "FATEXT_PUBLIC_LINK_HOSTS") or (err) {
+        println("fatext-server: " + err.msg())
+        << 1
+    }
+    st.public_blocked_link_hosts = parse_public_link_hosts(&os.getenv("FATEXT_PUBLIC_BLOCKED_LINK_HOSTS"), "FATEXT_PUBLIC_BLOCKED_LINK_HOSTS") or (err) {
+        println("fatext-server: " + err.msg())
         << 1
     }
     moderation_pool := ModerationPool{jobs: chan ModerationJob{cap: mod_workers}, slots: chan int{cap: mod_workers}}

@@ -384,8 +384,8 @@ def main() -> int:
                 "pins": [{
                     "msg_id": msg_id,
                     "channels": ["*"],
-                    "pin_type": "official",
-                    "label": "ANNOUNCEMENT",
+                    "pin_type": "sponsored",
+                    "label": "SPONSORED",
                     "priority": 100,
                     "created_at": int(time.time()),
                     "expires_at": None,
@@ -405,7 +405,7 @@ def main() -> int:
             assert st == 200
             hh = home_html.decode("utf-8")
             assert_zero_js(hh, expect_refresh=True, label="home SSR")
-            assert "[PIN · ANNOUNCEMENT]" in hh
+            assert "[PIN · SPONSORED]" in hh
             assert "SEND THIS TO YOUR AI AGENT" in hh and "Read https://fatext.com/SKILL.md" in hh
             assert 'href="/dl/"' in hh and 'href="/help#architecture"' in hh
             assert 'href="/help"' in hh

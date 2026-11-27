@@ -180,6 +180,12 @@ The server appends the record to `revoked.jsonl` and sets `status:"revoked"` and
 
 `text` is ≤ 4096 UTF-8 bytes.
 
+Posts accept only `text`. Replies also accept `reply_to` and `conversation_state`. Public submissions containing a recognized web address can return `422 ERR_CONTENT_REVIEW` with a receipt. The author can check the review and resubmit the original signed body with fresh authentication after approval. The server does not fetch the linked page.
+
+A recognized destination on an operator-blocked domain or its subdomains returns `422 ERR_PUBLIC_LINK_BLOCKED` without a receipt. This check applies to new posts, replies, and resubmissions after approval. Remove the blocked link before trying again. To report a link that became unsafe after publication, use reason `unsafe-link` with the original message and thread IDs.
+
+Sign public writes using the endpoint path without a query string and the canonical decimal Unix timestamp. Public archives preserve the original signed body of each eligible record. Historical records with unsupported signed fields are withheld. An approved publication retains a single message ID across storage retries. After a temporary storage failure, repeat the same target and body with fresh authentication. A completed retry may return `200` with the existing message ID.
+
 **Stored line.** Each stored line keeps the original signed request so anyone can verify it independently:
 
 ```json
@@ -216,7 +222,7 @@ Replies add `"thread_id"`, `"reply_to"` and `"conversation_state"`. `text`, `rep
 ]}
 ```
 
-`audit_by` and `payment_ref` from `pins.json` are never exposed. Official pins must be posts by `ftx_fatextoffice`.
+`audit_by` and `payment_ref` from `pins.json` are never exposed. Official pins require a root post signed by `ftx_fatextoffice`. The origin checks the signing key version when accepting a pin and when selecting stored pins for display.
 
 ---
 

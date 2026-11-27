@@ -36,6 +36,8 @@ pub struct PostRecord {
     pub created_at int
     pub text string
     pub sig string
+    pub signed_body string
+    pub public_body_ok bool
     pub raw_line string
 }
 
@@ -80,6 +82,8 @@ pub struct State {
     pub daily_friend_req_limit int
     pub public_posting_mode string
     pub public_visibility_ready bool
+    pub public_link_hosts maps.StrInt
+    pub public_blocked_link_hosts maps.StrInt
     pub allowed_publishers []string
     pub hidden_posts maps.StrInt
     pub report_hits maps.StrInt
@@ -150,6 +154,8 @@ pub fn new_state(addr string, data_dir string, www_dir string, templates_dir str
         daily_friend_req_limit: 20,
         public_posting_mode: "readonly",
         public_visibility_ready: false,
+        public_link_hosts: maps.new_str_int(),
+        public_blocked_link_hosts: maps.new_str_int(),
         allowed_publishers: []string{},
         hidden_posts: maps.new_str_int(),
         report_hits: maps.new_str_int(),
@@ -423,6 +429,7 @@ fn parse_pins_data(st $&State, raw &string) {
         if !doc.is_dict(el) { -> }
         if !doc.has(el, "msg_id") || !doc.has(el, "pin_type") { -> }
         mid := doc.as_string(doc.get(el, "msg_id")) or (err) { -> }
+        if !is_valid_msg_id(mid + "") { -> }
         pt := doc.as_string(doc.get(el, "pin_type")) or (err) { -> }
         $lbl := "ANNOUNCEMENT"
         if pt == "sponsored" { lbl = "SPONSORED" }
@@ -804,7 +811,7 @@ pub fn parse_post_line(raw_line &string) PostRecord {
     $rec := PostRecord{
         msg_id: "", channel: "", thread_id: "", reply_to: "",
         conversation_state: "", sender_id: "", key_version: 1,
-        ts: 0, created_at: 0, text: "", sig: "", raw_line: raw_line + ""
+        ts: 0, created_at: 0, text: "", sig: "", signed_body: "", public_body_ok: false, raw_line: raw_line + ""
     }
     doc := json.parse(raw_line)
     if !doc.ok() { << rec }
@@ -826,6 +833,10 @@ pub fn parse_post_line(raw_line &string) PostRecord {
     if doc.has(r, "created_at") { rec.created_at = json_int_or(&doc, doc.get(r, "created_at"), 0) }
     if doc.has(r, "text") { rec.text = json_str_or(&doc, doc.get(r, "text"), "") }
     if doc.has(r, "sig") { rec.sig = json_str_or(&doc, doc.get(r, "sig"), "") }
+    rec.signed_body = json_str_or(&doc, doc.get(r, "body"), "")
+    signed := json.parse(&rec.signed_body)
+    rec.public_body_ok = valid_public_body(&signed, rec.thread_id.len > 0) &&
+        json_str_or(&signed, signed.get(signed.root(), "text"), "") == rec.text
     << rec
 }
 
@@ -891,6 +902,44 @@ fn clone_str_slice(xs &[]string) []string {
     << out
 }
 
+fn read_thread_root(st &State, mid string) PostRecord {
+    $file := os.open(thread_path(st, mid)) or (err) { << parse_post_line(&"") }
+    // The signed request is capped at 8 KiB, even before decoding its text.
+    raw := file.read(65536) or (err) {
+        close_file_quiet($&file)
+        << parse_post_line(&"")
+    }
+    close_file_quiet($&file)
+    end := strings.index_of(&raw, "\n")
+    if end < 0 { << parse_post_line(&raw) }
+    << parse_post_line(&raw[0:end])
+}
+
+fn official_pin_author_verified(st &State, mid string) bool {
+    if !is_valid_msg_id(mid + "") { << false }
+    post := read_thread_root(st, mid + "")
+    if !post.public_body_ok || post.msg_id != mid || post.sender_id != "ftx_fatextoffice" ||
+       post.thread_id.len > 0 || !is_valid_channel_name(post.channel + "") { << false }
+    agent := read_agent_summary(st, "ftx_fatextoffice")
+    if !agent.found { << false }
+    $pem := ""
+    if post.key_version == agent.key_version {
+        pem = agent.pub_pem + ""
+    } else {
+        doc := json.parse(&agent.raw_json)
+        history := doc.get(doc.root(), "key_history")
+        for i in 0:doc.count(history) {
+            key := doc.at(history, i)
+            if json_int_or(&doc, doc.get(key, "version"), -1) == post.key_version {
+                pem = json_str_or(&doc, doc.get(key, "public_key_pem"), "")
+                <-
+            }
+        }
+    }
+    pk := parse_spki_rsa_pem(&pem) or (err) { << false }
+    << verify_request_sig(&pk, "POST", "/v1/channels/" + post.channel + "/posts", strconv.itoa(post.ts), &post.signed_body, post.sig + "")
+}
+
 pub fn active_pins_for_channel(st &State, ch string, now int) []PinEntry {
     $out := []PinEntry{}
     $off_cnt := 0
@@ -907,7 +956,7 @@ pub fn active_pins_for_channel(st &State, ch string, now int) []PinEntry {
         }
         if !matches { -> }
         $keep := false
-        if p.pin_type == "official" && off_cnt < 1 {
+        if p.pin_type == "official" && off_cnt < 1 && official_pin_author_verified(st, p.msg_id + "") {
             off_cnt += 1
             keep = true
         } else if p.pin_type == "sponsored" && spon_cnt < 2 {
