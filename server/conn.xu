@@ -207,6 +207,7 @@ fn http_reason(status int) string {
     if status == 403 { << "Forbidden" }
     if status == 404 { << "Not Found" }
     if status == 405 { << "Method Not Allowed" }
+    if status == 408 { << "Request Timeout" }
     if status == 409 { << "Conflict" }
     if status == 413 { << "Payload Too Large" }
     if status == 429 { << "Too Many Requests" }
@@ -320,13 +321,70 @@ fn parse_content_length_hdr(names &[]string, vals &[]string) int {
     << cl
 }
 
-pub fn read_http_request_timeout(cc $&ClientConn, timeout_ns int) HttpReq {
+pub struct ReadReqMeta {
+    pub ok bool
+    pub idle_closed bool
+    pub is_timeout bool
+    pub err_msg string
+}
+
+fn empty_http_req() HttpReq {
+    << HttpReq{req_method: "", req_path: "", hdr_names: []string{}, hdr_vals: []string{}, req_body: "", remote_ip: "", peer_ip: ""}
+}
+
+fn read_fail_meta(is_timeout bool, msg string) ReadReqMeta {
+    << ReadReqMeta{ok: false, idle_closed: false, is_timeout: is_timeout, err_msg: msg}
+}
+
+fn read_idle_meta() ReadReqMeta {
+    << ReadReqMeta{ok: false, idle_closed: true, is_timeout: false, err_msg: ""}
+}
+
+fn is_read_timeout_err(msg &string) bool {
+    low := strings.to_lower(msg)
+    << strings.contains(&low, "resource temporarily unavailable") ||
+        strings.contains(&low, "i/o timeout") ||
+        strings.contains(&low, "timed out") ||
+        strings.contains(&low, "timeout")
+}
+
+fn is_idle_disconnect_err(msg &string) bool {
+    if is_read_timeout_err(msg) { << true }
+    low := strings.to_lower(msg)
+    << low == "eof reading request" ||
+        low == "tls: eof" ||
+        strings.contains(&low, "connection reset") ||
+        strings.contains(&low, "broken pipe")
+}
+
+fn has_expect_100_continue(names &[]string, vals &[]string) bool {
+    for i in 0:names.len {
+        if names[i] == "expect" {
+            v := strings.to_lower(&strings.trim_space(&vals[i]))
+            if v == "100-continue" { << true }
+        }
+    }
+    << false
+}
+
+pub fn read_http_request_split(cc $&ClientConn, idle_timeout_ns int, read_timeout_ns int, out_req $&HttpReq) ReadReqMeta {
+    $saw_bytes := cc.buf.len > 0
     $deadline_ns := 0
-    if timeout_ns > 0 {
-        deadline_ns = time.now() + timeout_ns
-        cc_set_sock_timeout(cc, timeout_ns)
+    $idle_deadline_ns := 0
+    if saw_bytes {
+        if read_timeout_ns > 0 {
+            deadline_ns = time.now() + read_timeout_ns
+            cc_set_sock_timeout(cc, read_timeout_ns)
+        } else {
+            cc_set_sock_timeout(cc, 0)
+        }
     } else {
-        cc_set_sock_timeout(cc, 0)
+        if idle_timeout_ns > 0 {
+            idle_deadline_ns = time.now() + idle_timeout_ns
+            cc_set_sock_timeout(cc, idle_timeout_ns)
+        } else {
+            cc_set_sock_timeout(cc, 0)
+        }
     }
     $hdr_end := -1
     while hdr_end < 0 {
@@ -336,23 +394,55 @@ pub fn read_http_request_timeout(cc $&ClientConn, timeout_ns int) HttpReq {
             <-
         }
         if cc.buf.len > 16384 {
-            >> errors.new("header too large")
+            cc_set_sock_timeout(cc, 0)
+            << read_fail_meta(false, "header too large")
         }
-        if deadline_ns > 0 {
-            rem := deadline_ns - time.now()
-            if rem <= 0 {
-                >> errors.new("request read timeout")
+        if saw_bytes {
+            if deadline_ns > 0 {
+                rem := deadline_ns - time.now()
+                if rem <= 0 {
+                    cc_set_sock_timeout(cc, 0)
+                    << read_fail_meta(true, "request read timeout")
+                }
+                cc_set_sock_timeout(cc, rem)
             }
-            cc_set_sock_timeout(cc, rem)
+        } else if idle_deadline_ns > 0 {
+            rem_idle := idle_deadline_ns - time.now()
+            if rem_idle <= 0 {
+                cc_set_sock_timeout(cc, 0)
+                << read_idle_meta()
+            }
+            cc_set_sock_timeout(cc, rem_idle)
         }
-        chunk := cc_read(cc, 4096) or >>
+        chunk := cc_read(cc, 4096) or (err) {
+            emsg := err.msg()
+            cc_set_sock_timeout(cc, 0)
+            if !saw_bytes && is_idle_disconnect_err(&emsg) {
+                << read_idle_meta()
+            }
+            if is_read_timeout_err(&emsg) {
+                << read_fail_meta(true, "request read timeout")
+            }
+            << read_fail_meta(false, emsg)
+        }
         if chunk.len == 0 {
-            >> errors.new("eof reading request")
+            cc_set_sock_timeout(cc, 0)
+            if !saw_bytes {
+                << read_idle_meta()
+            }
+            << read_fail_meta(false, "eof reading request")
+        }
+        if !saw_bytes {
+            saw_bytes = true
+            if read_timeout_ns > 0 {
+                deadline_ns = time.now() + read_timeout_ns
+            }
         }
         cc.buf = cc.buf + chunk
     }
     if hdr_end > 16384 {
-        >> errors.new("header too large")
+        cc_set_sock_timeout(cc, 0)
+        << read_fail_meta(false, "header too large")
     }
     head_s := cc.buf[0:hdr_end]
     $rest := ""
@@ -363,17 +453,20 @@ pub fn read_http_request_timeout(cc $&ClientConn, timeout_ns int) HttpReq {
 
     lines := strings.split(&head_s, "\r\n")
     if lines.len == 0 || lines.len > 129 {
-        >> errors.new("empty or oversized header block")
+        cc_set_sock_timeout(cc, 0)
+        << read_fail_meta(false, "empty or oversized header block")
     }
     req_parts := strings.split(&lines[0], " ")
     if req_parts.len != 3 {
-        >> errors.new("malformed request line")
+        cc_set_sock_timeout(cc, 0)
+        << read_fail_meta(false, "malformed request line")
     }
     meth := strings.to_upper(&strings.trim_space(&req_parts[0]))
     rpath := req_parts[1] + ""
     proto := strings.trim_space(&req_parts[2])
     if !is_valid_http_method(&meth) || !is_valid_http_path(&rpath) || (proto != "HTTP/1.1" && proto != "HTTP/1.0") {
-        >> errors.new("invalid request target or protocol")
+        cc_set_sock_timeout(cc, 0)
+        << read_fail_meta(false, "invalid request target or protocol")
     }
 
     $hnames := []string{}
@@ -383,11 +476,13 @@ pub fn read_http_request_timeout(cc $&ClientConn, timeout_ns int) HttpReq {
         if ln.len == 0 { -> }
         col := strings.index_of(&ln, ":")
         if col <= 0 {
-            >> errors.new("malformed header")
+            cc_set_sock_timeout(cc, 0)
+            << read_fail_meta(false, "malformed header")
         }
         k_raw := ln[0:col] + ""
         if !is_strict_header_name(&k_raw) {
-            >> errors.new("invalid header name")
+            cc_set_sock_timeout(cc, 0)
+            << read_fail_meta(false, "invalid header name")
         }
         k := strings.to_lower(&k_raw)
         $v := ""
@@ -400,10 +495,19 @@ pub fn read_http_request_timeout(cc $&ClientConn, timeout_ns int) HttpReq {
 
     clen := parse_content_length_hdr(&hnames, &hvals)
     if clen == -2 {
-        >> errors.new("transfer-encoding not supported")
+        cc_set_sock_timeout(cc, 0)
+        << read_fail_meta(false, "transfer-encoding not supported")
     }
     if clen < 0 || clen > 262144 {
-        >> errors.new("invalid or oversized content-length")
+        cc_set_sock_timeout(cc, 0)
+        << read_fail_meta(false, "invalid or oversized content-length")
+    }
+    if clen > 0 && rest.len < clen && proto == "HTTP/1.1" && has_expect_100_continue(&hnames, &hvals) {
+        cont := "HTTP/1.1 100 Continue\r\n\r\n"
+        if cc_write_timeout(cc, &cont, 2000000000) < 0 {
+            cc_set_sock_timeout(cc, 0)
+            << read_fail_meta(false, "failed writing 100 Continue")
+        }
     }
     while rest.len < clen {
         need := clen - rest.len
@@ -412,13 +516,22 @@ pub fn read_http_request_timeout(cc $&ClientConn, timeout_ns int) HttpReq {
         if deadline_ns > 0 {
             rem := deadline_ns - time.now()
             if rem <= 0 {
-                >> errors.new("request body read timeout")
+                cc_set_sock_timeout(cc, 0)
+                << read_fail_meta(true, "request body read timeout")
             }
             cc_set_sock_timeout(cc, rem)
         }
-        chunk := cc_read(cc, rmax) or >>
+        chunk := cc_read(cc, rmax) or (err) {
+            emsg := err.msg()
+            cc_set_sock_timeout(cc, 0)
+            if is_read_timeout_err(&emsg) {
+                << read_fail_meta(true, "request body read timeout")
+            }
+            << read_fail_meta(false, emsg)
+        }
         if chunk.len == 0 {
-            >> errors.new("unexpected eof reading body")
+            cc_set_sock_timeout(cc, 0)
+            << read_fail_meta(false, "unexpected eof reading body")
         }
         rest = rest + chunk
     }
@@ -431,15 +544,26 @@ pub fn read_http_request_timeout(cc $&ClientConn, timeout_ns int) HttpReq {
         cc.buf = ""
     }
     cc_set_sock_timeout(cc, 0)
-    << HttpReq{
-        req_method: meth,
-        req_path: rpath,
-        hdr_names: hnames,
-        hdr_vals: hvals,
-        req_body: body,
-        remote_ip: cc.remote_ip + "",
-        peer_ip: cc.remote_ip + ""
+    out_req.req_method = meth
+    out_req.req_path = rpath
+    out_req.hdr_names = hnames
+    out_req.hdr_vals = hvals
+    out_req.req_body = body
+    out_req.remote_ip = cc.remote_ip + ""
+    out_req.peer_ip = cc.remote_ip + ""
+    << ReadReqMeta{ok: true, idle_closed: false, is_timeout: false, err_msg: ""}
+}
+
+pub fn read_http_request_timeout(cc $&ClientConn, timeout_ns int) HttpReq {
+    $req := empty_http_req()
+    rr := read_http_request_split(cc, timeout_ns, timeout_ns, $&req)
+    if !rr.ok {
+        if rr.idle_closed {
+            >> errors.new("eof reading request")
+        }
+        >> errors.new(rr.err_msg + "")
     }
+    << req
 }
 
 pub fn read_http_request(cc $&ClientConn) HttpReq {
@@ -449,6 +573,6 @@ pub fn read_http_request(cc $&ClientConn) HttpReq {
 pub fn read_req_into(cc $&ClientConn, timeout_ns int, out_errs $&[]string) HttpReq {
     << read_http_request_timeout(cc, timeout_ns) or (err) {
         out_errs.push(err.msg())
-        << HttpReq{req_method: "", req_path: "", hdr_names: []string{}, hdr_vals: []string{}, req_body: "", remote_ip: "", peer_ip: ""}
+        << empty_http_req()
     }
 }

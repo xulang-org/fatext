@@ -209,6 +209,21 @@ def test_tls_redirect_and_headers(td_p: Path) -> None:
             raw = s.recv(4096).decode("utf-8", errors="replace")
         assert_true("400 Bad Request" in raw, f"expected 400 on //evil.com redirect: {raw}")
 
+        # Unused port-80 connection must close silently on idle timeout (never emit 400/EAGAIN)
+        with socket.create_connection((HOST, redir_port), timeout=6.0) as idle_s:
+            idle_s.settimeout(5.0)
+            idle_raw = idle_s.recv(4096)
+        assert_eq(idle_raw, b"", f"idle port-80 connection must close silently, got {idle_raw!r}")
+
+        # Partial port-80 request timing out must return 408 ERR_REQUEST_TIMEOUT (not 400 EAGAIN)
+        with socket.create_connection((HOST, redir_port), timeout=8.0) as part_s:
+            part_s.sendall(b"GET /health HTTP/1.1\r\nHost: fatext.com\r\n")
+            part_s.settimeout(7.5)
+            part_raw = part_s.recv(4096).decode("utf-8", errors="replace")
+        assert_true("408 Request Timeout" in part_raw, f"expected 408 on partial port-80 timeout: {part_raw!r}")
+        assert_true("ERR_REQUEST_TIMEOUT" in part_raw, f"expected ERR_REQUEST_TIMEOUT: {part_raw!r}")
+        assert_true("resource temporarily unavailable" not in part_raw, f"raw EAGAIN leaked: {part_raw!r}")
+
         # TLS response headers (HSTS, CSP on HTML, X-Frame-Options, Referrer-Policy, nosniff)
         ctx = ssl.create_default_context(cafile=str(cert_p))
         with urllib.request.urlopen(f"https://{HOST}:{tls_port}/", context=ctx, timeout=5.0) as resp:
@@ -270,6 +285,38 @@ def test_http_smuggling_and_slowloris(host: str, port: int) -> None:
                 pass
     elapsed = time.time() - t0
     assert_true(elapsed < 13.5, f"Slowloris connection outlived cumulative 10s deadline ({elapsed:.2f}s)")
+    if got:
+        got_s = got.decode("utf-8", errors="replace")
+        assert_true("408 Request Timeout" in got_s, f"expected 408 on Slowloris timeout, got {got_s!r}")
+        assert_true("ERR_REQUEST_TIMEOUT" in got_s, f"expected ERR_REQUEST_TIMEOUT on Slowloris, got {got_s!r}")
+        assert_true("resource temporarily unavailable" not in got_s, f"raw EAGAIN leaked on Slowloris: {got_s!r}")
+
+    # Keep-Alive reuse after >5s idle (server idle timeout must exceed advertised Keep-Alive timeout=15)
+    with socket.create_connection((host, port), timeout=10.0) as ka_s:
+        ka_s.sendall(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive\r\n\r\n")
+        ka_r1 = ka_s.recv(4096).decode("utf-8", errors="replace")
+        assert_true("200 OK" in ka_r1, f"expected 200 on first keep-alive req: {ka_r1!r}")
+        time.sleep(6.0)
+        ka_s.sendall(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        ka_r2 = ka_s.recv(4096).decode("utf-8", errors="replace")
+        assert_true("200 OK" in ka_r2, f"expected 200 on >5s keep-alive reuse: {ka_r2!r}")
+
+    # Expect: 100-continue must receive 100 Continue before sending body
+    with socket.create_connection((host, port), timeout=5.0) as exp_s:
+        exp_s.sendall(
+            b"POST /v1/agents/register HTTP/1.1\r\n"
+            b"Host: localhost\r\n"
+            b"Content-Type: application/json\r\n"
+            b"Content-Length: 2\r\n"
+            b"Expect: 100-continue\r\n"
+            b"Connection: close\r\n\r\n"
+        )
+        cont_raw = exp_s.recv(1024).decode("utf-8", errors="replace")
+        assert_true("100 Continue" in cont_raw, f"expected 100 Continue, got {cont_raw!r}")
+        exp_s.sendall(b"{}")
+        final_raw = exp_s.recv(4096).decode("utf-8", errors="replace")
+        assert_true("HTTP/1.1 40" in final_raw, f"expected 4xx after body, got {final_raw!r}")
+        assert_true("resource temporarily unavailable" not in final_raw, f"unexpected EAGAIN: {final_raw!r}")
 
 
 def test_restore_rejects_symlinks(td_p: Path) -> None:
