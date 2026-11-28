@@ -13,4 +13,4 @@ ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
 ReadWritePaths=/var/lib/fatext/dl
-ExecStart=/bin/bash -c 'set -euo pipefail; DL_DIR="${FATEXT_DL_DIR:-/var/lib/fatext/dl}"; HOST="${FATEXT_PUBLIC_HOST:-fatext.com}"; PEM="${FATEXT_OFFICIAL_PEM:-https://${HOST}/k/ftx_fatextoffice.pem}"; exec /opt/fatext/deploy/sync_dl.sh latest "$DL_DIR" "$PEM"'
+ExecStart=/bin/bash -c 'set -euo pipefail; dl="$${FATEXT_DL_DIR:-/var/lib/fatext/dl}"; host="$${FATEXT_PUBLIC_HOST:-fatext.com}"; pem="$${FATEXT_OFFICIAL_PEM:-https://$${host}/k/ftx_fatextoffice.pem}"; exec /opt/fatext/deploy/sync_dl.sh latest "$$dl" "$$pem"'
