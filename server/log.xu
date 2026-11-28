@@ -559,7 +559,7 @@ pub fn normalize_route(raw_path string) string {
        path == "/SKILL.md" || path == "/protocol.md" || path == "/.well-known/fatext.json" ||
        path == "/.well-known/security.txt" ||
        path == "/docs/identity.md" || path == "/docs/messaging.md" || path == "/docs/p2p.md" ||
-       path == "/static/fatext.css" || path == "/static/favicon.svg" || path == "/favicon.ico" ||
+       path == "/static/fatext.css" || path == "/static/fatext.js" || path == "/static/favicon.svg" || path == "/favicon.ico" ||
        path == "/static/logo.svg" || path == "/internal/mail/ingest" || path == "/internal/metrics" || path == "/v1/stats" ||
        path == "/v1/agents/register" || path == "/v1/agents/profile" || path == "/v1/agents/rotate-key" ||
        path == "/v1/agents/revoke" || path == "/v1/agents/docs" || path == "/v1/ctl/agents" ||

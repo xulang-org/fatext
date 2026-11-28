@@ -758,14 +758,23 @@ class SafetyAndBalanceParser(HTMLParser):
         self.stack: list[str] = []
         self.errors: list[str] = []
         self.has_refresh = False
+        self.in_ext_script = False
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         t = tag.lower()
         attr_map = {k.lower(): (v or "") for k, v in attrs}
         if t == "script":
             stype = attr_map.get("type", "").lower()
-            if stype != "application/ld+json":
-                self.errors.append(f"executable <script> found (type={stype!r})")
+            src = attr_map.get("src", "")
+            if stype == "application/ld+json":
+                if src:
+                    self.errors.append(f"json-ld <script> has src={src!r}")
+            elif src.startswith("./static/fatext.js") or src.startswith("/static/fatext.js"):
+                if "defer" not in attr_map:
+                    self.errors.append(f"first-party <script> missing defer: {attr_map!r}")
+                self.in_ext_script = True
+            else:
+                self.errors.append(f"disallowed <script> found (type={stype!r}, src={src!r})")
         if t == "meta" and attr_map.get("http-equiv", "").lower() == "refresh":
             self.has_refresh = True
         for k, v in attrs:
@@ -777,8 +786,14 @@ class SafetyAndBalanceParser(HTMLParser):
         if t not in VOID_TAGS:
             self.stack.append(t)
 
+    def handle_data(self, data: str) -> None:
+        if self.in_ext_script and data.strip():
+            self.errors.append(f"non-empty body inside external <script>: {data!r}")
+
     def handle_endtag(self, tag: str) -> None:
         t = tag.lower()
+        if t == "script":
+            self.in_ext_script = False
         if t in VOID_TAGS:
             return
         if not self.stack or self.stack[-1] != t:
@@ -866,7 +881,7 @@ def main() -> int:
         for f in failures:
             print(f"  - {f}", file=sys.stderr)
         return 1
-    print("All validations passed (0 JS, balanced HTML, valid JSON/SVGs, zero leftover placeholders).")
+    print("All validations passed (first-party defer script only, balanced HTML, valid JSON/SVGs, zero leftover placeholders).")
     return 0
 
 

@@ -72,18 +72,37 @@ def assert_true(cond: bool, msg: str = "") -> None:
 class ZeroJSParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=False)
+        self.in_ext_script = False
         self.errors: list[str] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         t = tag.lower()
         amap = {k.lower(): (v or "") for k, v in attrs}
-        if t == "script" and amap.get("type", "").lower() != "application/ld+json":
-            self.errors.append(f"executable <script> found: {amap!r}")
+        if t == "script":
+            stype = amap.get("type", "").lower()
+            src = amap.get("src", "")
+            if stype == "application/ld+json":
+                if src:
+                    self.errors.append(f"json-ld <script> with src={src!r}")
+            elif src.startswith("/static/fatext.js"):
+                if "defer" not in amap:
+                    self.errors.append(f"first-party script missing defer: {amap!r}")
+                self.in_ext_script = True
+            else:
+                self.errors.append(f"disallowed <script> found: {amap!r}")
         for k, v in attrs:
             if k.lower().startswith("on"):
                 self.errors.append(f"inline handler {k!r}")
             if k.lower() in ("href", "src", "action") and v and v.strip().lower().startswith("javascript:"):
                 self.errors.append(f"javascript: URL in {k!r}")
+
+    def handle_data(self, data: str) -> None:
+        if self.in_ext_script and data.strip():
+            self.errors.append(f"non-empty body inside external <script>: {data!r}")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() == "script":
+            self.in_ext_script = False
 
 
 def assert_zero_js_html(html_text: str, label: str) -> None:
