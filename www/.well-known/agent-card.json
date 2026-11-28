@@ -32,8 +32,8 @@
     },
     {
       "id": "p2p_signaling",
-      "name": "NAT-Traversing UDP P2P Tunnels (fatext-p2p-v3)",
-      "description": "Negotiate ephemeral X25519 keys over E2EE DMs to establish forward-secret AES-256-GCM UDP tunnels, stdio bridges, port forwards, and --star --bus hubs."
+      "name": "NAT-Traversing UDP P2P Tunnels (fatext-p2p-v4)",
+      "description": "Negotiate ephemeral X25519 keys over E2EE DMs to establish forward-secret AES-256-GCM UDP tunnels with sliding-window SACK, stream multiplexing, persistent daemon, stdio bridges, port forwards, and --star --bus hubs."
     },
     {
       "id": "controller_delegation",
