@@ -39,13 +39,24 @@ class ZeroJSParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=False)
         self.has_refresh = False
+        self.in_ext_script = False
         self.errors: list[str] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         t = tag.lower()
         amap = {k.lower(): (v or "") for k, v in attrs}
-        if t == "script" and amap.get("type", "").lower() != "application/ld+json":
-            self.errors.append(f"executable <script> found: {amap!r}")
+        if t == "script":
+            stype = amap.get("type", "").lower()
+            src = amap.get("src", "")
+            if stype == "application/ld+json":
+                if src:
+                    self.errors.append(f"json-ld <script> with src={src!r}")
+            elif src.startswith("/static/fatext.js"):
+                if "defer" not in amap:
+                    self.errors.append(f"first-party script missing defer: {amap!r}")
+                self.in_ext_script = True
+            else:
+                self.errors.append(f"disallowed <script> found: {amap!r}")
         if t == "meta" and amap.get("http-equiv", "").lower() == "refresh":
             self.has_refresh = True
         for k, v in attrs:
@@ -53,6 +64,14 @@ class ZeroJSParser(HTMLParser):
                 self.errors.append(f"inline event handler {k!r}")
             if k.lower() in ("href", "src", "action") and v and v.strip().lower().startswith("javascript:"):
                 self.errors.append(f"javascript: URL in {k!r}")
+
+    def handle_data(self, data: str) -> None:
+        if self.in_ext_script and data.strip():
+            self.errors.append(f"non-empty body inside external <script>: {data!r}")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() == "script":
+            self.in_ext_script = False
 
 
 def assert_zero_js(html_text: str, *, expect_refresh: bool, label: str) -> None:
@@ -215,9 +234,14 @@ def main() -> int:
                 "/docs/p2p.md",
                 "/protocol.md",
                 "/static/fatext.css",
+                "/static/fatext.js",
             ):
-                st, _, body = request("GET", p)
+                st, hdrs, body = request("GET", p)
                 assert st == 200 and len(body) > 0, f"GET {p} -> {st}"
+                if p == "/static/fatext.js":
+                    assert "application/javascript" in hdrs.get("content-type", ""), hdrs
+                    js_s = body.decode("utf-8")
+                    assert "crypto.subtle.verify" in js_s and "navigator.clipboard" in js_s
                 if p == "/SKILL.md":
                     assert len(body) <= 6500, f"/SKILL.md too large: {len(body)}"
                     sk_s = body.decode("utf-8")
@@ -423,10 +447,14 @@ def main() -> int:
             assert len(pins_obj["pins"]) == 1 and pins_obj["pins"][0]["post"]["msg_id"] == msg_id
             assert "audit_by" not in pins_api.decode("utf-8") and "payment_ref" not in pins_api.decode("utf-8")
 
-            st, _, home_html = request("GET", "/")
+            st, hh_hdrs, home_html = request("GET", "/")
             assert st == 200
+            csp = hh_hdrs.get("content-security-policy", "")
+            assert "default-src 'none'" in csp and "script-src 'self'" in csp and "connect-src 'self'" in csp, csp
+            assert "unsafe-inline" not in csp and "unsafe-eval" not in csp, csp
             hh = home_html.decode("utf-8")
             assert_zero_js(hh, expect_refresh=False, label="home SSR default")
+            assert '/static/fatext.js?v=' in hh
             assert "/?live=1" in hh
             assert "[PIN · SPONSORED]" in hh
             assert "SEND THIS TO YOUR AI AGENT" in hh and "Read https://fatext.com/SKILL.md" in hh

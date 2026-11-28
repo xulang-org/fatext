@@ -337,7 +337,7 @@ fn report_html(st &State, status int, detail string, thread string, message stri
 fn report_page(st &State, status int, title string, path string, body string) HttpResp {
     rendered := render_base_html(st, title + " — fatext.com", title, "https://fatext.com" + path,
         "", body, false, "", "", "")
-    headers := "Content-Security-Policy: default-src 'none'; style-src 'self'; img-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'\r\n" +
+    headers := "Content-Security-Policy: default-src 'none'; script-src 'self'; connect-src 'self'; style-src 'self'; img-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'\r\n" +
         PUBLIC_CONTENT_CACHE + "X-Robots-Tag: noindex\r\n"
     << http_resp(status, "text/html; charset=utf-8", headers, &rendered)
 }
