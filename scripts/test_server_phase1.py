@@ -203,9 +203,31 @@ def main() -> int:
             today_utc = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
 
             # 1. Health, discovery, static assets
-            for p in ("/health", "/llms.txt", "/llms-full.txt", "/.well-known/fatext.json", "/SKILL.md", "/static/fatext.css"):
+            for p in (
+                "/health",
+                "/llms.txt",
+                "/llms-full.txt",
+                "/.well-known/fatext.json",
+                "/.well-known/security.txt",
+                "/SKILL.md",
+                "/docs/identity.md",
+                "/docs/messaging.md",
+                "/docs/p2p.md",
+                "/protocol.md",
+                "/static/fatext.css",
+            ):
                 st, _, body = request("GET", p)
                 assert st == 200 and len(body) > 0, f"GET {p} -> {st}"
+                if p == "/SKILL.md":
+                    assert len(body) <= 6500, f"/SKILL.md too large: {len(body)}"
+                    sk_s = body.decode("utf-8")
+                    assert "/docs/identity.md" in sk_s and "/docs/messaging.md" in sk_s and "/docs/p2p.md" in sk_s
+                if p == "/.well-known/security.txt":
+                    sec_s = body.decode("utf-8")
+                    assert "advisories/new" in sec_s and "ftx_fatextoffice.pem" in sec_s
+                if p == "/protocol.md":
+                    pr_s = body.decode("utf-8")
+                    assert "/internal/mail/ingest" in pr_s and "/internal/email" not in pr_s
             print("[1/12] health, discovery & static assets OK")
 
             # 2. Register Agent 1 (bad PoW, bad sig, then valid)
@@ -431,12 +453,18 @@ def main() -> int:
             assert_zero_js(dl_s, expect_refresh=False, label="download SSR")
             assert "Download fatext CLI" in dl_s and "SHA256SUMS.sig" in dl_s
 
-            for p_path, p_marker in [("/help", "Usage Help"), ("/about", "About fatext"), ("/privacy", "Privacy &amp; Security Policy"), ("/terms", "Terms of Use")]:
+            for p_path, p_marker in [("/help", "Usage Help"), ("/about", "About fatext"), ("/privacy", "Privacy &amp; Security Policy"), ("/terms", "Terms of Use"), ("/report", "Report public content"), ("/report/status", "Report status")]:
                 st_p, _, p_html = request("GET", p_path)
                 assert st_p == 200, f"GET {p_path} -> {st_p}"
                 p_s = p_html.decode("utf-8")
                 assert_zero_js(p_s, expect_refresh=False, label=f"{p_path} SSR")
                 assert p_marker in p_s, f"GET {p_path} missing {p_marker}"
+                if p_path == "/privacy":
+                    assert "/internal/mail/ingest" in p_s and "forward secrecy" in p_s.lower()
+                if p_path == "/report":
+                    assert '<option value="spam">' in p_s and 'fatext</a> / report' in p_s
+                if p_path == "/report/status":
+                    assert 'fatext</a> / <a href="/report">report</a> / status' in p_s
             print("[10/12] hot-reload pins.json + home/channel/policy SSR OK")
 
             # 11. Zero-DB restart recovery of daily post limit

@@ -52,11 +52,14 @@ def build_llms_full() -> None:
     sources = [
         ("https://fatext.com/llms.txt", WWW_DIR / "llms.txt"),
         ("https://fatext.com/SKILL.md", WWW_DIR / "SKILL.md"),
+        ("https://fatext.com/docs/identity.md", WWW_DIR / "docs" / "identity.md"),
+        ("https://fatext.com/docs/messaging.md", WWW_DIR / "docs" / "messaging.md"),
+        ("https://fatext.com/docs/p2p.md", WWW_DIR / "docs" / "p2p.md"),
         ("https://fatext.com/protocol.md", WWW_DIR / "protocol.md"),
     ]
     parts = [
         "# fatext.com — Full LLM Context (v3.0)\n",
-        "Concatenated from `/llms.txt`, `/SKILL.md`, and `/protocol.md`.\n",
+        "Concatenated from `/llms.txt`, `/SKILL.md`, `/docs/*.md`, and `/protocol.md`.\n",
     ]
     for url, path in sources:
         text = path.read_text(encoding="utf-8").strip()
@@ -805,9 +808,19 @@ def validate_all(rendered: dict[str, Path]) -> list[str]:
         svg_path = WWW_DIR / "static" / svg_name
         ET.fromstring(svg_path.read_text(encoding="utf-8"))
 
-    # 3. llms-full.txt check
+    # 3. SKILL.md size & llms-full.txt check
+    skill_bytes = (WWW_DIR / "SKILL.md").stat().st_size
+    if skill_bytes > 6500:
+        failures.append(f"SKILL.md too large ({skill_bytes} bytes > 6500)")
     llms_full = (WWW_DIR / "llms-full.txt").read_text(encoding="utf-8")
-    for marker in ("https://fatext.com/llms.txt", "https://fatext.com/SKILL.md", "https://fatext.com/protocol.md"):
+    for marker in (
+        "https://fatext.com/llms.txt",
+        "https://fatext.com/SKILL.md",
+        "https://fatext.com/docs/identity.md",
+        "https://fatext.com/docs/messaging.md",
+        "https://fatext.com/docs/p2p.md",
+        "https://fatext.com/protocol.md",
+    ):
         if marker not in llms_full:
             failures.append(f"llms-full.txt missing section {marker}")
 

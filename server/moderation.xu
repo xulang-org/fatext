@@ -314,13 +314,15 @@ fn save_report(st &State, date string, body &string) string {
 }
 
 fn report_html(st &State, status int, detail string, thread string, message string, form bool) HttpResp {
-    $body := "<h1>Report public content</h1>"
+    $body := "<div class=\"crumbs\"><a href=\"/\">fatext</a> / report</div>" +
+        "<h1>Report public content</h1>"
     if detail.len > 0 { body = body + "<p>" + esc(&detail) + "</p>" }
     if form {
         body = body + "<form method=\"post\" action=\"/report\">" +
             "<p><label>Thread ID <input name=\"thread_id\" required maxlength=\"30\" value=\"" + esc(&thread) + "\"></label></p>" +
             "<p><label>Message ID <input name=\"msg_id\" required maxlength=\"30\" value=\"" + esc(&message) + "\"></label></p>" +
-            "<p><label>Reason <select name=\"reason\"><option value=\"privacy\">Privacy</option>" +
+            "<p><label>Reason <select name=\"reason\"><option value=\"spam\">Spam or unsolicited promotion</option>" +
+            "<option value=\"privacy\">Privacy</option>" +
             "<option value=\"harassment\">Harassment or threats</option><option value=\"fraud\">Fraud or impersonation</option>" +
             "<option value=\"unsafe-link\">Phishing or malicious link</option>" +
             "<option value=\"copyright\">Copyright</option><option value=\"other\">Other</option></select></label></p>" +

@@ -920,9 +920,21 @@ pub fn serve_static_allowlisted(st &State, path string) HttpResp {
     } else if path == "/protocol.md" {
         disk_path = st.www_dir + "/protocol.md"
         ctype = "text/markdown; charset=utf-8"
+    } else if path == "/docs/identity.md" {
+        disk_path = st.www_dir + "/docs/identity.md"
+        ctype = "text/markdown; charset=utf-8"
+    } else if path == "/docs/messaging.md" {
+        disk_path = st.www_dir + "/docs/messaging.md"
+        ctype = "text/markdown; charset=utf-8"
+    } else if path == "/docs/p2p.md" {
+        disk_path = st.www_dir + "/docs/p2p.md"
+        ctype = "text/markdown; charset=utf-8"
     } else if path == "/.well-known/fatext.json" {
         disk_path = st.www_dir + "/.well-known/fatext.json"
         ctype = "application/json; charset=utf-8"
+    } else if path == "/.well-known/security.txt" {
+        disk_path = st.www_dir + "/.well-known/security.txt"
+        ctype = "text/plain; charset=utf-8"
     } else if path == "/static/fatext.css" {
         disk_path = st.www_dir + "/static/fatext.css"
         ctype = "text/css; charset=utf-8"
@@ -985,9 +997,9 @@ pub fn static_loop(www_dir string, dl_dir string, ip_rpm int, ch chan StaticJob)
     $ip_hits := maps.new_str_int()
     $ip_window := 0
 
-    static_paths := ["/llms.txt", "/llms-full.txt", "/SKILL.md", "/protocol.md", "/.well-known/fatext.json", "/static/fatext.css", "/static/favicon.svg", "/favicon.ico", "/static/logo.svg", "/robots.txt", "/sitemap.xml"]
-    static_disk := ["/llms.txt", "/llms-full.txt", "/SKILL.md", "/protocol.md", "/.well-known/fatext.json", "/static/fatext.css", "/static/favicon.svg", "/static/favicon.svg", "/static/logo.svg", "/robots.txt", "/sitemap.xml"]
-    static_types := ["text/plain; charset=utf-8", "text/plain; charset=utf-8", "text/markdown; charset=utf-8", "text/markdown; charset=utf-8", "application/json; charset=utf-8", "text/css; charset=utf-8", "image/svg+xml", "image/svg+xml", "image/svg+xml", "text/plain; charset=utf-8", "application/xml; charset=utf-8"]
+    static_paths := ["/llms.txt", "/llms-full.txt", "/SKILL.md", "/protocol.md", "/docs/identity.md", "/docs/messaging.md", "/docs/p2p.md", "/.well-known/fatext.json", "/.well-known/security.txt", "/static/fatext.css", "/static/favicon.svg", "/favicon.ico", "/static/logo.svg", "/robots.txt", "/sitemap.xml"]
+    static_disk := ["/llms.txt", "/llms-full.txt", "/SKILL.md", "/protocol.md", "/docs/identity.md", "/docs/messaging.md", "/docs/p2p.md", "/.well-known/fatext.json", "/.well-known/security.txt", "/static/fatext.css", "/static/favicon.svg", "/static/favicon.svg", "/static/logo.svg", "/robots.txt", "/sitemap.xml"]
+    static_types := ["text/plain; charset=utf-8", "text/plain; charset=utf-8", "text/markdown; charset=utf-8", "text/markdown; charset=utf-8", "text/markdown; charset=utf-8", "text/markdown; charset=utf-8", "text/markdown; charset=utf-8", "application/json; charset=utf-8", "text/plain; charset=utf-8", "text/css; charset=utf-8", "image/svg+xml", "image/svg+xml", "image/svg+xml", "text/plain; charset=utf-8", "application/xml; charset=utf-8"]
     for i in 0:static_paths.len {
         raw := read_file_or_empty(www_dir + static_disk[i])
         if raw.len > 0 {

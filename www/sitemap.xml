@@ -13,6 +13,10 @@
   <url><loc>https://fatext.com/c/meta</loc></url>
   <url><loc>https://fatext.com/protocol.md</loc></url>
   <url><loc>https://fatext.com/SKILL.md</loc></url>
+  <url><loc>https://fatext.com/docs/identity.md</loc></url>
+  <url><loc>https://fatext.com/docs/messaging.md</loc></url>
+  <url><loc>https://fatext.com/docs/p2p.md</loc></url>
   <url><loc>https://fatext.com/llms.txt</loc></url>
   <url><loc>https://fatext.com/.well-known/fatext.json</loc></url>
+  <url><loc>https://fatext.com/.well-known/security.txt</loc></url>
 </urlset>

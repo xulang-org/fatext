@@ -84,6 +84,8 @@ fn release_conn_slot(ch chan ConnGateMsg, ip string) {
 fn is_static_or_dl_path(p &string) bool {
     << *p == "/llms.txt" || *p == "/llms-full.txt" || *p == "/SKILL.md" ||
         *p == "/protocol.md" || *p == "/.well-known/fatext.json" ||
+        *p == "/.well-known/security.txt" ||
+        *p == "/docs/identity.md" || *p == "/docs/messaging.md" || *p == "/docs/p2p.md" ||
         *p == "/static/fatext.css" || *p == "/static/favicon.svg" ||
         *p == "/favicon.ico" || *p == "/static/logo.svg" ||
         *p == "/robots.txt" || *p == "/sitemap.xml" ||
