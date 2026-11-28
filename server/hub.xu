@@ -98,6 +98,8 @@ pub struct HubState {
     pub ch_posts_today maps.StrInt
     pub pub_stats_ts int
     pub pub_stats_json string
+    pub pair_sessions []PairSession
+    pub last_pair_sweep int
 }
 
 pub fn empty_entity_stats_cache() EntityStatsCache {
@@ -158,7 +160,9 @@ pub fn new_hub_state(st State, log_ch chan string, static_ch chan StaticJob, web
         entity_cache_day: utc_date_from_unix(now),
         ch_posts_today: maps.new_str_int(),
         pub_stats_ts: 0,
-        pub_stats_json: ""
+        pub_stats_json: "",
+        pair_sessions: []PairSession{},
+        last_pair_sweep: now
     }
 }
 
@@ -657,6 +661,53 @@ fn dispatch_http(hub $&HubState, req &HttpReq, now int, preflight bool, reviewed
         }
     }
 
+    if path == "/v1/ctl/pair" {
+        if method != "POST" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+        << handle_ctl_pair_open(hub, req, now)
+    }
+    if strings.has_prefix(&path, "/v1/ctl/pair/") {
+        rest := path[13:path.len]
+        parts := strings.split(&rest, "/")
+        if parts.len == 1 {
+            pid := parts[0] + ""
+            if method == "GET" { << handle_ctl_pair_poll(hub, req, pid, now) }
+            if method == "DELETE" { << handle_ctl_pair_cancel(hub, req, pid, now) }
+            << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0)
+        }
+        if parts.len == 2 {
+            pid := parts[0] + ""
+            act := parts[1] + ""
+            if act == "reject" {
+                if method != "POST" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+                << handle_ctl_pair_reject(hub, req, pid, now)
+            }
+            if act == "deliver" {
+                if method != "POST" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+                << handle_ctl_pair_deliver(hub, req, pid, now)
+            }
+        }
+    }
+    if strings.has_prefix(&path, "/v1/pair/") {
+        rest := path[9:path.len]
+        parts := strings.split(&rest, "/")
+        if parts.len == 1 {
+            if method != "GET" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+            << handle_pair_info(hub, parts[0] + "", now)
+        }
+        if parts.len == 2 {
+            pid := parts[0] + ""
+            act := parts[1] + ""
+            if act == "join" {
+                if method != "POST" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+                << handle_pair_join(hub, req, pid, now)
+            }
+            if act == "voucher" {
+                if method != "GET" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
+                << handle_pair_voucher(hub, req, pid, now)
+            }
+        }
+    }
+
     if path == "/v1/ctl/agents" {
         if method != "GET" { << err_resp(405, "ERR_BAD_REQUEST", "method not allowed", 0, 0, 0) }
         << handle_ctl_list_agents($&hub.st, req, now)
@@ -952,6 +1003,10 @@ pub fn hub_loop(hub_init HubState, jobs chan HubJob) {
         t_start := time.now()
         now := time.now_time().unix()
         sweep_state_maps($&hub.st, now)
+        if now - hub.last_pair_sweep >= 10 {
+            sweep_pair_sessions($&hub, now)
+            hub.last_pair_sweep = now
+        }
 
         if job.kind == HUB_CONFIG_RELOAD {
             reload_configs($&hub.st, now)
