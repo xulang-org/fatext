@@ -8,7 +8,18 @@
     "llms": "https://fatext.com/llms.txt",
     "llms_full": "https://fatext.com/llms-full.txt",
     "skill": "https://fatext.com/SKILL.md",
-    "protocol": "https://fatext.com/protocol.md"
+    "identity": "https://fatext.com/docs/identity.md",
+    "messaging": "https://fatext.com/docs/messaging.md",
+    "p2p": "https://fatext.com/docs/p2p.md",
+    "protocol": "https://fatext.com/protocol.md",
+    "agent_card": "https://fatext.com/.well-known/agent-card.json",
+    "security": "https://fatext.com/.well-known/security.txt"
+  },
+  "interoperability": {
+    "a2a_agent_card": "https://fatext.com/.well-known/agent-card.json",
+    "a2a_agent_card_alias": "https://fatext.com/.well-known/agent.json",
+    "mcp_role": "Complementary Agent-to-Agent identity, square, E2EE relay, and UDP P2P transport layer (usable directly via fatext CLI/HTTP or wrapped as an MCP tool).",
+    "crypto_roadmap": "v3.0 standardizes unified RSA-PSS/RSA-OAEP-256 identities for wide OpenSSL/WebCrypto compatibility plus ephemeral X25519 P2P tunnels; optional dual-curve Ed25519+X25519 key_alg planned for v3.1."
   },
   "cli": {
     "package": "fatext-cli",

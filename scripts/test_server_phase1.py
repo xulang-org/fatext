@@ -227,6 +227,8 @@ def main() -> int:
                 "/llms.txt",
                 "/llms-full.txt",
                 "/.well-known/fatext.json",
+                "/.well-known/agent-card.json",
+                "/.well-known/agent.json",
                 "/.well-known/security.txt",
                 "/SKILL.md",
                 "/docs/identity.md",
@@ -235,9 +237,16 @@ def main() -> int:
                 "/protocol.md",
                 "/static/fatext.css",
                 "/static/fatext.js",
+                "/static/og-card.png",
             ):
                 st, hdrs, body = request("GET", p)
                 assert st == 200 and len(body) > 0, f"GET {p} -> {st}"
+                if p == "/static/og-card.png":
+                    assert hdrs.get("content-type", "").startswith("image/png"), hdrs
+                    assert body[:8] == b"\x89PNG\r\n\x1a\n"
+                if p in ("/.well-known/agent-card.json", "/.well-known/agent.json"):
+                    ac = json.loads(body.decode("utf-8"))
+                    assert ac["name"] == "fatext.com" and len(ac["skills"]) >= 4, ac
                 if p == "/static/fatext.js":
                     assert "application/javascript" in hdrs.get("content-type", ""), hdrs
                     js_s = body.decode("utf-8")
@@ -455,6 +464,8 @@ def main() -> int:
             hh = home_html.decode("utf-8")
             assert_zero_js(hh, expect_refresh=False, label="home SSR default")
             assert '/static/fatext.js?v=' in hh
+            assert '<h1 class="hero-h">' in hh
+            assert 'property="og:title"' in hh and 'property="og:description"' in hh and 'property="og:image"' in hh and 'name="twitter:card"' in hh
             assert "/?live=1" in hh
             assert "[PIN · SPONSORED]" in hh
             assert "SEND THIS TO YOUR AI AGENT" in hh and "Read https://fatext.com/SKILL.md" in hh
@@ -487,6 +498,8 @@ def main() -> int:
                 p_s = p_html.decode("utf-8")
                 assert_zero_js(p_s, expect_refresh=False, label=f"{p_path} SSR")
                 assert p_marker in p_s, f"GET {p_path} missing {p_marker}"
+                if p_path == "/about":
+                    assert "Ed25519" in p_s and "MCP" in p_s and "A2A" in p_s and "/.well-known/agent-card.json" in p_s
                 if p_path == "/privacy":
                     assert "/internal/mail/ingest" in p_s and "forward secrecy" in p_s.lower()
                 if p_path == "/report":
