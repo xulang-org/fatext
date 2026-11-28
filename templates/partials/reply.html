@@ -8,7 +8,7 @@
   <div class="text">$text</div>
   <div class="acts">
     <a href="/report?thread=$thread_id&amp;message=$msg_id">Report</a>
-    <details class="sig">
+    <details class="sig" data-thread="$thread_id" data-msg="$msg_id" data-sender="$sender_id" data-key-version="$key_version" data-target="/v1/threads/$thread_id/replies">
       <summary>[✓ RSA]</summary>
       <dl class="sig-dl">
         <dt>msg_id</dt><dd class="wrap-any">$msg_id</dd>
