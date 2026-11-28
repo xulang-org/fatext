@@ -1,0 +1,431 @@
+@main
+
+#crypto/sha256
+#crypto/subtle
+#encoding/base64
+#encoding/json
+#strconv
+#strings
+
+pub const PAIR_MAX_SESSIONS = 128
+pub const PAIR_MAX_PER_CONTROLLER = 4
+pub const PAIR_MAX_ATTEMPTS = 3
+pub const PAIR_MIN_TTL = 20
+pub const PAIR_MAX_TTL = 605
+pub const PAIR_MAX_ENVELOPE_BYTES = 16384
+
+pub struct PairSession {
+    pub pair_id string
+    pub controller_id string
+    pub controller_key_version int
+    pub c_xpub string
+    pub c_xpub_sig string
+    pub created_at int
+    pub expires_at int
+    pub status string
+    pub attempts int
+    pub w_xpub string
+    pub worker_confirm string
+    pub claim_hash string
+    pub last_rejected_claim_hash string
+    pub voucher_iv string
+    pub voucher_ct string
+}
+
+fn clone_pair_session(s &PairSession) PairSession {
+    << PairSession{
+        pair_id: s.pair_id + "",
+        controller_id: s.controller_id + "",
+        controller_key_version: s.controller_key_version,
+        c_xpub: s.c_xpub + "",
+        c_xpub_sig: s.c_xpub_sig + "",
+        created_at: s.created_at,
+        expires_at: s.expires_at,
+        status: s.status + "",
+        attempts: s.attempts,
+        w_xpub: s.w_xpub + "",
+        worker_confirm: s.worker_confirm + "",
+        claim_hash: s.claim_hash + "",
+        last_rejected_claim_hash: s.last_rejected_claim_hash + "",
+        voucher_iv: s.voucher_iv + "",
+        voucher_ct: s.voucher_ct + ""
+    }
+}
+
+pub fn is_valid_pair_id(s string) bool {
+    if !strings.has_prefix(&s, "pair_") { << false }
+    if s.len < 17 || s.len > 31 { << false }
+    for i in 5:s.len {
+        c := s[i] & 255
+        is_az := c >= 97 && c <= 122
+        is_27 := c >= 50 && c <= 55
+        if !is_az && !is_27 { << false }
+    }
+    << true
+}
+
+fn is_lower_hex64(s &string) bool {
+    if s.len != 64 { << false }
+    for i in 0:64 {
+        c := s[i] & 255
+        is_d := c >= 48 && c <= 57
+        is_a := c >= 97 && c <= 102
+        if !is_d && !is_a { << false }
+    }
+    << true
+}
+
+fn is_valid_x25519_b64(s &string) bool {
+    raw := base64.decode_string(*s + "") or (err) { << false }
+    if raw.len != 32 { << false }
+    << base64.encode_to_string(raw) == *s
+}
+
+pub fn sweep_pair_sessions(hub $&HubState, now int) {
+    if hub.pair_sessions.len == 0 { << }
+    $next := []PairSession{}
+    for i in 0:hub.pair_sessions.len {
+        s := &hub.pair_sessions[i]
+        if s.expires_at > now {
+            next.push(clone_pair_session(s))
+        }
+    }
+    hub.pair_sessions = next
+}
+
+fn find_pair_index(hub &HubState, pair_id string) int {
+    for i in 0:hub.pair_sessions.len {
+        if hub.pair_sessions[i].pair_id == pair_id {
+            << i
+        }
+    }
+    << -1
+}
+
+fn delete_pair_index(hub $&HubState, idx int) {
+    $next := []PairSession{}
+    for i in 0:hub.pair_sessions.len {
+        if i != idx {
+            next.push(clone_pair_session(&hub.pair_sessions[i]))
+        }
+    }
+    hub.pair_sessions = next
+}
+
+fn replace_pair_index(hub $&HubState, idx int, updated &PairSession) {
+    $next := []PairSession{}
+    for i in 0:hub.pair_sessions.len {
+        if i == idx {
+            next.push(clone_pair_session(updated))
+        } else {
+            next.push(clone_pair_session(&hub.pair_sessions[i]))
+        }
+    }
+    hub.pair_sessions = next
+}
+
+pub fn handle_ctl_pair_open(hub $&HubState, req &HttpReq, now int) HttpResp {
+    sweep_pair_sessions(hub, now)
+    au := authenticate_controller($&hub.st, req, now)
+    if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
+
+    body := req.body()
+    doc := json.parse(&body)
+    if !doc.ok() || !doc.is_dict(doc.root()) {
+        << err_resp(400, "ERR_BAD_REQUEST", "invalid JSON body", 0, 0, 0)
+    }
+    r := doc.root()
+    pair_id := strings.trim_space(&json_str_or(&doc, doc.get(r, "pair_id"), ""))
+    c_xpub := strings.trim_space(&json_str_or(&doc, doc.get(r, "c_xpub"), ""))
+    c_xpub_sig := strings.trim_space(&json_str_or(&doc, doc.get(r, "c_xpub_sig"), ""))
+    expires_at := json_int_or(&doc, doc.get(r, "expires_at"), 0)
+
+    if !is_valid_pair_id(pair_id + "") {
+        << err_resp(400, "ERR_BAD_REQUEST", "invalid pair_id format", 0, 0, 0)
+    }
+    if !is_valid_x25519_b64(&c_xpub) {
+        << err_resp(400, "ERR_BAD_REQUEST", "c_xpub must be base64-encoded 32-byte X25519 key", 0, 0, 0)
+    }
+    if expires_at < now + PAIR_MIN_TTL || expires_at > now + PAIR_MAX_TTL {
+        << err_resp(400, "ERR_BAD_REQUEST", "expires_at TTL must be between 30s and 600s", 0, 0, 0)
+    }
+    if c_xpub_sig.len == 0 {
+        << err_resp(400, "ERR_BAD_REQUEST", "missing c_xpub_sig", 0, 0, 0)
+    }
+
+    pk := parse_spki_rsa_pem(&au.agent.pub_pem) or (err) {
+        << err_resp(500, "ERR_INTERNAL", "controller key invalid", 0, 0, 0)
+    }
+    sign_msg := "fatext-pair-v1\nopen\n" + au.agent_id + "\n" + pair_id + "\n" + c_xpub + "\n" + strconv.itoa(expires_at)
+    if !verify_pss_message(&pk, &sign_msg, c_xpub_sig + "") {
+        << err_resp(401, "ERR_BAD_SIGNATURE", "c_xpub_sig verification failed", 0, 0, 0)
+    }
+
+    if find_pair_index(hub, pair_id + "") >= 0 {
+        << err_resp(409, "ERR_CONFLICT", "pair_id already exists", 0, 0, 0)
+    }
+    if hub.pair_sessions.len >= PAIR_MAX_SESSIONS {
+        << err_resp(429, "ERR_OVERLOADED", "pairing relay session limit reached", 30, now + 30, 0)
+    }
+    $mine := 0
+    for i in 0:hub.pair_sessions.len {
+        if hub.pair_sessions[i].controller_id == au.agent_id {
+            mine += 1
+        }
+    }
+    if mine >= PAIR_MAX_PER_CONTROLLER {
+        << err_resp(429, "ERR_RATE_LIMITED", "too many active pairing sessions for controller", 30, now + 30, 0)
+    }
+
+    sess := PairSession{
+        pair_id: pair_id + "",
+        controller_id: au.agent_id + "",
+        controller_key_version: au.key_version,
+        c_xpub: c_xpub + "",
+        c_xpub_sig: c_xpub_sig + "",
+        created_at: now,
+        expires_at: expires_at,
+        status: "waiting",
+        attempts: 0,
+        w_xpub: "",
+        worker_confirm: "",
+        claim_hash: "",
+        last_rejected_claim_hash: "",
+        voucher_iv: "",
+        voucher_ct: ""
+    }
+    $ps := $&hub.pair_sessions
+    ps.push(sess)
+    << json_resp(201, "{\"ok\":true,\"pair_id\":" + json.quote(&pair_id) +
+        ",\"controller_id\":" + json.quote(&au.agent_id) +
+        ",\"expires_at\":" + strconv.itoa(expires_at) + "}")
+}
+
+pub fn handle_ctl_pair_poll(hub $&HubState, req &HttpReq, pair_id string, now int) HttpResp {
+    sweep_pair_sessions(hub, now)
+    au := authenticate_controller($&hub.st, req, now)
+    if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
+    if !is_valid_pair_id(pair_id + "") { << err_resp(404, "ERR_NOT_FOUND", "pairing session not found", 0, 0, 0) }
+    idx := find_pair_index(hub, pair_id + "")
+    if idx < 0 { << err_resp(404, "ERR_NOT_FOUND", "pairing session not found or expired", 0, 0, 0) }
+    s := &hub.pair_sessions[idx]
+    if s.controller_id != au.agent_id {
+        << err_resp(403, "ERR_FORBIDDEN", "pairing session belongs to another controller", 0, 0, 0)
+    }
+    $rem := PAIR_MAX_ATTEMPTS - s.attempts
+    if rem < 0 { rem = 0 }
+    << json_resp(200, "{\"ok\":true,\"pair_id\":" + json.quote(&s.pair_id) +
+        ",\"status\":" + json.quote(&s.status) +
+        ",\"attempts\":" + strconv.itoa(s.attempts) +
+        ",\"attempts_remaining\":" + strconv.itoa(rem) +
+        ",\"expires_at\":" + strconv.itoa(s.expires_at) +
+        ",\"w_xpub\":" + json.quote(&s.w_xpub) +
+        ",\"worker_confirm\":" + json.quote(&s.worker_confirm) + "}")
+}
+
+pub fn handle_ctl_pair_reject(hub $&HubState, req &HttpReq, pair_id string, now int) HttpResp {
+    sweep_pair_sessions(hub, now)
+    au := authenticate_controller($&hub.st, req, now)
+    if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
+    if !is_valid_pair_id(pair_id + "") { << err_resp(404, "ERR_NOT_FOUND", "pairing session not found", 0, 0, 0) }
+    idx := find_pair_index(hub, pair_id + "")
+    if idx < 0 { << err_resp(404, "ERR_NOT_FOUND", "pairing session not found or expired", 0, 0, 0) }
+    s := clone_pair_session(&hub.pair_sessions[idx])
+    if s.controller_id != au.agent_id {
+        << err_resp(403, "ERR_FORBIDDEN", "pairing session belongs to another controller", 0, 0, 0)
+    }
+    if s.status != "joined" {
+        << err_resp(409, "ERR_CONFLICT", "pairing session has no pending worker attempt", 0, 0, 0)
+    }
+    $next := clone_pair_session(&s)
+    next.attempts = s.attempts + 1
+    next.last_rejected_claim_hash = s.claim_hash + ""
+    next.w_xpub = ""
+    next.worker_confirm = ""
+    next.claim_hash = ""
+    $burned := false
+    if next.attempts >= PAIR_MAX_ATTEMPTS {
+        next.status = "burned"
+        burned = true
+    } else {
+        next.status = "waiting"
+    }
+    replace_pair_index(hub, idx, &next)
+    $rem := PAIR_MAX_ATTEMPTS - next.attempts
+    if rem < 0 { rem = 0 }
+    $burned_s := "false"
+    if burned { burned_s = "true" }
+    << json_resp(200, "{\"ok\":true,\"pair_id\":" + json.quote(&pair_id) +
+        ",\"status\":" + json.quote(&next.status) +
+        ",\"attempts\":" + strconv.itoa(next.attempts) +
+        ",\"attempts_remaining\":" + strconv.itoa(rem) +
+        ",\"burned\":" + burned_s + "}")
+}
+
+pub fn handle_ctl_pair_deliver(hub $&HubState, req &HttpReq, pair_id string, now int) HttpResp {
+    sweep_pair_sessions(hub, now)
+    au := authenticate_controller($&hub.st, req, now)
+    if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
+    if !is_valid_pair_id(pair_id + "") { << err_resp(404, "ERR_NOT_FOUND", "pairing session not found", 0, 0, 0) }
+    idx := find_pair_index(hub, pair_id + "")
+    if idx < 0 { << err_resp(404, "ERR_NOT_FOUND", "pairing session not found or expired", 0, 0, 0) }
+    s := clone_pair_session(&hub.pair_sessions[idx])
+    if s.controller_id != au.agent_id {
+        << err_resp(403, "ERR_FORBIDDEN", "pairing session belongs to another controller", 0, 0, 0)
+    }
+    if s.status != "joined" {
+        << err_resp(409, "ERR_CONFLICT", "pairing session is not ready for delivery", 0, 0, 0)
+    }
+
+    body := req.body()
+    doc := json.parse(&body)
+    if !doc.ok() || !doc.is_dict(doc.root()) {
+        << err_resp(400, "ERR_BAD_REQUEST", "invalid JSON body", 0, 0, 0)
+    }
+    r := doc.root()
+    iv_b64 := strings.trim_space(&json_str_or(&doc, doc.get(r, "iv"), ""))
+    ct_b64 := strings.trim_space(&json_str_or(&doc, doc.get(r, "ct"), ""))
+    iv_raw := base64.decode_string(iv_b64 + "") or (err) {
+        << err_resp(400, "ERR_BAD_REQUEST", "invalid iv base64", 0, 0, 0)
+    }
+    if iv_raw.len != 12 {
+        << err_resp(400, "ERR_BAD_REQUEST", "iv must be 12 bytes", 0, 0, 0)
+    }
+    if ct_b64.len == 0 || ct_b64.len > PAIR_MAX_ENVELOPE_BYTES {
+        << err_resp(400, "ERR_BAD_REQUEST", "ciphertext empty or exceeds size limit", 0, 0, 0)
+    }
+    ct_raw := base64.decode_string(ct_b64 + "") or (err) {
+        << err_resp(400, "ERR_BAD_REQUEST", "invalid ct base64", 0, 0, 0)
+    }
+    if ct_raw.len < 16 {
+        << err_resp(400, "ERR_BAD_REQUEST", "ciphertext too short", 0, 0, 0)
+    }
+
+    $next := clone_pair_session(&s)
+    next.status = "delivered"
+    next.voucher_iv = iv_b64 + ""
+    next.voucher_ct = ct_b64 + ""
+    next.last_rejected_claim_hash = ""
+    replace_pair_index(hub, idx, &next)
+    << json_resp(200, "{\"ok\":true,\"pair_id\":" + json.quote(&pair_id) + ",\"status\":\"delivered\"}")
+}
+
+pub fn handle_ctl_pair_cancel(hub $&HubState, req &HttpReq, pair_id string, now int) HttpResp {
+    sweep_pair_sessions(hub, now)
+    au := authenticate_controller($&hub.st, req, now)
+    if !au.ok { << err_resp(au.status, au.code, au.message, 0, 0, 0) }
+    if !is_valid_pair_id(pair_id + "") { << err_resp(404, "ERR_NOT_FOUND", "pairing session not found", 0, 0, 0) }
+    idx := find_pair_index(hub, pair_id + "")
+    if idx < 0 { << err_resp(404, "ERR_NOT_FOUND", "pairing session not found or expired", 0, 0, 0) }
+    if hub.pair_sessions[idx].controller_id != au.agent_id {
+        << err_resp(403, "ERR_FORBIDDEN", "pairing session belongs to another controller", 0, 0, 0)
+    }
+    delete_pair_index(hub, idx)
+    << json_resp(200, "{\"ok\":true,\"deleted\":true}")
+}
+
+pub fn handle_pair_info(hub $&HubState, pair_id string, now int) HttpResp {
+    sweep_pair_sessions(hub, now)
+    if !is_valid_pair_id(pair_id + "") { << err_resp(404, "ERR_NOT_FOUND", "pairing session not found", 0, 0, 0) }
+    idx := find_pair_index(hub, pair_id + "")
+    if idx < 0 { << err_resp(404, "ERR_NOT_FOUND", "pairing session not found or expired", 0, 0, 0) }
+    s := &hub.pair_sessions[idx]
+    if s.status == "burned" {
+        << err_resp(404, "ERR_NOT_FOUND", "pairing session not found or expired", 0, 0, 0)
+    }
+    << json_resp(200, "{\"ok\":true,\"pair_id\":" + json.quote(&s.pair_id) +
+        ",\"controller_id\":" + json.quote(&s.controller_id) +
+        ",\"controller_key_version\":" + strconv.itoa(s.controller_key_version) +
+        ",\"c_xpub\":" + json.quote(&s.c_xpub) +
+        ",\"c_xpub_sig\":" + json.quote(&s.c_xpub_sig) +
+        ",\"expires_at\":" + strconv.itoa(s.expires_at) +
+        ",\"status\":" + json.quote(&s.status) + "}")
+}
+
+pub fn handle_pair_join(hub $&HubState, req &HttpReq, pair_id string, now int) HttpResp {
+    sweep_pair_sessions(hub, now)
+    if !is_valid_pair_id(pair_id + "") { << err_resp(404, "ERR_NOT_FOUND", "pairing session not found", 0, 0, 0) }
+    idx := find_pair_index(hub, pair_id + "")
+    if idx < 0 { << err_resp(404, "ERR_NOT_FOUND", "pairing session not found or expired", 0, 0, 0) }
+    s := clone_pair_session(&hub.pair_sessions[idx])
+    if s.status == "burned" {
+        << err_resp(401, "ERR_PAIR_EXHAUSTED", "pairing session burned after too many failed 2FA attempts", 0, 0, 0)
+    }
+    if s.status != "waiting" {
+        << err_resp(409, "ERR_CONFLICT", "pairing session already joined or completed", 0, 0, 0)
+    }
+
+    body := req.body()
+    doc := json.parse(&body)
+    if !doc.ok() || !doc.is_dict(doc.root()) {
+        << err_resp(400, "ERR_BAD_REQUEST", "invalid JSON body", 0, 0, 0)
+    }
+    r := doc.root()
+    w_xpub := strings.trim_space(&json_str_or(&doc, doc.get(r, "w_xpub"), ""))
+    worker_confirm := strings.to_lower(&strings.trim_space(&json_str_or(&doc, doc.get(r, "worker_confirm"), "")))
+    claim_hash := strings.to_lower(&strings.trim_space(&json_str_or(&doc, doc.get(r, "claim_hash"), "")))
+
+    if !is_valid_x25519_b64(&w_xpub) {
+        << err_resp(400, "ERR_BAD_REQUEST", "w_xpub must be base64-encoded 32-byte X25519 key", 0, 0, 0)
+    }
+    if !is_lower_hex64(&worker_confirm) || !is_lower_hex64(&claim_hash) {
+        << err_resp(400, "ERR_BAD_REQUEST", "worker_confirm and claim_hash must be 64-char hex", 0, 0, 0)
+    }
+
+    $next := clone_pair_session(&s)
+    next.status = "joined"
+    next.w_xpub = w_xpub + ""
+    next.worker_confirm = worker_confirm + ""
+    next.claim_hash = claim_hash + ""
+    next.last_rejected_claim_hash = ""
+    replace_pair_index(hub, idx, &next)
+    << json_resp(202, "{\"ok\":true,\"status\":\"joined\"}")
+}
+
+pub fn handle_pair_voucher(hub $&HubState, req &HttpReq, pair_id string, now int) HttpResp {
+    sweep_pair_sessions(hub, now)
+    if !is_valid_pair_id(pair_id + "") { << err_resp(404, "ERR_NOT_FOUND", "pairing session not found", 0, 0, 0) }
+    claim_secret := strings.to_lower(&strings.trim_space(&req.header("X-Pair-Claim")))
+    if !is_lower_hex64(&claim_secret) {
+        << err_resp(403, "ERR_FORBIDDEN", "missing or invalid X-Pair-Claim", 0, 0, 0)
+    }
+    h := sha256.sum256(claim_secret + "")
+
+    idx := find_pair_index(hub, pair_id + "")
+    if idx < 0 { << err_resp(404, "ERR_NOT_FOUND", "pairing session not found or expired", 0, 0, 0) }
+    s := clone_pair_session(&hub.pair_sessions[idx])
+
+    if s.status == "burned" {
+        if s.last_rejected_claim_hash.len == 64 && subtle.constant_time_compare(&h, &s.last_rejected_claim_hash) == 1 {
+            delete_pair_index(hub, idx)
+            << err_resp(401, "ERR_PAIR_EXHAUSTED", "pairing session burned after too many invalid 2FA codes", 0, 0, 0)
+        }
+        << err_resp(403, "ERR_FORBIDDEN", "invalid pairing claim secret", 0, 0, 0)
+    }
+
+    if s.status == "waiting" && s.last_rejected_claim_hash.len == 64 {
+        if subtle.constant_time_compare(&h, &s.last_rejected_claim_hash) == 1 {
+            $next := clone_pair_session(&s)
+            next.last_rejected_claim_hash = ""
+            replace_pair_index(hub, idx, &next)
+            $rem := PAIR_MAX_ATTEMPTS - s.attempts
+            if rem < 0 { rem = 0 }
+            << err_resp(401, "ERR_BAD_PAIR_CODE", "invalid 2FA pairing code (" + strconv.itoa(rem) + " attempts remaining)", 0, 0, 0)
+        }
+    }
+
+    if s.claim_hash.len != 64 || subtle.constant_time_compare(&h, &s.claim_hash) != 1 {
+        << err_resp(403, "ERR_FORBIDDEN", "invalid pairing claim secret", 0, 0, 0)
+    }
+
+    if s.status == "joined" {
+        << json_resp(202, "{\"ok\":true,\"status\":\"pending\"}")
+    }
+    if s.status == "delivered" {
+        iv := s.voucher_iv + ""
+        ct := s.voucher_ct + ""
+        delete_pair_index(hub, idx)
+        << json_resp(200, "{\"ok\":true,\"status\":\"delivered\",\"iv\":" + json.quote(&iv) + ",\"ct\":" + json.quote(&ct) + "}")
+    }
+    << err_resp(409, "ERR_CONFLICT", "unexpected pairing session state", 0, 0, 0)
+}

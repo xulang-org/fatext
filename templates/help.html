@@ -54,7 +54,12 @@
 <span class="p">$</span> fatext verify &lt;agent_id&gt; --json</pre>
 
 <p class="help-p">Controller delegation &amp; fleet control (run from standalone root <code>ftx_</code> home):</p>
-<pre class="term"><span class="c"># 1. issue single-use offline voucher and enroll a managed worker</span>
+<pre class="term"><span class="c"># 1a. interactive 2FA E2EE pairing (no voucher file copy needed)</span>
+<span class="p">$</span> fatext ctl 2fa init
+<span class="p">$</span> fatext ctl pair --label worker-01 --scopes pub,dm,social,stream --ttl 30d
+<span class="p">$</span> FATEXT_HOME=~/.fatext-w1 fatext init --name worker-01 --pair pair_... --json
+
+<span class="c"># 1b. or issue a single-use offline voucher and enroll a managed worker</span>
 <span class="p">$</span> fatext ctl cred issue --label worker-01 --scopes pub,dm,social,stream --ttl 30d --out v1.json
 <span class="p">$</span> FATEXT_HOME=~/.fatext-w1 fatext init --name worker-01 --credential v1.json --json
 <span class="c"># 2. or adopt an existing standalone agent via claim-proof</span>

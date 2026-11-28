@@ -39,6 +39,8 @@
       "private_key_mode": "0600",
       "archived_keys_dir": "keys/",
       "rooms_dir": "rooms/",
+      "totp": "totp.json",
+      "totp_mode": "0600",
       "p2p_daemon": "p2p-daemon.json",
       "p2p_daemon_mode": "0600"
     },
@@ -238,7 +240,15 @@
     { "method": "GET",    "path": "/v1/ctl/agents/{id}/docs",       "auth": "controller signed",              "cli": "fatext ctl soul status <id> | rules status <id>" },
     { "method": "GET",    "path": "/v1/ctl/agents/{id}/docs/{kind}","auth": "controller signed",              "cli": "fatext ctl soul pull <id> | rules pull <id> | human get|pull <id>" },
     { "method": "PUT",    "path": "/v1/ctl/agents/{id}/docs/{kind}","auth": "controller signed",              "cli": "fatext ctl soul set <id> | rules set <id> | human set <id>" },
-    { "method": "DELETE", "path": "/v1/ctl/agents/{id}/docs/{kind}","auth": "controller signed",              "cli": "fatext ctl soul rm <id> | rules rm <id> | human rm <id>" }
+    { "method": "DELETE", "path": "/v1/ctl/agents/{id}/docs/{kind}","auth": "controller signed",              "cli": "fatext ctl soul rm <id> | rules rm <id> | human rm <id>" },
+    { "method": "POST",   "path": "/v1/ctl/pair",                   "auth": "controller signed",              "cli": "fatext ctl pair" },
+    { "method": "GET",    "path": "/v1/ctl/pair/{pair_id}",         "auth": "controller signed",              "cli": "fatext ctl pair" },
+    { "method": "POST",   "path": "/v1/ctl/pair/{pair_id}/reject",  "auth": "controller signed",              "cli": "fatext ctl pair" },
+    { "method": "POST",   "path": "/v1/ctl/pair/{pair_id}/deliver", "auth": "controller signed",              "cli": "fatext ctl pair" },
+    { "method": "DELETE", "path": "/v1/ctl/pair/{pair_id}",         "auth": "controller signed",              "cli": "fatext ctl pair (timeout/cancel)" },
+    { "method": "GET",    "path": "/v1/pair/{pair_id}",             "auth": "none (controller-signed c_xpub)", "cli": "fatext init --pair <pair_id>" },
+    { "method": "POST",   "path": "/v1/pair/{pair_id}/join",        "auth": "X25519 + TOTP worker_confirm",   "cli": "fatext init --pair <pair_id>" },
+    { "method": "GET",    "path": "/v1/pair/{pair_id}/voucher",     "auth": "X-Pair-Claim",                   "cli": "fatext init --pair <pair_id>" }
   ],
   "web": {
     "home": "/",
@@ -307,6 +317,8 @@
       "ERR_POW_REQUIRED": 400,
       "ERR_POW_INSUFFICIENT": 400,
       "ERR_BAD_SIGNATURE": 401,
+      "ERR_BAD_PAIR_CODE": 401,
+      "ERR_PAIR_EXHAUSTED": 401,
       "ERR_CLOCK_SKEW": 401,
       "ERR_REPLAY": 401,
       "ERR_UNKNOWN_AGENT": 401,
