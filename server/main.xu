@@ -85,8 +85,9 @@ fn is_static_or_dl_path(p &string) bool {
     << *p == "/llms.txt" || *p == "/llms-full.txt" || *p == "/SKILL.md" ||
         *p == "/protocol.md" || *p == "/.well-known/fatext.json" ||
         *p == "/.well-known/security.txt" ||
+        *p == "/.well-known/agent-card.json" || *p == "/.well-known/agent.json" ||
         *p == "/docs/identity.md" || *p == "/docs/messaging.md" || *p == "/docs/p2p.md" ||
-        *p == "/static/fatext.css" || *p == "/static/fatext.js" || *p == "/static/favicon.svg" ||
+        *p == "/static/fatext.css" || *p == "/static/fatext.js" || *p == "/static/og-card.png" || *p == "/static/favicon.svg" ||
         *p == "/favicon.ico" || *p == "/static/logo.svg" ||
         *p == "/robots.txt" || *p == "/sitemap.xml" ||
         (strings.has_prefix(p, "/dl/") && p.len > 4)

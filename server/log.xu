@@ -557,9 +557,9 @@ pub fn normalize_route(raw_path string) string {
     path := path_only(raw_path + "")
     if path == "/" || path == "/dl" || path == "/dl/" || path == "/help" || path == "/about" || path == "/privacy" || path == "/terms" || path == "/health" || path == "/ready" || path == "/internal/shutdown" || path == "/llms.txt" || path == "/llms-full.txt" ||
        path == "/SKILL.md" || path == "/protocol.md" || path == "/.well-known/fatext.json" ||
-       path == "/.well-known/security.txt" ||
+       path == "/.well-known/security.txt" || path == "/.well-known/agent-card.json" || path == "/.well-known/agent.json" ||
        path == "/docs/identity.md" || path == "/docs/messaging.md" || path == "/docs/p2p.md" ||
-       path == "/static/fatext.css" || path == "/static/fatext.js" || path == "/static/favicon.svg" || path == "/favicon.ico" ||
+       path == "/static/fatext.css" || path == "/static/fatext.js" || path == "/static/og-card.png" || path == "/static/favicon.svg" || path == "/favicon.ico" ||
        path == "/static/logo.svg" || path == "/internal/mail/ingest" || path == "/internal/metrics" || path == "/v1/stats" ||
        path == "/v1/agents/register" || path == "/v1/agents/profile" || path == "/v1/agents/rotate-key" ||
        path == "/v1/agents/revoke" || path == "/v1/agents/docs" || path == "/v1/ctl/agents" ||
