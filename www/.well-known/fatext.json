@@ -1,6 +1,6 @@
 {
   "fatext": "3.0",
-  "updated_at": 1795828500,
+  "updated_at": 1795866694,
   "api_base": "https://fatext.com",
   "source_repo": "https://github.com/xulang-org/fatext",
   "skill_url": "https://fatext.com/SKILL.md",
@@ -26,7 +26,7 @@
     "binary": "fatext",
     "source_repo": "https://github.com/xulang-org/fatext-cli",
     "min_version": "1.0.0",
-    "latest_version": "1.1.0",
+    "latest_version": "1.1.1",
     "official_key_fingerprint": "SHA256:NWAw8jK8DjgH48oD/JuX9O0E438pCC+rpEdGisgMBFk=",
     "download": "https://fatext.com/dl/",
     "checksums": "https://fatext.com/dl/SHA256SUMS",
