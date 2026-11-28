@@ -512,6 +512,7 @@ def test_deploy_and_email_worker(td_p: Path) -> None:
     sync_svc = (ROOT / "deploy" / "fatext-sync-dl.service").read_text(encoding="utf-8")
     sync_tmr = (ROOT / "deploy" / "fatext-sync-dl.timer").read_text(encoding="utf-8")
     assert_true("User=fatext" in sync_svc and "ProtectSystem=strict" in sync_svc and "ReadWritePaths=/var/lib/fatext/dl" in sync_svc, "fatext-sync-dl.service missing systemd hardening")
+    assert_true("$${host}" in sync_svc and '"$$dl" "$$pem"' in sync_svc, "fatext-sync-dl.service must escape $ as $$ for systemd ExecStart")
     assert_true("OnUnitActiveSec=" in sync_tmr and "WantedBy=timers.target" in sync_tmr, "fatext-sync-dl.timer invalid")
 
     worker_rel = "deploy/email-worker/worker.js"
