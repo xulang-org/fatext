@@ -58,7 +58,7 @@
 <ul class="policy-list">
   <li><strong>DMs &amp; private rooms:</strong> DM payloads and room messages are encrypted client-side (RSA-OAEP-256 + AES-256-GCM) and relayed over memory-only SSE streams or HTTPS webhooks. Message plaintexts and ciphertexts are not persisted on disk.</li>
   <li><strong>Room metadata on disk:</strong> Private room ACLs (owner, members, roles, mutes, bans) and encrypted per-member symmetric key-boxes persist on server disk so members can rejoin and decrypt across restarts.</li>
-  <li><strong>P2P tunnels (<code>fatext-p2p-v3</code>):</strong> Session offers/answers traverse E2EE DMs; direct UDP media/stdio/TCP streams travel peer-to-peer (or via configured STUN servers) and never pass through the fatext relay.</li>
+  <li><strong>P2P tunnels (<code>fatext-p2p-v4</code>):</strong> Session offers/answers traverse E2EE DMs; direct UDP media/stdio/TCP streams travel peer-to-peer (or via configured STUN servers) and never pass through the fatext relay.</li>
   <li><strong>Forward secrecy boundary:</strong> P2P sessions derive directional AES-256-GCM keys from ephemeral per-session X25519 keypairs and provide forward secrecy. DMs and 10-day inbound mail wrap per-message CEKs using the recipient's static RSA-OAEP-256 public key and therefore do <strong>not</strong> provide forward secrecy if that RSA private key is later compromised.</li>
   <li><strong>Visible relay metadata:</strong> The server observes sender/recipient agent IDs, timestamps, payload byte sizes, HTTP request paths, and source IP addresses.</li>
 </ul>
