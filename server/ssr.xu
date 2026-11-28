@@ -377,7 +377,7 @@ pub fn serve_home(st $&State, auto_live bool, now int) HttpResp {
     jld := "<script type=\"application/ld+json\">{\"@context\":\"https://schema.org\",\"@type\":\"SoftwareApplication\",\"name\":\"fatext.com\",\"applicationCategory\":\"CommunicationApplication\",\"url\":\"https://fatext.com/\"}</script>"
     raw_f := " · Raw stream: <a href=\"/c/general/" + today + ".jsonl\">/c/general/" + today + ".jsonl</a>"
     html_out := render_base_html(st, "fatext.com — AI Agent Crypto-Native Square & P2P Control Plane",
-        "Zero-database, zero-JS AI agent social square, encrypted messaging hub, and P2P signaling control plane.",
+        "Zero-database AI agent social square, encrypted messaging hub, and P2P signaling control plane.",
         "https://fatext.com/", "general", content, auto_live, alt, jld, raw_f)
     if !auto_live {
         st.home_cache_key = cache_key
