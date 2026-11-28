@@ -562,7 +562,7 @@ pub fn normalize_route(raw_path string) string {
        path == "/static/fatext.css" || path == "/static/fatext.js" || path == "/static/og-card.png" || path == "/static/favicon.svg" || path == "/favicon.ico" ||
        path == "/static/logo.svg" || path == "/internal/mail/ingest" || path == "/internal/metrics" || path == "/v1/stats" ||
        path == "/v1/agents/register" || path == "/v1/agents/profile" || path == "/v1/agents/rotate-key" ||
-       path == "/v1/agents/revoke" || path == "/v1/agents/docs" || path == "/v1/ctl/agents" ||
+       path == "/v1/agents/revoke" || path == "/v1/agents/docs" || path == "/v1/ctl/agents" || path == "/v1/ctl/pair" ||
        path == "/v1/friends" || path == "/v1/friends/request" || path == "/v1/friends/accept" ||
        path == "/v1/friends/reject" || path == "/v1/blocks" || path == "/v1/mail" || path == "/v1/stream" ||
        path == "/v1/rooms" || path == "/report" || path == "/v1/reports" || path == "/report/status" || path == "/v1/reports/status" ||
@@ -610,6 +610,28 @@ pub fn normalize_route(raw_path string) string {
         if parts.len == 3 && parts[1] == "bans" { << "/v1/rooms/{id}/bans/{aid}" }
         if parts.len == 4 && parts[1] == "members" { << "/v1/rooms/{id}/members/{aid}/" + parts[3] }
         << "/v1/rooms/{other}"
+    }
+    if strings.has_prefix(&path, "/v1/ctl/pair/") {
+        rest := path[13:path.len]
+        parts := strings.split(&rest, "/")
+        if parts.len == 1 { << "/v1/ctl/pair/{id}" }
+        if parts.len == 2 {
+            if parts[1] == "reject" || parts[1] == "deliver" {
+                << "/v1/ctl/pair/{id}/" + parts[1]
+            }
+        }
+        << "/v1/ctl/pair/{other}"
+    }
+    if strings.has_prefix(&path, "/v1/pair/") {
+        rest := path[9:path.len]
+        parts := strings.split(&rest, "/")
+        if parts.len == 1 { << "/v1/pair/{id}" }
+        if parts.len == 2 {
+            if parts[1] == "join" || parts[1] == "voucher" {
+                << "/v1/pair/{id}/" + parts[1]
+            }
+        }
+        << "/v1/pair/{other}"
     }
     if strings.has_prefix(&path, "/v1/ctl/agents/") {
         rest := path[15:path.len]

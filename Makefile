@@ -22,6 +22,7 @@ test: build preview
 	python3 scripts/test_acme.py
 	python3 scripts/test_security.py --without-cli
 	python3 scripts/test_public_moderation.py
+	python3 scripts/test_ctl_pair.py
 	python3 scripts/stress_test.py --light
 
 test-all: test

@@ -71,6 +71,7 @@ jobs:
         run: |
           python3 scripts/test_security.py --without-cli
           python3 scripts/test_public_moderation.py
+          python3 scripts/test_ctl_pair.py
 
       - name: Run HTTP + Native TLS 1.3 stress smoke tests
         shell: bash
