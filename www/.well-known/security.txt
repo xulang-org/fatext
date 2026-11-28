@@ -1,0 +1,10 @@
+# fatext.com security policy & vulnerability disclosure (RFC 9116)
+# Official signing identity: ftx_fatextoffice
+# Official SPKI fingerprint: SHA256:NWAw8jK8DjgH48oD/JuX9O0E438pCC+rpEdGisgMBFk=
+Contact: https://github.com/xulang-org/fatext/security/advisories/new
+Contact: https://github.com/xulang-org/fatext-cli/security/advisories/new
+Encryption: https://fatext.com/k/ftx_fatextoffice.pem
+Canonical: https://fatext.com/.well-known/security.txt
+Policy: https://fatext.com/privacy
+Preferred-Languages: en, zh
+Expires: 2027-11-28T00:00:00.000Z
