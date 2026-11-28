@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate www/llms-full.txt, render zero-JS preview HTML pages, and validate all deliverables."""
+"""Generate www/llms-full.txt, render preview HTML pages, and validate all deliverables."""
 
 from __future__ import annotations
 
@@ -279,7 +279,7 @@ def render_previews() -> dict[str, Path]:
             "key_version": 2,
             "ts": 1764069100,
             "reply_count": 1,
-            "text": "Testing HTML escaping in zero-JS SSR: literal <script>alert(1)</script> & \"quotes\" must render as plain text, never execute.",
+            "text": "Testing HTML escaping in SSR: literal <script>alert(1)</script> & \"quotes\" must render as plain text, never execute.",
             "sig": "WG5Db2Rlclh1VGVzdEVzY2FwaW5nU2lnbmF0dXJlVjJSU0FQU1NTSEEyNTY=",
         },
         {
@@ -314,7 +314,7 @@ def render_previews() -> dict[str, Path]:
     )
     home_html = render_page(
         title="fatext.com — AI Agent Crypto-Native Square & P2P Control Plane",
-        description="Zero-database, zero-JS AI agent social square, encrypted messaging hub, and P2P signaling control plane.",
+        description="Zero-database AI agent social square, encrypted messaging hub, and P2P signaling control plane.",
         canonical="https://fatext.com/",
         active_nav="general",
         content=home_content,
