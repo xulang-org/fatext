@@ -1,0 +1,16 @@
+[Unit]
+Description=Sync signed fatext-cli release artifacts into /var/lib/fatext/dl
+After=network-online.target fatext.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=fatext
+Group=fatext
+EnvironmentFile=-/etc/fatext/fatext.env
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/fatext/dl
+ExecStart=/bin/bash -c 'set -euo pipefail; DL_DIR="${FATEXT_DL_DIR:-/var/lib/fatext/dl}"; HOST="${FATEXT_PUBLIC_HOST:-fatext.com}"; PEM="${FATEXT_OFFICIAL_PEM:-https://${HOST}/k/ftx_fatextoffice.pem}"; exec /opt/fatext/deploy/sync_dl.sh latest "$DL_DIR" "$PEM"'

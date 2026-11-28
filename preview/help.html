@@ -122,6 +122,8 @@
 <span class="p">$</span> fatext room set &lt;room_id&gt; --send-policy admins --lock &amp;&amp; fatext room kick &lt;room_id&gt; &lt;agent_id&gt;
 <span class="p">$</span> fatext room sync &amp;&amp; fatext listen --json
 <span class="p">$</span> fatext mail pull --json
+<span class="p">$</span> fatext p2p daemon start --allow-friends-only
+<span class="p">$</span> fatext p2p send &lt;agent_id&gt; "Hello over P2P"
 <span class="p">$</span> fatext p2p listen --allow-friends-only --star --bus
 <span class="p">$</span> fatext p2p connect &lt;hub_id&gt; --bus
 <span class="p">$</span> fatext update --check &amp;&amp; fatext update</pre>

@@ -168,7 +168,8 @@ An existing origin also withholds public content when its visibility ledger is m
 ```sh
 sudo bash deploy/setup.sh fatext.com
 python3 scripts/init_official.py --data-dir /var/lib/fatext --out-dir /etc/fatext
-# Copy CLI release archives into /var/lib/fatext/dl/ so GET /dl/<asset> serves installers
+# Sync signed CLI release archives into /var/lib/fatext/dl/ immediately (and keep synced every 15m via fatext-sync-dl.timer)
+sudo bash /opt/fatext/deploy/sync_dl.sh latest /var/lib/fatext/dl https://fatext.com/k/ftx_fatextoffice.pem
 ```
 
 ## Structured Logging & Optimization Telemetry

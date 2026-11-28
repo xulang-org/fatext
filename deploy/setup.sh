@@ -184,15 +184,17 @@ install -m 0644 "$REPO_ROOT/deploy/fatext-backup.service" /etc/systemd/system/fa
 install -m 0644 "$REPO_ROOT/deploy/fatext-backup.timer" /etc/systemd/system/fatext-backup.timer
 install -m 0644 "$REPO_ROOT/deploy/fatext-log-report.service" /etc/systemd/system/fatext-log-report.service
 install -m 0644 "$REPO_ROOT/deploy/fatext-log-report.timer" /etc/systemd/system/fatext-log-report.timer
+install -m 0644 "$REPO_ROOT/deploy/fatext-sync-dl.service" /etc/systemd/system/fatext-sync-dl.service
+install -m 0644 "$REPO_ROOT/deploy/fatext-sync-dl.timer" /etc/systemd/system/fatext-sync-dl.timer
 install -m 0644 "$REPO_ROOT/deploy/fatext-webhook-signer.socket" "$REPO_ROOT/deploy/fatext-webhook-signer@.service" /etc/systemd/system/
 if [[ "$TUNNEL_MODE" == 1 ]]; then
   install -d -m 0755 /etc/systemd/system/fatext.service.d
   install -m 0644 "$REPO_ROOT/deploy/fatext-tunnel.conf.example" /etc/systemd/system/fatext.service.d/tunnel.conf
   systemctl daemon-reload
-  systemctl enable fatext.service fatext-backup.timer fatext-log-report.timer
+  systemctl enable fatext.service fatext-backup.timer fatext-log-report.timer fatext-sync-dl.timer
 else
   systemctl daemon-reload
-  systemctl enable fatext.service fatext-backup.timer fatext-log-report.timer fatext-webhook-signer.socket
+  systemctl enable fatext.service fatext-backup.timer fatext-log-report.timer fatext-sync-dl.timer fatext-webhook-signer.socket
 fi
 
 chmod 0700 /var/lib/fatext/acme
@@ -204,7 +206,7 @@ if [[ "$TUNNEL_MODE" == 1 ]]; then
   echo "     systemctl disable --now fatext-webhook-signer.socket || true"
   echo "  2. Set FATEXT_AI_MODERATION_API_KEY in /etc/fatext/fatext.env (required when FATEXT_AI_MODERATION_REQUIRED=1 for public channels)."
   echo "  3. Run: python3 $REPO_ROOT/scripts/init_official.py --data-dir /var/lib/fatext --out-dir /etc/fatext"
-  echo "  4. Start origin & verify loopback health: systemctl restart fatext fatext-backup.timer fatext-log-report.timer && curl -fsS http://127.0.0.1:8080/health"
+  echo "  4. Start origin & verify loopback health: systemctl restart fatext fatext-backup.timer fatext-log-report.timer fatext-sync-dl.timer && curl -fsS http://127.0.0.1:8080/health"
   echo "  5. Configure and start cloudflared using /opt/fatext/deploy/cloudflared.yml.example (keeps /internal/mail/ingest reachable and blocks other /internal/* paths)."
   echo "  6. Switch ${DOMAIN} / www.${DOMAIN} DNS to proxied Tunnel CNAMEs, close public inbound ports 80/443 on the host firewall, and rotate the origin public IP if previously exposed."
   echo "  7. Publish signed CLI binaries: bash /opt/fatext/deploy/sync_dl.sh latest /var/lib/fatext/dl https://${DOMAIN}/k/ftx_fatextoffice.pem"
@@ -214,6 +216,6 @@ else
   echo "Next:"
   echo "  1. Set FATEXT_AI_MODERATION_API_KEY in /etc/fatext/fatext.env (required when FATEXT_AI_MODERATION_REQUIRED=1 for public channels)."
   echo "  2. Run: python3 $REPO_ROOT/scripts/init_official.py --data-dir /var/lib/fatext --out-dir /etc/fatext"
-  echo "  3. Start service (automatically issues & renews TLS cert with zero downtime): systemctl start fatext fatext-backup.timer fatext-log-report.timer fatext-webhook-signer.socket && systemctl status fatext"
+  echo "  3. Start service (automatically issues & renews TLS cert with zero downtime): systemctl start fatext fatext-backup.timer fatext-log-report.timer fatext-sync-dl.timer fatext-webhook-signer.socket && systemctl status fatext"
   echo "  4. Publish signed CLI binaries: bash /opt/fatext/deploy/sync_dl.sh latest /var/lib/fatext/dl https://${DOMAIN}/k/ftx_fatextoffice.pem"
 fi

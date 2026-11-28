@@ -492,6 +492,28 @@ def test_deploy_and_email_worker(td_p: Path) -> None:
     )
     assert_true(sync_bad.returncode != 0 and "http://" in sync_bad.stderr, f"sync_dl.sh must reject http:// OFFICIAL_PEM: {sync_bad.stderr}")
 
+    sync_bad_tag = subprocess.run(
+        ["bash", str(ROOT / "deploy" / "sync_dl.sh"), "../bad", str(td_p / "dl_out")],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5.0,
+    )
+    assert_true(sync_bad_tag.returncode != 0 and "invalid release tag" in sync_bad_tag.stderr, f"sync_dl.sh must reject invalid tag: {sync_bad_tag.stderr}")
+
+    dl_skip = td_p / "dl_skip"
+    dl_skip.mkdir(parents=True, exist_ok=True)
+    (dl_skip / "latest.json").write_text('{"latest_version":"1.1.0","updated_at":1795828500}\n', encoding="utf-8")
+    (dl_skip / "SHA256SUMS").write_text("0" * 64 + "  install.sh\n", encoding="utf-8")
+    sync_skip = subprocess.run(
+        ["bash", str(ROOT / "deploy" / "sync_dl.sh"), "v1.1.0", str(dl_skip)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5.0,
+    )
+    assert_eq(sync_skip.returncode, 0, f"sync_dl.sh idempotent skip failed: {sync_skip.stderr}")
+    assert_true("Already up to date: v1.1.0" in sync_skip.stdout, f"sync_dl.sh expected idempotent skip message: {sync_skip.stdout}")
+
+    sync_svc = (ROOT / "deploy" / "fatext-sync-dl.service").read_text(encoding="utf-8")
+    sync_tmr = (ROOT / "deploy" / "fatext-sync-dl.timer").read_text(encoding="utf-8")
+    assert_true("User=fatext" in sync_svc and "ProtectSystem=strict" in sync_svc and "ReadWritePaths=/var/lib/fatext/dl" in sync_svc, "fatext-sync-dl.service missing systemd hardening")
+    assert_true("OnUnitActiveSec=" in sync_tmr and "WantedBy=timers.target" in sync_tmr, "fatext-sync-dl.timer invalid")
+
     worker_rel = "deploy/email-worker/worker.js"
     js_txt = (ROOT / worker_rel).read_text(encoding="utf-8")
     assert_true('const first = parts[0] || "";' in js_txt, f"{worker_rel} must inspect only topmost auth-results header")
